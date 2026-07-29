@@ -1,3 +1,5 @@
+use unicode_segmentation::UnicodeSegmentation;
+
 pub(crate) const EMOJI: &[(&str, &str)] = &[
     // Faces & emotions
     ("smile", "😊"),
@@ -156,6 +158,7 @@ pub(crate) const EMOJI: &[(&str, &str)] = &[
     ("snowflake", "❄️"),
 ];
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TextSpan {
     Text(String),
     Emoji(String),
@@ -189,8 +192,11 @@ pub(crate) fn is_emoji_char(c: char) -> bool {
 
 /// Convert an emoji character cluster to its Twemoji CDN PNG URL.
 pub(crate) fn emoji_to_twemoji_url(emoji: &str) -> String {
+    // Twemoji omits VS16 for standalone emoji, but keeps selectors inside
+    // zero-width-joiner sequences because they are part of the asset name.
+    let keep_variation_selectors = emoji.contains('\u{200D}');
     let codepoints: Vec<String> = emoji.chars()
-        .filter(|&c| c != '\u{FE0F}') // strip variation selector-16
+        .filter(|&c| keep_variation_selectors || c != '\u{FE0F}')
         .map(|c| format!("{:x}", c as u32))
         .collect();
     format!(
@@ -199,48 +205,35 @@ pub(crate) fn emoji_to_twemoji_url(emoji: &str) -> String {
     )
 }
 
-/// Split a string into alternating plain-text and emoji cluster spans.
+fn is_emoji_cluster(grapheme: &str) -> bool {
+    if grapheme.contains('\u{FE0E}') {
+        return false;
+    }
+
+    grapheme.chars().any(is_emoji_char)
+        || grapheme.ends_with('\u{20E3}')
+}
+
+/// Split a string into alternating plain-text and complete emoji grapheme spans.
 pub(crate) fn split_emoji(text: &str) -> Vec<TextSpan> {
     let mut spans: Vec<TextSpan> = Vec::new();
     let mut current_text = String::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
 
-    while i < chars.len() {
-        let c = chars[i];
-        if is_emoji_char(c) {
+    for grapheme in text.graphemes(true) {
+        if is_emoji_cluster(grapheme) {
             if !current_text.is_empty() {
                 spans.push(TextSpan::Text(std::mem::take(&mut current_text)));
             }
-            let mut seq = String::from(c);
-            i += 1;
-            // Consume continuation chars: VS-16, ZWJ, skin-tone modifiers, tags, keycap
-            while i < chars.len() {
-                let u = chars[i] as u32;
-                if matches!(u,
-                    0xFE0F | 0xFE0E | 0x20E3 | 0x200D |
-                    0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F
-                ) {
-                    seq.push(chars[i]);
-                    i += 1;
-                    // After ZWJ, consume the joined emoji too
-                    if u == 0x200D && i < chars.len() && is_emoji_char(chars[i]) {
-                        seq.push(chars[i]);
-                        i += 1;
-                    }
-                } else {
-                    break;
-                }
-            }
-            spans.push(TextSpan::Emoji(seq));
+            spans.push(TextSpan::Emoji(grapheme.to_owned()));
         } else {
-            current_text.push(c);
-            i += 1;
+            current_text.push_str(grapheme);
         }
     }
+
     if !current_text.is_empty() {
         spans.push(TextSpan::Text(current_text));
     }
+
     spans
 }
 
@@ -250,4 +243,45 @@ pub(crate) fn find_matches(prefix: &str) -> Vec<String> {
         .filter(|(name, _)| name.starts_with(lower.as_str()))
         .map(|(_, ch)| ch.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{emoji_to_twemoji_url, split_emoji, TextSpan};
+
+    #[test]
+    fn keeps_complete_unicode_emoji_clusters() {
+        assert_eq!(
+            vec![
+                TextSpan::Text("ok ".to_owned()),
+                TextSpan::Emoji("👨‍👩‍👧‍👦".to_owned()),
+                TextSpan::Text(" ".to_owned()),
+                TextSpan::Emoji("👍🏽".to_owned()),
+                TextSpan::Text(" ".to_owned()),
+                TextSpan::Emoji("🇬🇪".to_owned()),
+                TextSpan::Text(" ".to_owned()),
+                TextSpan::Emoji("1️⃣".to_owned()),
+                TextSpan::Text(" done".to_owned()),
+            ],
+            split_emoji("ok 👨‍👩‍👧‍👦 👍🏽 🇬🇪 1️⃣ done"),
+        );
+    }
+
+    #[test]
+    fn preserves_explicit_text_presentation() {
+        assert_eq!(
+            vec![TextSpan::Text("text ☕︎ stays text".to_owned())],
+            split_emoji("text ☕︎ stays text"),
+        );
+    }
+
+    #[test]
+    fn twemoji_url_uses_the_complete_cluster() {
+        assert!(emoji_to_twemoji_url("🇬🇪").ends_with("/1f1ec-1f1ea.png"));
+        assert!(emoji_to_twemoji_url("1️⃣").ends_with("/31-20e3.png"));
+        assert!(emoji_to_twemoji_url("👨‍👩‍👧‍👦")
+            .ends_with("/1f468-200d-1f469-200d-1f467-200d-1f466.png"));
+        assert!(emoji_to_twemoji_url("🏳️‍⚧️")
+            .ends_with("/1f3f3-fe0f-200d-26a7-fe0f.png"));
+    }
 }
