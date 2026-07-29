@@ -785,6 +785,66 @@ impl WeeChatApp {
         )
     }
 
+    pub(crate) fn render_text_with_emoji(
+        &mut self,
+        ui: &mut egui::Ui,
+        text: &str,
+        format: &egui::TextFormat,
+        wrap: bool,
+    ) {
+        if !self.emoji_rendering {
+            let mut job = LayoutJob::default();
+            job.append(text, 0.0, format.clone());
+            ui.add(Label::new(job).wrap(wrap));
+            return;
+        }
+
+        let emoji_size = format.font_id.size + 2.0;
+        for span in crate::ui::emoji::split_emoji(text) {
+            match span {
+                crate::ui::emoji::TextSpan::Text(text) => {
+                    let mut job = LayoutJob::default();
+                    job.append(&text, 0.0, format.clone());
+                    ui.add(Label::new(job).wrap(wrap));
+                }
+                crate::ui::emoji::TextSpan::Emoji(emoji) => {
+                    let url = crate::ui::emoji::emoji_to_twemoji_url(&emoji);
+                    if !self.image_cache.contains_key(&url) {
+                        self.image_cache.insert(url.clone(), ImageState::Loading);
+                        let tx = self.image_tx.clone();
+                        let url_owned = url.clone();
+                        tokio::spawn(async move {
+                            let result: Result<Vec<u8>, String> = async {
+                                let bytes = reqwest::get(&url_owned)
+                                    .await
+                                    .map_err(|e| e.to_string())?
+                                    .bytes()
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                Ok(bytes.to_vec())
+                            }
+                            .await;
+                            let _ = tx.send((url_owned, result));
+                        });
+                    }
+                    match self.image_cache.get(&url) {
+                        Some(ImageState::Loaded(texture)) => {
+                            ui.add(egui::Image::new((
+                                texture.id(),
+                                egui::Vec2::splat(emoji_size),
+                            )));
+                        }
+                        _ => {
+                            let mut job = LayoutJob::default();
+                            job.append(&emoji, 0.0, format.clone());
+                            ui.add(Label::new(job).wrap(wrap));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn is_any_connected(&self) -> bool {
         self.connections.iter().any(|c| c.client.is_connected())
     }
@@ -1794,17 +1854,41 @@ impl eframe::App for WeeChatApp {
                                         }
                                     } else { text };
                                     let sections = ANSIParser::parse(&input);
-                                    let mut job = LayoutJob::default();
-                                    for s in sections {
-                                        let mut fmt = s.style.to_format(font_id.clone(), &render_theme);
-                                        if nick.away {
-                                            fmt.color = text_muted;
-                                            fmt.italics = true;
+                                    let row_height = (font_id.size + 4.0)
+                                        .max(ui.text_style_height(&TextStyle::Body));
+                                    let row_rect = egui::Rect::from_min_size(
+                                        ui.next_widget_position(),
+                                        egui::vec2(ui.available_width(), row_height),
+                                    );
+                                    let mut row_ui = ui.child_ui(
+                                        row_rect,
+                                        egui::Layout::left_to_right(egui::Align::Center)
+                                            .with_main_align(egui::Align::Min),
+                                    );
+                                    {
+                                        let ui = &mut row_ui;
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        for section in &sections {
+                                            let mut format = section.style.to_format(
+                                                font_id.clone(),
+                                                &render_theme,
+                                            );
+                                            if nick.away {
+                                                format.color = text_muted;
+                                                format.italics = true;
+                                            }
+                                            self.render_text_with_emoji(
+                                                ui,
+                                                &section.text,
+                                                &format,
+                                                false,
+                                            );
                                         }
-                                        job.append(&s.text, 0.0, fmt);
                                     }
-
-                                    let label_res = ui.add(Label::new(job).truncate(true).sense(egui::Sense::click()));
+                                    let label_res = ui.allocate_rect(
+                                        row_rect,
+                                        egui::Sense::click(),
+                                    );
                                     label_res.context_menu(|ui| {
                                         if ui.button(format!("Query {}", nick.name)).clicked() {
                                             self.send_command(&format!("/query {}", nick.name));
@@ -2198,7 +2282,19 @@ impl eframe::App for WeeChatApp {
                                         .fill(row_bg)
                                         .rounding(Rounding::same(3.0))
                                         .show(ui, |ui| {
-                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                                    let row_width = ui.available_width();
+                                    let row_start = ui.next_widget_position();
+                                    let row_rect = egui::Rect::from_min_size(
+                                        row_start,
+                                        egui::vec2(row_width, 0.0),
+                                    );
+                                    let mut row_ui = ui.child_ui(
+                                        row_rect,
+                                        egui::Layout::left_to_right(egui::Align::TOP)
+                                            .with_main_align(egui::Align::Min),
+                                    );
+                                    {
+                                        let ui = &mut row_ui;
                                         ui.spacing_mut().item_spacing.x = 6.0;
                                         if self.show_timestamps {
                                             ui.label(egui::RichText::new(line.timestamp.with_timezone(&chrono::Local).format("%H:%M:%S").to_string()).font(font_id.clone()).color(text_muted));
@@ -2222,21 +2318,32 @@ impl eframe::App for WeeChatApp {
 
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(col_width, ui.text_style_height(&TextStyle::Body)),
-                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
-                                                let mut prefix_job = LayoutJob::default();
-                                                prefix_job.halign = egui::Align::RIGHT;
-                                                for s in prefix_sections { prefix_job.append(&s.text, 0.0, s.style.to_format(font_id.clone(), &render_theme)); }
-                                                ui.add(Label::new(prefix_job).wrap(false));
+                                                ui.spacing_mut().item_spacing.x = 0.0;
+                                                ui.add_space((col_width - measured_w).max(0.0));
+                                                for section in prefix_sections {
+                                                    let format = section.style.to_format(
+                                                        font_id.clone(),
+                                                        &render_theme,
+                                                    );
+                                                    self.render_text_with_emoji(
+                                                        ui,
+                                                        &section.text,
+                                                        &format,
+                                                        false,
+                                                    );
+                                                }
                                             }
                                         );
                                         if !self.prefix_suffix.is_empty() {
                                             ui.label(egui::RichText::new(&self.prefix_suffix).font(font_id.clone()).color(text_muted));
                                         }
 
-                                        let msg_col_width = ui.available_width();
+                                        let msg_col_width =
+                                            (ui.max_rect().right() - ui.cursor().left()).max(0.0);
                                         ui.vertical(|ui| {
-                                            ui.set_min_width(msg_col_width);
+                                            ui.set_width(msg_col_width);
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 6.0;
                                                 for s in msg_sections {
@@ -2306,49 +2413,17 @@ impl eframe::App for WeeChatApp {
                                                                 }
                                                             }
                                                         }
-                                                    } else if !self.emoji_rendering {
-                                                        let mut job = LayoutJob::default();
-                                                        job.append(&s.text, 0.0, s.style.to_format(font_id.clone(), &render_theme));
-                                                        ui.add(Label::new(job).wrap(true));
                                                     } else {
-                                                        let emoji_size = font_id.size + 2.0;
-                                                        for span in crate::ui::emoji::split_emoji(&s.text) {
-                                                            match span {
-                                                                crate::ui::emoji::TextSpan::Text(t) => {
-                                                                    let mut job = LayoutJob::default();
-                                                                    job.append(&t, 0.0, s.style.to_format(font_id.clone(), &render_theme));
-                                                                    ui.add(Label::new(job).wrap(true));
-                                                                }
-                                                                crate::ui::emoji::TextSpan::Emoji(e) => {
-                                                                    let eurl = crate::ui::emoji::emoji_to_twemoji_url(&e);
-                                                                    if !self.image_cache.contains_key(&eurl) {
-                                                                        self.image_cache.insert(eurl.clone(), ImageState::Loading);
-                                                                        let tx = self.image_tx.clone();
-                                                                        let url_owned = eurl.clone();
-                                                                        tokio::spawn(async move {
-                                                                            let result: Result<Vec<u8>, String> = async {
-                                                                                let bytes = reqwest::get(&url_owned).await
-                                                                                    .map_err(|e| e.to_string())?
-                                                                                    .bytes().await
-                                                                                    .map_err(|e| e.to_string())?;
-                                                                                Ok(bytes.to_vec())
-                                                                            }.await;
-                                                                            let _ = tx.send((url_owned, result));
-                                                                        });
-                                                                    }
-                                                                    match self.image_cache.get(&eurl) {
-                                                                        Some(ImageState::Loaded(texture)) => {
-                                                                            ui.add(egui::Image::new((texture.id(), egui::Vec2::splat(emoji_size))));
-                                                                        }
-                                                                        _ => {
-                                                                            let mut job = LayoutJob::default();
-                                                                            job.append(&e, 0.0, s.style.to_format(font_id.clone(), &render_theme));
-                                                                            ui.add(Label::new(job).wrap(true));
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
+                                                        let format = s.style.to_format(
+                                                            font_id.clone(),
+                                                            &render_theme,
+                                                        );
+                                                        self.render_text_with_emoji(
+                                                            ui,
+                                                            &s.text,
+                                                            &format,
+                                                            true,
+                                                        );
                                                     }
                                                 }
                                             });
@@ -2435,7 +2510,10 @@ impl eframe::App for WeeChatApp {
                                                 }
                                             }
                                         }); // end vertical (message column)
-                                    }); // end horizontal (full message row)
+                                    }
+                                    let row_height = (row_ui.min_rect().bottom() - row_start.y)
+                                        .max(ui.text_style_height(&TextStyle::Body));
+                                    ui.allocate_space(egui::vec2(row_width, row_height));
                                     }); // end highlight frame
                                     let plain_message = line.plain_message.clone();
                                     let plain_prefix = line.plain_prefix.clone();
