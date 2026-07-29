@@ -5084,6 +5084,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-tungstenite",
+ "unicode-segmentation",
  "url",
  "winres",
  "zbus 4.4.0",
