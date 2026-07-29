@@ -153,8 +153,20 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                     self.rebuild_buffer_idx();
                 }
-                // Auto-select when nothing is currently selected (e.g. first buffer on connect).
-                if self.selected_buffer_id.is_none() {
+                // Incremental backends may open a service buffer first. Wait for
+                // a real chat instead of showing raw protocol output at startup.
+                let remembered_for_connection = self.last_chat_buffer_name.as_deref()
+                    .map(|name| name.starts_with(&format!("{conn_prefix}/")))
+                    .unwrap_or(false);
+                let should_select = self.buffer_by_id(&full_id)
+                    .map(|buffer| {
+                        !matches!(buffer.kind.as_str(), "core" | "server")
+                            && (!remembered_for_connection
+                                || self.last_chat_buffer_name.as_deref()
+                                    == Some(buffer.full_name.as_str()))
+                    })
+                    .unwrap_or(false);
+                if self.selected_buffer_id.is_none() && should_select {
                     self.select_buffer(full_id.clone());
                 }
                 // Resolve a pending /join or /query switch
@@ -189,6 +201,21 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                 }
                 self.rebuild_buffer_idx();
+                if self.selected_buffer_id.is_none() {
+                    let preferred = self.last_chat_buffer_name.as_deref()
+                        .and_then(|name| self.buffers.iter().find(|buffer| {
+                            !buffer.hidden
+                                && buffer.full_name == name
+                                && !matches!(buffer.kind.as_str(), "core" | "server")
+                        }))
+                        .or_else(|| self.buffers.iter().find(|buffer| {
+                            !buffer.hidden
+                                && !matches!(buffer.kind.as_str(), "core" | "server")
+                        }));
+                    if let Some(buffer) = preferred {
+                        self.select_buffer(buffer.id.clone());
+                    }
+                }
             }
             BackendEvent::LineAdded { buffer_id, line } => {
                 let full_id = format!("{}/{}", conn_prefix, buffer_id);
@@ -594,7 +621,13 @@ impl WeeChatApp {
                     .or_else(|| obj.get("name").and_then(|v| v.as_str()))
                     .unwrap_or("unknown").to_string();
                 let raw_full_name = obj.get("name").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
-                let plugin = obj.get("plugin").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let plugin = obj.get("plugin").and_then(|v| v.as_str())
+                    .or_else(|| obj.get("local_variables")
+                        .and_then(|v| v.as_object())
+                        .and_then(|vars| vars.get("plugin"))
+                        .and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string();
                 let hidden = obj.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
                 let has_nicklist = obj.get("nicklist").and_then(|v| v.as_bool()).unwrap_or(true);
                 let relay_last_read_id = obj.get("last_read_line_id").and_then(|v| Self::parse_id(v))
@@ -733,8 +766,25 @@ impl WeeChatApp {
             }
 
             if self.selected_buffer_id.is_none() {
-                if let Some(first) = self.buffers.first() {
-                    let id = first.id.clone();
+                let remembered_for_connection = self.last_chat_buffer_name
+                    .as_deref()
+                    .map(|name| name.starts_with(&format!("{conn_prefix}/")))
+                    .unwrap_or(false);
+                let preferred = self.last_chat_buffer_name.as_deref()
+                    .and_then(|name| self.buffers.iter().find(|buffer| {
+                        !buffer.hidden
+                            && buffer.full_name == name
+                            && !matches!(buffer.kind.as_str(), "core" | "server")
+                    }))
+                    .or_else(|| (!remembered_for_connection).then(|| {
+                        self.buffers.iter().find(|buffer| {
+                            !buffer.hidden
+                                && buffer.id.starts_with(&format!("{conn_prefix}/"))
+                                && !matches!(buffer.kind.as_str(), "core" | "server")
+                        })
+                    }).flatten());
+                if let Some(buffer) = preferred {
+                    let id = buffer.id.clone();
                     self.select_buffer(id);
                 }
             }

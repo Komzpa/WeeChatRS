@@ -376,6 +376,9 @@ pub struct AppSettings {
     /// Derive theme colours from the current desktop wallpaper.
     #[serde(default)]
     pub adaptive_theme: bool,
+    /// Stable prefixed full name of the last selected non-service chat.
+    #[serde(default)]
+    pub last_chat_buffer_name: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -424,6 +427,7 @@ impl Default for AppSettings {
             keybinds: KeybindsMap::default(),
             collapsed_servers: HashSet::new(),
             adaptive_theme: false,
+            last_chat_buffer_name: None,
         }
     }
 }
@@ -456,6 +460,7 @@ pub struct WeeChatApp {
     /// called after every push/retain/extend/sort/clear of `buffers`.
     pub(crate) buffer_idx: HashMap<String, usize>,
     pub(crate) selected_buffer_id: Option<String>,
+    pub(crate) last_chat_buffer_name: Option<String>,
     pub(crate) input_text: String,
     // Settings
     pub(crate) show_settings: bool,
@@ -663,6 +668,7 @@ impl WeeChatApp {
             buffers: Vec::new(),
             buffer_idx: HashMap::new(),
             selected_buffer_id: None,
+            last_chat_buffer_name: settings.last_chat_buffer_name,
             input_text: String::new(),
             show_settings: false,
             show_filtered_lines: settings.show_filtered_lines,
@@ -829,6 +835,14 @@ impl WeeChatApp {
                 if let Some((client, raw_id)) = self.client_for_buffer(&prev_id) {
                     client.mark_read(&raw_id);
                 }
+            }
+        }
+
+        if let Some(buffer) = self.buffer_by_id(&id) {
+            if !buffer.hidden
+                && !matches!(buffer.kind.as_str(), "core" | "server")
+            {
+                self.last_chat_buffer_name = Some(buffer.full_name.clone());
             }
         }
 
@@ -1029,6 +1043,7 @@ impl eframe::App for WeeChatApp {
             keybinds: self.keybinds.clone(),
             collapsed_servers: self.collapsed_servers.clone(),
             adaptive_theme: self.adaptive_theme,
+            last_chat_buffer_name: self.last_chat_buffer_name.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &settings);
     }
