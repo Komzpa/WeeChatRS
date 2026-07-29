@@ -380,6 +380,10 @@ pub struct AppSettings {
 
 fn default_true() -> bool { true }
 fn default_nicklist_width() -> f32 { 180.0 }
+
+const NICKLIST_MIN_WIDTH: f32 = 160.0;
+const BUFFERS_MIN_WIDTH: f32 = 200.0;
+const BUFFERS_MAX_AUTO_WIDTH: f32 = 380.0;
 fn default_prefix_suffix() -> String { "│".to_string() }
 fn default_file_share_duration() -> String { "day".to_string() }
 
@@ -1374,16 +1378,29 @@ impl eframe::App for WeeChatApp {
         }
 
         if self.show_buffers {
-            if self.buffers_width == 0.0 {
-                let buf_font_id = FontId::new(self.font_size, if self.use_monospace { FontFamily::Monospace } else { FontFamily::Proportional });
-                let char_w = ctx.fonts(|f| f.glyph_width(&buf_font_id, 'W'));
-                self.buffers_width = char_w * 20.0 + 20.0;
-            }
+            let buf_font_id = FontId::new(
+                self.font_size,
+                if self.use_monospace { FontFamily::Monospace } else { FontFamily::Proportional },
+            );
+            let longest_name_width = self.buffers.iter()
+                .filter(|buffer| !buffer.hidden || self.show_hidden_buffers)
+                .map(|buffer| ctx.fonts(|fonts| {
+                    fonts.layout_no_wrap(
+                        buffer.name.clone(),
+                        buf_font_id.clone(),
+                        Color32::WHITE,
+                    ).size().x
+                }))
+                .fold(0.0_f32, f32::max);
             let buffers_max_w = (ctx.screen_rect().width() * 0.40).max(80.0);
+            let auto_width = (longest_name_width + 88.0)
+                .clamp(BUFFERS_MIN_WIDTH, BUFFERS_MAX_AUTO_WIDTH)
+                .min(buffers_max_w);
+            self.buffers_width = self.buffers_width.max(auto_width);
             let buffers_resp = egui::SidePanel::left("buffers_panel")
                 .resizable(true)
                 .default_width(self.buffers_width)
-                .min_width(80.0)
+                .min_width(auto_width)
                 .max_width(buffers_max_w)
                 .frame(Frame::none().fill(bg_color).inner_margin(Margin::same(10.0)))
                 .show(ctx, |ui| {
@@ -1759,14 +1776,15 @@ impl eframe::App for WeeChatApp {
 
         let current_buf_has_nicklist = current_buf.map(|b| b.has_nicklist).unwrap_or(false);
         if self.show_nicklist && current_buf_has_nicklist && any_connected && current_buffer_id.is_some() {
-            if self.nicklist_width < 80.0 {
+            if self.nicklist_width < NICKLIST_MIN_WIDTH {
                 self.nicklist_width = 180.0;
             }
-            let nicks_max_w = (ctx.screen_rect().width() * 0.30).max(80.0);
+            let nicks_max_w = (ctx.screen_rect().width() * 0.30)
+                .max(NICKLIST_MIN_WIDTH);
             let nicks_resp = egui::SidePanel::right("nicks_panel_2")
                 .resizable(true)
                 .default_width(self.nicklist_width)
-                .min_width(80.0)
+                .min_width(NICKLIST_MIN_WIDTH)
                 .max_width(nicks_max_w)
                 .frame(Frame::none().fill(bg_color).inner_margin(Margin::same(10.0)))
                 .show(ctx, |ui| {
