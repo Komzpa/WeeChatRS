@@ -3,6 +3,10 @@ use egui::text::{CCursorRange, CCursor};
 use crate::ui::app::{WeeChatApp, CompletionState};
 use crate::ui::emoji;
 
+fn matrix_reply_command(event_id: &str, message: &str) -> String {
+    format!("/reply {} {}", event_id, message)
+}
+
 impl WeeChatApp {
     pub(crate) fn perform_completion(&mut self, ctx: &egui::Context, id: egui::Id) {
         let mut new_cursor_char = 0usize;
@@ -164,9 +168,12 @@ impl WeeChatApp {
         let msg = self.input_text.clone();
 
         let is_command = msg.starts_with('/');
+        let sends_reply = self.reply_target.as_ref().is_some_and(|reply| {
+            self.selected_buffer_id.as_deref() == Some(reply.buffer_id.as_str())
+        });
 
         // Determine pending_buffer_switch before the borrow via client_for_buffer
-        if is_command {
+        if is_command && !sends_reply {
             if msg.starts_with("/query ") {
                 self.pending_buffer_switch = msg[7..].split_whitespace().next().map(|s| s.to_string());
             } else if msg.starts_with("/join ") || msg.starts_with("/j ") {
@@ -217,8 +224,14 @@ impl WeeChatApp {
 
         if let Some(buffer_id) = self.selected_buffer_id.clone() {
             if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
-                client.send_message(&raw_id, &msg);
-                if is_command {
+                let command = self
+                    .reply_target
+                    .as_ref()
+                    .filter(|reply| reply.buffer_id == buffer_id)
+                    .map(|reply| matrix_reply_command(&reply.matrix_event_id, &msg))
+                    .unwrap_or_else(|| msg.clone());
+                client.send_message(&raw_id, &command);
+                if is_command && !sends_reply {
                     client.fetch_buffer_list();
                 }
             }
@@ -233,6 +246,7 @@ impl WeeChatApp {
 
         self.input_text.clear();
         self.completion = None;
+        self.reply_target = None;
         self.history_index = None;
     }
 
@@ -256,5 +270,18 @@ impl WeeChatApp {
             client.send_message(&raw_id, command);
             client.fetch_buffer_list();
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::matrix_reply_command;
+
+    #[test]
+    fn reply_command_keeps_the_selected_matrix_event() {
+        assert_eq!(
+            matrix_reply_command("$chosen:elsewhere.example", "not the latest"),
+            "/reply $chosen:elsewhere.example not the latest"
+        );
     }
 }
