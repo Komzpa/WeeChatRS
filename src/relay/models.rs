@@ -34,6 +34,7 @@ pub struct Buffer {
     pub server: String,
     pub messages: VecDeque<Line>,
     pub nicks: Vec<Nick>,
+    pub mention_candidates: Vec<MentionCandidate>,
     pub activity: BufferActivity,
     pub unread_count: u32,
     pub last_read_id: Option<String>,
@@ -46,6 +47,12 @@ pub struct Buffer {
     /// Snapshot of last_read_id taken when the buffer was first entered this session.
     /// Used to anchor the unread divider while the user views the buffer.
     pub visit_start_marker_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MentionCandidate {
+    pub display_name: String,
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone)]

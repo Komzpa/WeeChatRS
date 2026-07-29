@@ -145,6 +145,7 @@ impl Session {
             server: self.server_name.clone(),
             messages: VecDeque::new(),
             nicks: Vec::new(),
+            mention_candidates: Vec::new(),
             activity: BufferActivity::None,
             unread_count: 0,
             last_read_id: None,
