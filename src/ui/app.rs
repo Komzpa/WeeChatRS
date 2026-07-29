@@ -500,6 +500,7 @@ pub struct WeeChatApp {
     pub(crate) command_history: VecDeque<String>,
     pub(crate) history_index: Option<usize>,
     pub(crate) focus_input: bool,
+    pub(crate) reply_target: Option<ReplyTarget>,
 
     // Search state
     pub(crate) show_search: bool,
@@ -588,6 +589,14 @@ pub(crate) struct CompletionState {
     pub(crate) matches: Vec<String>,
     pub(crate) index: usize,
     pub(crate) word_start_idx: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReplyTarget {
+    pub(crate) buffer_id: String,
+    pub(crate) matrix_event_id: String,
+    pub(crate) sender: String,
+    pub(crate) message: String,
 }
 
 impl WeeChatApp {
@@ -696,6 +705,7 @@ impl WeeChatApp {
             command_history: VecDeque::new(),
             history_index: None,
             focus_input: false,
+            reply_target: None,
             show_search: false,
             search_text: String::new(),
             pending_buffer_switch: None,
@@ -826,6 +836,7 @@ impl WeeChatApp {
     pub(crate) fn select_buffer(&mut self, id: String) {
         if let Some(prev_id) = self.selected_buffer_id.clone() {
             if prev_id != id {
+                self.reply_target = None;
                 if let Some((client, raw_id)) = self.client_for_buffer(&prev_id) {
                     client.mark_read(&raw_id);
                 }
@@ -1308,6 +1319,7 @@ impl eframe::App for WeeChatApp {
         let mut next_drag_buffer_id: Option<String> = None;
         let mut pending_mute: Option<(String, String, bool)> = None;
         let mut pending_load_more: Option<(String, usize)> = None;
+        let mut pending_reply_target: Option<ReplyTarget> = None;
 
         if self.show_toolbar { egui::TopBottomPanel::top("top_panel")
             .frame(Frame::none().fill(surface_color).inner_margin(Margin::symmetric(12.0, 8.0)))
@@ -1746,6 +1758,8 @@ impl eframe::App for WeeChatApp {
         let current_buf = current_buffer_id.as_ref().and_then(|id| self.buffer_by_id(id));
         let current_buffer_nicks = current_buf.map(|b| b.nicks.clone());
         let current_buffer_full_name = current_buf.map(|b| b.full_name.clone());
+        let current_buffer_is_matrix =
+            current_buf.is_some_and(|buffer| buffer.plugin == "matrix");
         let current_buffer_messages = current_buf.map(|b| b.messages.clone());
         let _current_buffer_last_read_id = current_buf.and_then(|b| b.last_read_id.clone());
         let current_buffer_visit_marker_id = current_buf.and_then(|b| b.visit_start_marker_id.clone());
@@ -1834,6 +1848,30 @@ impl eframe::App for WeeChatApp {
             egui::TopBottomPanel::bottom("input_panel")
                 .frame(Frame::none().fill(surface_color).inner_margin(Margin::symmetric(16.0, 10.0)))
                 .show(ctx, |ui| {
+                    if let Some(reply) = self.reply_target.clone().filter(|reply| {
+                        current_buffer_id.as_deref() == Some(reply.buffer_id.as_str())
+                    }) {
+                        let mut preview: String = reply.message.chars().take(120).collect();
+                        if reply.message.chars().count() > 120 {
+                            preview.push('…');
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("Replying to {}", reply.sender))
+                                    .strong()
+                                    .color(accent_color),
+                            );
+                            ui.label(
+                                egui::RichText::new(preview)
+                                    .color(text_secondary)
+                                    .italics(),
+                            );
+                            if ui.small_button("✕").on_hover_text("Cancel reply").clicked() {
+                                self.reply_target = None;
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
                     // File share error toast (clears on next click anywhere)
                     if let Some(err) = self.file_share_error.clone() {
                         ui.horizontal(|ui| {
@@ -2449,6 +2487,32 @@ impl eframe::App for WeeChatApp {
                                     }
                                     let menu_url = self.ctx_menu_hovered_url.clone();
                                     interactable.context_menu(|ui| {
+                                        if current_buffer_is_matrix {
+                                            let event_id = line.matrix_event_id.clone();
+                                            if ui
+                                                .add_enabled(
+                                                    event_id.is_some(),
+                                                    egui::Button::new("Reply"),
+                                                )
+                                                .on_disabled_hover_text(
+                                                    "This line has no Matrix event ID",
+                                                )
+                                                .clicked()
+                                            {
+                                                pending_reply_target = event_id.map(
+                                                    |matrix_event_id| ReplyTarget {
+                                                        buffer_id: current_buffer_id
+                                                            .clone()
+                                                            .unwrap_or_default(),
+                                                        matrix_event_id,
+                                                        sender: plain_prefix.clone(),
+                                                        message: plain_message.clone(),
+                                                    },
+                                                );
+                                                ui.close_menu();
+                                            }
+                                            ui.separator();
+                                        }
                                         if let Some(ref url) = menu_url {
                                             if ui.button("Open URL").clicked() {
                                                 ui.ctx().output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(url.clone())));
@@ -2493,6 +2557,11 @@ impl eframe::App for WeeChatApp {
                 }
                 client.fetch_lines(&raw_id, count);
             }
+        }
+
+        if let Some(reply_target) = pending_reply_target {
+            self.reply_target = Some(reply_target);
+            self.focus_input = true;
         }
 
         if any_connected {

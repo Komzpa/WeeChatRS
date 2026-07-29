@@ -55,6 +55,7 @@ pub struct Line {
     pub timestamp: DateTime<Utc>,
     pub prefix: String,
     pub message: String,
+    pub matrix_event_id: Option<String>,
     pub displayed: bool,
     pub highlight: bool,
     // Cached: parsed once at insertion. Theme/font-independent — resolved at render.
@@ -87,6 +88,7 @@ impl Line {
             timestamp,
             prefix,
             message,
+            matrix_event_id: None,
             displayed,
             highlight,
             parsed_prefix,

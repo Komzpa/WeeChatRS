@@ -475,6 +475,23 @@ impl WeeChatApp {
         }
     }
 
+    fn tag_value(obj: &serde_json::Map<String, Value>, prefix: &str) -> Option<String> {
+        let tags: Vec<&str> = match obj.get("tags") {
+            Some(Value::Array(tags)) => tags.iter().filter_map(Value::as_str).collect(),
+            Some(Value::String(tags)) => tags.split(',').map(str::trim).collect(),
+            _ => Vec::new(),
+        };
+
+        tags.into_iter().find_map(|tag| {
+            let value = tag.strip_prefix(prefix)?;
+            if value.starts_with('$') && !value.chars().any(char::is_whitespace) {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
     fn parse_id(v: &Value) -> Option<String> {
         v.as_i64().map(|i| i.to_string())
             .or_else(|| v.as_f64().map(|f| (f as i64).to_string()))
@@ -801,7 +818,16 @@ impl WeeChatApp {
             let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
             let timestamp = Self::parse_date(obj.get("date"));
             let highlight = obj.get("highlight").and_then(|v| v.as_bool()).unwrap_or(false);
-            Some(Line::new(id, timestamp, prefix.to_string(), message.to_string(), displayed, highlight))
+            let mut line = Line::new(
+                id,
+                timestamp,
+                prefix.to_string(),
+                message.to_string(),
+                displayed,
+                highlight,
+            );
+            line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
+            Some(line)
         }).collect();
 
         let mut log_entry: Option<String> = None;
@@ -979,7 +1005,15 @@ impl WeeChatApp {
                         .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string());
                     let timestamp = Self::parse_date(obj.get("date"));
 
-                    let line = Line::new(id, timestamp, prefix.to_string(), message.to_string(), displayed, is_highlight);
+                    let mut line = Line::new(
+                        id,
+                        timestamp,
+                        prefix.to_string(),
+                        message.to_string(),
+                        displayed,
+                        is_highlight,
+                    );
+                    line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
 
                     let is_selected = self.selected_buffer_id.as_deref() == Some(&buffer_id);
                     let mut notify_data: Option<(String, String, String)> = None;
@@ -1045,11 +1079,23 @@ impl WeeChatApp {
                     if let Some(buffer) = self.buffer_by_id_mut(&buffer_id) {
                         if let Some(line) = buffer.messages.iter_mut().find(|m| m.id == line_id) {
                             line.displayed = displayed;
+                            if let Some(event_id) = Self::tag_value(obj, "matrix_id_") {
+                                line.matrix_event_id = Some(event_id);
+                            }
                         } else if displayed {
                             let prefix = obj.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
                             let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
                             let timestamp = Self::parse_date(obj.get("date"));
-                            buffer.messages.push_back(Line::new(line_id, timestamp, prefix.to_string(), message.to_string(), displayed, false));
+                            let mut line = Line::new(
+                                line_id,
+                                timestamp,
+                                prefix.to_string(),
+                                message.to_string(),
+                                displayed,
+                                false,
+                            );
+                            line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
+                            buffer.messages.push_back(line);
                             if buffer.messages.len() > MAX_STORED_LINES {
                                 buffer.messages.pop_front();
                             }
@@ -1058,5 +1104,43 @@ impl WeeChatApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::WeeChatApp;
+
+    #[test]
+    fn matrix_event_id_is_read_from_weechat_tags() {
+        let array = json!({
+            "tags": ["notify_message", "matrix_id_$selected:remote.example"]
+        });
+        let string = json!({
+            "tags": "notify_message, matrix_id_$older:remote.example"
+        });
+
+        assert_eq!(
+            WeeChatApp::tag_value(array.as_object().unwrap(), "matrix_id_"),
+            Some("$selected:remote.example".to_owned())
+        );
+        assert_eq!(
+            WeeChatApp::tag_value(string.as_object().unwrap(), "matrix_id_"),
+            Some("$older:remote.example".to_owned())
+        );
+    }
+
+    #[test]
+    fn malformed_matrix_event_tag_is_not_replyable() {
+        let object = json!({
+            "tags": ["matrix_id_not-an-event", "matrix_id_$bad event"]
+        });
+
+        assert_eq!(
+            WeeChatApp::tag_value(object.as_object().unwrap(), "matrix_id_"),
+            None
+        );
     }
 }
