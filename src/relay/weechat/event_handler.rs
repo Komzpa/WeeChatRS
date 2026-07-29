@@ -847,6 +847,7 @@ impl WeeChatApp {
 
                     let mut messages = std::collections::VecDeque::new();
                     let mut nicks = Vec::new();
+                    let mut mention_candidates = Vec::new();
                     let mut activity = BufferActivity::None;
                     let mut unread_count = 0u32;
                     let mut last_read_id = None;
@@ -857,6 +858,7 @@ impl WeeChatApp {
                     if let Some(existing) = self.buffer_by_id(&full_id) {
                         messages = existing.messages.clone();
                         nicks = existing.nicks.clone();
+                        mention_candidates = existing.mention_candidates.clone();
                         activity = existing.activity;
                         unread_count = existing.unread_count;
                         last_read_id = existing.last_read_id.clone();
@@ -869,6 +871,15 @@ impl WeeChatApp {
 
                     // Use raw_full_name (without prefix) for metadata extraction
                     Self::extract_metadata(obj, &mut topic, &mut modes, &mut kind, &mut server, &raw_full_name, &plugin);
+                    if let Some(encoded) = obj.get("local_variables")
+                        .and_then(|value| value.as_object())
+                        .and_then(|vars| vars.get("matrix_mentions"))
+                        .and_then(|value| value.as_str())
+                    {
+                        if let Ok(candidates) = serde_json::from_str(encoded) {
+                            mention_candidates = candidates;
+                        }
+                    }
 
                     // Core and server buffers never have a usable nicklist regardless of
                     // what the relay reports (unwrap_or(true) above can over-report).
@@ -886,6 +897,7 @@ impl WeeChatApp {
                         server,
                         messages,
                         nicks,
+                        mention_candidates,
                         activity,
                         unread_count,
                         last_read_id,
@@ -1163,6 +1175,15 @@ impl WeeChatApp {
                     Self::extract_metadata(obj, &mut buffer.topic, &mut buffer.modes, &mut buffer.kind, &mut buffer.server, &raw_full_name, &plugin);
                     buffer.matrix_room_id = matrix_room_id;
                     buffer.matrix_thread_root = matrix_thread_root;
+                    if let Some(encoded) = obj.get("local_variables")
+                        .and_then(|value| value.as_object())
+                        .and_then(|vars| vars.get("matrix_mentions"))
+                        .and_then(|value| value.as_str())
+                    {
+                        if let Ok(candidates) = serde_json::from_str(encoded) {
+                            buffer.mention_candidates = candidates;
+                        }
+                    }
                 }
             }
         }
