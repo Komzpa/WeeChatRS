@@ -34,6 +34,7 @@ pub struct Buffer {
     pub server: String,
     pub messages: VecDeque<Line>,
     pub nicks: Vec<Nick>,
+    pub mention_candidates: Vec<MentionCandidate>,
     pub activity: BufferActivity,
     pub unread_count: u32,
     pub last_read_id: Option<String>,
@@ -76,6 +77,12 @@ pub struct MatrixMedia {
     pub mxc_uri: String,
     pub name: String,
     pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MentionCandidate {
+    pub display_name: String,
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone)]

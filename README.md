@@ -16,6 +16,7 @@
 - **Read synchronization** — bidirectional sync of read markers; unread divider line shows where you left off
 - **Server group headers** — buffer list automatically groups channels by network with labeled dividers (toggleable)
 - **Tab completion** — nicknames and emoji (`:fire` + Tab → 🔥), cycling through all matches
+- **Mentions** — type `@` for a searchable member popup; Matrix sends semantic mentions, while IRC inserts a nick highlight
 - **Command history** — Arrow Up/Down in the input bar
 - **Inline search** — `Ctrl+F` filters current buffer scrollback
 - **Context menus** — right-click nicks for `/query` and `/whois`; right-click buffers to leave or close

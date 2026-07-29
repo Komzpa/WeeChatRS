@@ -861,6 +861,7 @@ mod thread_tests {
             server: "matrix".to_owned(),
             messages: VecDeque::new(),
             nicks: Vec::new(),
+            mention_candidates: Vec::new(),
             activity: BufferActivity::None,
             unread_count: 0,
             last_read_id: None,
@@ -1263,6 +1264,8 @@ pub struct WeeChatApp {
 
     // Completion state
     pub(crate) completion: Option<CompletionState>,
+    pub(crate) mention_completion: Option<MentionCompletionState>,
+    pub(crate) selected_mentions: Vec<SelectedMention>,
 
     // Command History
     pub(crate) command_history: VecDeque<String>,
@@ -1380,6 +1383,20 @@ pub(crate) struct ReplyTarget {
     pub(crate) message: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct MentionCompletionState {
+    pub(crate) trigger_byte_idx: usize,
+    pub(crate) cursor_byte_idx: usize,
+    pub(crate) matches: Vec<MentionCandidate>,
+    pub(crate) index: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct SelectedMention {
+    pub(crate) label: String,
+    pub(crate) user_id: String,
+}
+
 impl WeeChatApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (shared_event_tx, event_rx) = mpsc::unbounded_channel::<(String, BackendEvent)>();
@@ -1464,6 +1481,8 @@ impl WeeChatApp {
             preview_tx,
             preview_rx,
             completion: None,
+            mention_completion: None,
+            selected_mentions: Vec::new(),
             command_history: VecDeque::new(),
             history_index: None,
             focus_input: false,
@@ -2149,6 +2168,8 @@ impl WeeChatApp {
         if let Some(prev_id) = self.selected_buffer_id.clone() {
             if prev_id != id {
                 self.reply_target = None;
+                self.mention_completion = None;
+                self.selected_mentions.clear();
                 if let Some((client, raw_id)) = self.client_for_buffer(&prev_id) {
                     client.mark_read(&raw_id);
                 }
@@ -2545,9 +2566,20 @@ impl eframe::App for WeeChatApp {
         let mut search_shortcut = false;
         let mut jump_next_unread = false;
         let mut jump_buffer_n: Option<usize> = None;
+        let mut mention_up = false;
+        let mut mention_down = false;
+        let mut mention_accept = false;
+        let mut mention_cancel = false;
+        let mention_open = self.mention_completion.is_some();
 
         ctx.input_mut(|i| {
-            if i.consume_key(Modifiers::NONE, Key::Tab) {
+            if mention_open {
+                mention_accept = i.consume_key(Modifiers::NONE, Key::Tab)
+                    || i.consume_key(Modifiers::NONE, Key::Enter);
+                mention_up = i.consume_key(Modifiers::NONE, Key::ArrowUp);
+                mention_down = i.consume_key(Modifiers::NONE, Key::ArrowDown);
+                mention_cancel = i.consume_key(Modifiers::NONE, Key::Escape);
+            } else if i.consume_key(Modifiers::NONE, Key::Tab) {
                 tab_pressed = true;
             }
 
@@ -3662,8 +3694,19 @@ impl eframe::App for WeeChatApp {
                                 self.focus_input = false;
                             }
 
-                            if res.has_focus() {
-                                if tab_pressed {
+            if res.has_focus() {
+                                if mention_cancel {
+                                    self.mention_completion = None;
+                                } else if mention_up {
+                                    self.move_mention_selection(-1);
+                                    res.request_focus();
+                                } else if mention_down {
+                                    self.move_mention_selection(1);
+                                    res.request_focus();
+                                } else if mention_accept {
+                                    self.accept_mention(None, ctx, res.id);
+                                    res.request_focus();
+                                } else if tab_pressed {
                                     self.perform_completion(ctx, res.id);
                                     res.request_focus();
                                 } else if history_up {
@@ -3678,10 +3721,69 @@ impl eframe::App for WeeChatApp {
                                         self.completion = None;
                                     }
                                 }
+                                if !mention_accept && !mention_cancel {
+                                    self.refresh_mention_completion(ctx, res.id);
+                                }
+                                if res.changed() {
+                                    self.reconcile_selected_mentions();
+                                }
                             }
 
                             if ui.add(egui::Button::new(egui::RichText::new("Send").color(Color32::WHITE).strong()).fill(accent_color).min_size(Vec2::new(60.0, 0.0))).clicked() || (res.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter))) {
                                 self.send_current_message();
+                                res.request_focus();
+                            }
+
+                            let popup_state = self.mention_completion.clone();
+                            let mut clicked_mention = None;
+                            if let Some(state) = popup_state {
+                                let popup_id = res.id.with("mention_popup");
+                                ui.memory_mut(|memory| memory.open_popup(popup_id));
+                                egui::popup::popup_above_or_below_widget(
+                                    ui,
+                                    popup_id,
+                                    &res,
+                                    egui::AboveOrBelow::Above,
+                                    |ui| {
+                                        ui.set_min_width(res.rect.width().min(520.0));
+                                        ui.set_max_width(res.rect.width().min(520.0));
+                                        ui.label(
+                                            egui::RichText::new("MENTION")
+                                                .small()
+                                                .strong()
+                                                .color(accent_color),
+                                        );
+                                        egui::ScrollArea::vertical()
+                                            .max_height(260.0)
+                                            .show(ui, |ui| {
+                                                for (index, candidate) in
+                                                    state.matches.iter().enumerate()
+                                                {
+                                                    let label =
+                                                        if candidate.display_name
+                                                            == candidate.user_id
+                                                        {
+                                                            candidate.display_name.clone()
+                                                        } else {
+                                                            format!(
+                                                                "{}  {}",
+                                                                candidate.display_name,
+                                                                candidate.user_id,
+                                                            )
+                                                        };
+                                                    if ui.selectable_label(
+                                                        index == state.index,
+                                                        label,
+                                                    ).clicked() {
+                                                        clicked_mention = Some(index);
+                                                    }
+                                                }
+                                            });
+                                    },
+                                );
+                            }
+                            if let Some(index) = clicked_mention {
+                                self.accept_mention(Some(index), ctx, res.id);
                                 res.request_focus();
                             }
                         });

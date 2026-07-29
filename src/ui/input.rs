@@ -1,6 +1,10 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use egui::text_edit::TextEditState;
 use egui::text::{CCursorRange, CCursor};
-use crate::ui::app::{WeeChatApp, CompletionState};
+use crate::relay::models::MentionCandidate;
+use crate::ui::app::{
+    WeeChatApp, CompletionState, MentionCompletionState, SelectedMention,
+};
 use crate::ui::emoji;
 
 fn selected_char_range(ctx: &egui::Context, id: egui::Id, text: &str) -> (usize, usize) {
@@ -178,7 +182,160 @@ fn matrix_reply_command(event_id: &str, message: &str) -> String {
     format!("/reply {} {}", event_id, message)
 }
 
+fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
+    text.char_indices().nth(char_idx).map(|(idx, _)| idx).unwrap_or(text.len())
+}
+
+fn mention_query(text: &str, cursor_char_idx: usize) -> Option<(usize, usize, &str)> {
+    let cursor_byte_idx = char_to_byte_idx(text, cursor_char_idx);
+    let before_cursor = &text[..cursor_byte_idx];
+    let trigger_byte_idx = before_cursor.char_indices().rev().find_map(|(idx, ch)| {
+        if ch != '@' { return None; }
+        let valid_boundary = idx == 0 || before_cursor[..idx].chars().next_back()
+            .map(|previous| previous.is_whitespace() || matches!(previous, '(' | '[' | '{' | '"' | '\''))
+            .unwrap_or(true);
+        valid_boundary.then_some(idx)
+    })?;
+    let query = &before_cursor[trigger_byte_idx + '@'.len_utf8()..];
+    if query.starts_with(char::is_whitespace) || query.chars().count() > 80 {
+        return None;
+    }
+    Some((trigger_byte_idx, cursor_byte_idx, query))
+}
+
+fn matching_mentions(candidates: &[MentionCandidate], query: &str) -> Vec<MentionCandidate> {
+    let query = query.to_lowercase();
+    let mut matches: Vec<_> = candidates.iter()
+        .filter(|candidate| candidate.display_name.to_lowercase().contains(&query)
+            || candidate.user_id.to_lowercase().contains(&query))
+        .cloned()
+        .collect();
+    matches.sort_by_key(|candidate| {
+        let name = candidate.display_name.to_lowercase();
+        let id = candidate.user_id.to_lowercase();
+        (!name.starts_with(&query), !id.trim_start_matches('@').starts_with(&query), name, id)
+    });
+
+    if query.is_empty() {
+        let mut homeservers: Vec<(String, Vec<MentionCandidate>)> = Vec::new();
+        for candidate in matches {
+            let homeserver = candidate.user_id.rsplit_once(':')
+                .map(|(_, homeserver)| homeserver)
+                .unwrap_or("")
+                .to_owned();
+            if let Some((_, candidates)) = homeservers.iter_mut()
+                .find(|(existing, _)| existing == &homeserver)
+            {
+                candidates.push(candidate);
+            } else {
+                homeservers.push((homeserver, vec![candidate]));
+            }
+        }
+
+        let mut diversified = Vec::new();
+        let mut round = 0;
+        while diversified.len() < 8 {
+            let before = diversified.len();
+            for (_, candidates) in &homeservers {
+                if let Some(candidate) = candidates.get(round) {
+                    diversified.push(candidate.clone());
+                    if diversified.len() == 8 { break; }
+                }
+            }
+            if diversified.len() == before { break; }
+            round += 1;
+        }
+        return diversified;
+    }
+
+    matches.truncate(8);
+    matches
+}
+
 impl WeeChatApp {
+    pub(crate) fn refresh_mention_completion(&mut self, ctx: &egui::Context, id: egui::Id) {
+        let cursor_char_idx = TextEditState::load(ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index)
+            .unwrap_or_else(|| self.input_text.chars().count());
+        let Some((trigger_byte_idx, cursor_byte_idx, query)) =
+            mention_query(&self.input_text, cursor_char_idx)
+        else {
+            self.mention_completion = None;
+            return;
+        };
+        let Some(buffer) = self.selected_buffer_id.as_ref()
+            .and_then(|buffer_id| self.buffers.iter().find(|buffer| &buffer.id == buffer_id))
+        else {
+            self.mention_completion = None;
+            return;
+        };
+        let fallback_candidates;
+        let candidates = if buffer.mention_candidates.is_empty() {
+            fallback_candidates = buffer.nicks.iter().map(|nick| MentionCandidate {
+                display_name: nick.name.clone(),
+                user_id: nick.name.clone(),
+            }).collect::<Vec<_>>();
+            fallback_candidates.as_slice()
+        } else {
+            buffer.mention_candidates.as_slice()
+        };
+        let matches = matching_mentions(candidates, query);
+        if matches.is_empty() {
+            self.mention_completion = None;
+            return;
+        }
+        let previous_index = self.mention_completion.as_ref()
+            .map(|state| state.index)
+            .unwrap_or(0);
+        self.mention_completion = Some(MentionCompletionState {
+            trigger_byte_idx,
+            cursor_byte_idx,
+            index: previous_index.min(matches.len() - 1),
+            matches,
+        });
+    }
+
+    pub(crate) fn move_mention_selection(&mut self, delta: isize) {
+        let Some(state) = &mut self.mention_completion else { return; };
+        state.index =
+            (state.index as isize + delta).rem_euclid(state.matches.len() as isize) as usize;
+    }
+
+    pub(crate) fn accept_mention(&mut self, index: Option<usize>, ctx: &egui::Context, id: egui::Id) {
+        let Some(state) = self.mention_completion.take() else { return; };
+        let index = index.unwrap_or(state.index).min(state.matches.len() - 1);
+        let candidate = &state.matches[index];
+        let label = if candidate.display_name.starts_with('@') {
+            candidate.display_name.clone()
+        } else {
+            format!("@{}", candidate.display_name)
+        };
+        let mut new_text = self.input_text[..state.trigger_byte_idx].to_owned();
+        new_text.push_str(&label);
+        new_text.push(' ');
+        let cursor_char_idx = new_text.chars().count();
+        new_text.push_str(&self.input_text[state.cursor_byte_idx..]);
+        self.input_text = new_text;
+        self.selected_mentions.retain(|mention| {
+            mention.user_id != candidate.user_id && mention.label != label
+        });
+        self.selected_mentions.push(SelectedMention {
+            label,
+            user_id: candidate.user_id.clone(),
+        });
+        if let Some(mut edit_state) = TextEditState::load(ctx, id) {
+            edit_state.cursor.set_char_range(Some(CCursorRange::one(
+                CCursor::new(cursor_char_idx),
+            )));
+            edit_state.store(ctx, id);
+        }
+    }
+
+    pub(crate) fn reconcile_selected_mentions(&mut self) {
+        self.selected_mentions.retain(|mention| self.input_text.contains(&mention.label));
+    }
+
     pub(crate) fn perform_completion(&mut self, ctx: &egui::Context, id: egui::Id) {
         let mut new_cursor_char = 0usize;
 
@@ -419,13 +576,33 @@ impl WeeChatApp {
         }
 
         if let Some(buffer_id) = self.selected_buffer_id.clone() {
+            let semantic_matrix_message = !is_command
+                && !sends_reply
+                && !self.selected_mentions.is_empty()
+                && self.buffer_by_id(&buffer_id)
+                    .map(|buffer| buffer.plugin == "matrix")
+                    .unwrap_or(false);
+            let command = if semantic_matrix_message {
+                let payload = serde_json::json!({
+                    "body": msg,
+                    "user_ids": self.selected_mentions.iter()
+                        .map(|mention| mention.user_id.as_str())
+                        .collect::<Vec<_>>(),
+                });
+                format!(
+                    "/matrix-send {}",
+                    URL_SAFE_NO_PAD.encode(payload.to_string()),
+                )
+            } else {
+                msg.clone()
+            };
             if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
                 let command = self
                     .reply_target
                     .as_ref()
                     .filter(|reply| reply.buffer_id == buffer_id)
                     .map(|reply| matrix_reply_command(&reply.matrix_event_id, &msg))
-                    .unwrap_or_else(|| msg.clone());
+                    .unwrap_or(command);
                 client.send_message(&raw_id, &command);
                 if is_command && !sends_reply {
                     client.fetch_buffer_list();
@@ -443,6 +620,8 @@ impl WeeChatApp {
         self.input_text.clear();
         self.completion = None;
         self.reply_target = None;
+        self.mention_completion = None;
+        self.selected_mentions.clear();
         self.history_index = None;
     }
 
@@ -470,14 +649,51 @@ impl WeeChatApp {
 }
 
 #[cfg(test)]
-mod reply_tests {
-    use super::{matrix_reply_command, replace_selection, selected_text};
+mod tests {
+    use super::{
+        matching_mentions, matrix_reply_command, mention_query, replace_selection,
+        selected_text,
+    };
+    use crate::relay::models::MentionCandidate;
+
+    fn candidate(display_name: &str, user_id: &str) -> MentionCandidate {
+        MentionCandidate {
+            display_name: display_name.to_owned(),
+            user_id: user_id.to_owned(),
+        }
+    }
 
     #[test]
     fn reply_command_keeps_the_selected_matrix_event() {
         assert_eq!(
             matrix_reply_command("$chosen:elsewhere.example", "not the latest"),
             "/reply $chosen:elsewhere.example not the latest"
+        );
+    }
+
+    #[test]
+    fn mention_query_starts_at_at_sign_and_keeps_unicode_cursor() {
+        assert_eq!(mention_query("Привет @Ада", 11), Some((13, 20, "Ада")));
+    }
+
+    #[test]
+    fn mention_query_does_not_open_inside_an_email_address() {
+        assert_eq!(mention_query("mail@example.org", 16), None);
+    }
+
+    #[test]
+    fn mention_matches_display_name_and_matrix_id() {
+        let candidates = vec![
+            candidate("Ada Lovelace", "@ada:example.org"),
+            candidate("Grace Hopper", "@amazing:example.org"),
+        ];
+        assert_eq!(
+            matching_mentions(&candidates, "ada"),
+            vec![candidate("Ada Lovelace", "@ada:example.org")],
+        );
+        assert_eq!(
+            matching_mentions(&candidates, "amazing"),
+            vec![candidate("Grace Hopper", "@amazing:example.org")],
         );
     }
 
@@ -489,5 +705,36 @@ mod reply_tests {
         let cursor = replace_selection(&mut text, 1, 4, "🌍");
         assert_eq!(text, "a🌍z");
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn empty_matrix_query_represents_federated_homeservers() {
+        let candidates = vec![
+            candidate("Ada", "@ada:matrix.org"),
+            candidate("Bob", "@bob:matrix.org"),
+            candidate("Cara", "@cara:osgeo.org"),
+            candidate("Dan", "@dan:dend.ro"),
+        ];
+        assert_eq!(
+            matching_mentions(&candidates, ""),
+            vec![
+                candidate("Ada", "@ada:matrix.org"),
+                candidate("Cara", "@cara:osgeo.org"),
+                candidate("Dan", "@dan:dend.ro"),
+                candidate("Bob", "@bob:matrix.org"),
+            ],
+        );
+    }
+
+    #[test]
+    fn empty_irc_query_keeps_nicks_alphabetical() {
+        let candidates = vec![
+            candidate("Zed", "Zed"),
+            candidate("alice", "alice"),
+        ];
+        assert_eq!(
+            matching_mentions(&candidates, ""),
+            vec![candidate("alice", "alice"), candidate("Zed", "Zed")],
+        );
     }
 }
