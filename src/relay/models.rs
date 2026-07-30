@@ -72,6 +72,13 @@ pub struct MatrixReplyContext {
 }
 
 #[derive(Debug, Clone)]
+pub struct MatrixMedia {
+    pub mxc_uri: String,
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Line {
     pub id: String,
@@ -80,6 +87,7 @@ pub struct Line {
     pub message: String,
     pub matrix_event_id: Option<String>,
     pub matrix_reply: Option<MatrixReplyContext>,
+    pub matrix_media: Option<MatrixMedia>,
     pub displayed: bool,
     pub highlight: bool,
     // Cached: parsed once at insertion. Theme/font-independent — resolved at render.
@@ -114,6 +122,7 @@ impl Line {
             message,
             matrix_event_id: None,
             matrix_reply: None,
+            matrix_media: None,
             displayed,
             highlight,
             parsed_prefix,
@@ -123,6 +132,11 @@ impl Line {
             plain_prefix_lower,
             plain_message_lower,
         }
+    }
+
+    pub fn with_matrix_media(mut self, matrix_media: Option<MatrixMedia>) -> Self {
+        self.matrix_media = matrix_media;
+        self
     }
 }
 

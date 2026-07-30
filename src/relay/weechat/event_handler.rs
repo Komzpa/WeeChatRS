@@ -1,5 +1,6 @@
 use crate::relay::backend::BackendEvent;
 use crate::relay::models::*;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{WeeChatApp, MAX_STORED_LINES};
 use chrono::{Utc, DateTime, Local};
 use serde_json::Value;
@@ -9,6 +10,46 @@ static ANSI_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 fn ansi_re() -> &'static regex::Regex {
     ANSI_RE.get_or_init(|| regex::Regex::new(r"\x1B\[[0-9;]*[A-Za-z]").unwrap())
+}
+
+#[cfg(test)]
+mod matrix_media_tests {
+    use super::WeeChatApp;
+    use serde_json::json;
+
+    #[test]
+    fn matrix_image_metadata_is_read_from_structured_tags() {
+        let object = json!({
+            "tags": [
+                "matrix_media",
+                "matrix_media_kind_image",
+                "matrix_media_name_aW1hZ2UucG5n",
+                "matrix_media_uri_bXhjOi8vbWF0cml4Lm9yZy9zb21lLW1lZGlhLWlk"
+            ]
+        });
+        let media =
+            WeeChatApp::matrix_media_from_tags(object.as_object().unwrap())
+                .expect("valid image metadata");
+        assert_eq!(media.kind, "image");
+        assert_eq!(media.name, "image.png");
+        assert_eq!(media.mxc_uri, "mxc://matrix.org/some-media-id");
+    }
+
+    #[test]
+    fn non_mxc_matrix_media_uri_is_rejected() {
+        let object = json!({
+            "tags": [
+                "matrix_media",
+                "matrix_media_kind_image",
+                "matrix_media_name_aW1hZ2UucG5n",
+                "matrix_media_uri_aHR0cHM6Ly9leGFtcGxlLm9yZy9pbWFnZS5wbmc"
+            ]
+        });
+        assert!(
+            WeeChatApp::matrix_media_from_tags(object.as_object().unwrap())
+                .is_none()
+        );
+    }
 }
 
 
@@ -560,6 +601,46 @@ impl WeeChatApp {
         })
     }
 
+    fn decode_media_tag(
+        obj: &serde_json::Map<String, Value>,
+        prefix: &str,
+    ) -> Option<String> {
+        let encoded = Self::raw_tag_value(obj, prefix)?;
+        String::from_utf8(URL_SAFE_NO_PAD.decode(encoded).ok()?).ok()
+    }
+
+    fn matrix_media_from_tags(
+        obj: &serde_json::Map<String, Value>,
+    ) -> Option<MatrixMedia> {
+        if !Self::has_tag(obj, "matrix_media") {
+            return None;
+        }
+
+        let mxc_uri = Self::decode_media_tag(obj, "matrix_media_uri_")?;
+        let parsed = url::Url::parse(&mxc_uri).ok()?;
+        if parsed.scheme() != "mxc"
+            || parsed.host_str().is_none()
+            || parsed.path().trim_matches('/').is_empty()
+        {
+            return None;
+        }
+
+        let kind = Self::raw_tag_value(obj, "matrix_media_kind_")?;
+        if !matches!(kind.as_str(), "audio" | "file" | "image" | "video") {
+            return None;
+        }
+
+        let name = Self::decode_media_tag(obj, "matrix_media_name_")
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "attachment".to_owned());
+
+        Some(MatrixMedia {
+            mxc_uri,
+            name,
+            kind,
+        })
+    }
+
     fn parse_id(v: &Value) -> Option<String> {
         v.as_i64().map(|i| i.to_string())
             .or_else(|| v.as_f64().map(|f| (f as i64).to_string()))
@@ -952,6 +1033,7 @@ impl WeeChatApp {
             );
             line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
             line.matrix_reply = Self::matrix_reply_from_tags(obj);
+            line.matrix_media = Self::matrix_media_from_tags(obj);
             Some(line)
         }).collect();
 
@@ -1148,6 +1230,7 @@ impl WeeChatApp {
                     );
                     line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
                     line.matrix_reply = Self::matrix_reply_from_tags(obj);
+                    line.matrix_media = Self::matrix_media_from_tags(obj);
 
                     let is_selected = self.selected_buffer_id.as_deref() == Some(&buffer_id);
                     let mut notify_data: Option<(String, String, String)> = None;
@@ -1233,6 +1316,7 @@ impl WeeChatApp {
                             );
                             line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
                             line.matrix_reply = Self::matrix_reply_from_tags(obj);
+                            line.matrix_media = Self::matrix_media_from_tags(obj);
                             buffer.messages.push_back(line);
                             if buffer.messages.len() > MAX_STORED_LINES {
                                 buffer.messages.pop_front();
