@@ -5,10 +5,14 @@ use crate::ui::ansi::ANSIParser;
 use crate::ui::theme::AppTheme;
 use crate::ui::keybinds::KeybindsMap;
 use crate::ui::url_safety::is_safe_public_url;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use egui::{FontId, ScrollArea, Label, Key, Visuals, TextStyle, FontFamily, Color32, text::LayoutJob, Margin, Frame, Rounding, Stroke, Vec2, Modifiers, Rect, Painter};
 use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 pub(crate) enum ImageState {
     Loading,
@@ -136,6 +140,179 @@ pub const INITIAL_LINES: usize = 300;
 const IMAGE_CACHE_MAX: usize = 200;
 const PREVIEW_CACHE_MAX: usize = 200;
 const PREFIX_COL_WIDTHS_MAX: usize = 500;
+const MAX_INLINE_IMAGE_WIDTH: f32 = 1200.0;
+const MAX_INLINE_IMAGE_HEIGHT: f32 = 800.0;
+const MAX_INLINE_IMAGE_UPSCALE: f32 = 2.0;
+const INLINE_IMAGE_VIEWPORT_FRACTION: f32 = 0.78;
+
+fn matrix_media_cache_path(mxc_uri: &str) -> PathBuf {
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    cache_root
+        .join("weechatrs")
+        .join("matrix-media")
+        .join(URL_SAFE_NO_PAD.encode(mxc_uri))
+}
+
+fn quote_weechat_argument(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn is_matrix_media_status_line(message: &str) -> bool {
+    message.contains("/weechatrs/matrix-media/")
+        && (message.contains("matrix: Downloading media to")
+            || message.contains("matrix: Successfully downloaded media to"))
+}
+
+async fn wait_for_matrix_media(path: &Path) -> Result<Vec<u8>, String> {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut previous_size = None;
+    let mut stable_samples = 0;
+
+    loop {
+        if let Ok(metadata) = tokio::fs::metadata(path).await {
+            let size = metadata.len();
+            if size > 0 && previous_size == Some(size) {
+                stable_samples += 1;
+                if stable_samples >= 10 {
+                    #[cfg(unix)]
+                    tokio::fs::set_permissions(
+                        path,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    return tokio::fs::read(path)
+                        .await
+                        .map_err(|error| error.to_string());
+                }
+            } else {
+                stable_samples = 0;
+            }
+            previous_size = Some(size);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Matrix media download did not finish".to_owned());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Fit an inline preview into the chat column.
+///
+/// Matrix servers and clients commonly expose conservative thumbnails even
+/// when the attachment is a screenshot. A bounded 2x upscale keeps those
+/// previews readable without allowing tiny assets or large portraits to take
+/// over the timeline.
+fn inline_image_preview_size(
+    original: Vec2,
+    available_width: f32,
+    viewport_height: f32,
+) -> Vec2 {
+    if original.x <= 0.0 || original.y <= 0.0 {
+        return original;
+    }
+
+    let max_width =
+        (available_width - 32.0).clamp(1.0, MAX_INLINE_IMAGE_WIDTH);
+    let max_height = (viewport_height * INLINE_IMAGE_VIEWPORT_FRACTION)
+        .clamp(240.0, MAX_INLINE_IMAGE_HEIGHT);
+    let scale = (max_width / original.x)
+        .min(max_height / original.y)
+        .min(MAX_INLINE_IMAGE_UPSCALE);
+    original * scale
+}
+
+#[cfg(test)]
+mod inline_matrix_image_tests {
+    use super::{
+        inline_image_preview_size, is_matrix_media_status_line,
+        matrix_media_cache_path, quote_weechat_argument,
+    };
+    use egui::Vec2;
+
+    #[test]
+    fn portrait_preview_is_capped_by_height() {
+        assert_eq!(
+            inline_image_preview_size(
+                Vec2::new(900.0, 1800.0),
+                1200.0,
+                900.0,
+            ),
+            Vec2::new(351.0, 702.0),
+        );
+    }
+
+    #[test]
+    fn landscape_preview_is_capped_by_width() {
+        assert_eq!(
+            inline_image_preview_size(
+                Vec2::new(2000.0, 1000.0),
+                1200.0,
+                900.0,
+            ),
+            Vec2::new(1168.0, 584.0),
+        );
+    }
+
+    #[test]
+    fn small_preview_is_upscaled_but_stays_bounded() {
+        assert_eq!(
+            inline_image_preview_size(
+                Vec2::new(200.0, 100.0),
+                1200.0,
+                900.0,
+            ),
+            Vec2::new(400.0, 200.0),
+        );
+    }
+
+    #[test]
+    fn screenshot_thumbnail_becomes_readable() {
+        assert_eq!(
+            inline_image_preview_size(
+                Vec2::new(500.0, 220.0),
+                1600.0,
+                1000.0,
+            ),
+            Vec2::new(1000.0, 440.0),
+        );
+    }
+
+    #[test]
+    fn matrix_media_cache_name_is_path_safe() {
+        let path = matrix_media_cache_path("mxc://matrix.org/some-media-id");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("bXhjOi8vbWF0cml4Lm9yZy9zb21lLW1lZGlhLWlk")
+        );
+    }
+
+    #[test]
+    fn matrix_media_download_path_is_one_weechat_argument() {
+        assert_eq!(
+            quote_weechat_argument("/tmp/a path/\"image\""),
+            "\"/tmp/a path/\\\"image\\\"\""
+        );
+    }
+
+    #[test]
+    fn hides_only_weechatrs_matrix_media_status_lines() {
+        assert!(is_matrix_media_status_line(
+            "matrix: Downloading media to /home/user/.cache/weechatrs/matrix-media/key"
+        ));
+        assert!(!is_matrix_media_status_line(
+            "matrix: Successfully downloaded media to /home/user/downloads/image.png"
+        ));
+    }
+}
 
 /// Drop entries from `map` until its size is at most `cap`. We don't track
 /// insertion order, so eviction picks an arbitrary key — acceptable for caches
@@ -825,6 +1002,59 @@ impl WeeChatApp {
             }
         }
         None
+    }
+
+    fn ensure_matrix_media_loading(
+        &mut self,
+        buffer_id: &str,
+        media: &MatrixMedia,
+    ) {
+        let cache_key = media.mxc_uri.clone();
+        self.image_expanded.insert(cache_key.clone());
+        if self.image_cache.contains_key(&cache_key) {
+            return;
+        }
+        self.image_cache
+            .insert(cache_key.clone(), ImageState::Loading);
+
+        let path = matrix_media_cache_path(&media.mxc_uri);
+        let parent_ready = path
+            .parent()
+            .ok_or_else(|| "Matrix media cache has no parent".to_owned())
+            .and_then(|parent| {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| error.to_string())?;
+                #[cfg(unix)]
+                std::fs::set_permissions(
+                    parent,
+                    std::fs::Permissions::from_mode(0o700),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            });
+        if let Err(error) = parent_ready {
+            let _ = self.image_tx.send((cache_key, Err(error)));
+            return;
+        }
+
+        if !path.is_file() {
+            if let Some((client, raw_buffer_id)) =
+                self.client_for_buffer(buffer_id)
+            {
+                let command = format!(
+                    "/matrix media download {} {}",
+                    media.mxc_uri,
+                    quote_weechat_argument(&path.display().to_string())
+                );
+                client.send_message(&raw_buffer_id, &command);
+            }
+        }
+
+        let tx = self.image_tx.clone();
+        tokio::spawn(async move {
+            let result = wait_for_matrix_media(&path).await;
+            let _ = tx.send((cache_key, result));
+        });
     }
 
     pub(crate) fn select_buffer(&mut self, id: String) {
@@ -2171,6 +2401,7 @@ impl eframe::App for WeeChatApp {
                                 };
                                 for line in messages {
                                     if !self.show_filtered_lines && !line.displayed { continue; }
+                                    if is_matrix_media_status_line(&line.plain_message) { continue; }
 
                                     if let Some(q) = &search_query {
                                         if !line.plain_prefix_lower.contains(q) && !line.plain_message_lower.contains(q) { continue; }
@@ -2206,7 +2437,40 @@ impl eframe::App for WeeChatApp {
                                         marker_shown = true;
                                     }
 
-                                    let msg_sections = &line.parsed_message;
+                                    let matrix_image = line
+                                        .matrix_media
+                                        .as_ref()
+                                        .filter(|media| media.kind == "image")
+                                        .cloned();
+                                    if self.show_inline_images {
+                                        if let (
+                                            Some(buffer_id),
+                                            Some(media),
+                                        ) = (
+                                            current_buffer_id.as_deref(),
+                                            matrix_image.as_ref(),
+                                        ) {
+                                            if !self
+                                                .image_cache
+                                                .contains_key(&media.mxc_uri)
+                                            {
+                                                self.ensure_matrix_media_loading(
+                                                    buffer_id,
+                                                    media,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    let matrix_message_sections =
+                                        matrix_image.as_ref().map(|media| {
+                                            ANSIParser::parse(&format!(
+                                                "📎 {}",
+                                                media.name
+                                            ))
+                                        });
+                                    let msg_sections = matrix_message_sections
+                                        .as_deref()
+                                        .unwrap_or(&line.parsed_message);
 
                                     let image_urls_in_line: Vec<String> = if self.show_inline_images {
                                         msg_sections.iter()
@@ -2415,9 +2679,12 @@ impl eframe::App for WeeChatApp {
                                                         match self.image_cache.get(url) {
                                                             Some(ImageState::Loaded(texture)) => {
                                                                 let orig = texture.size_vec2();
-                                                                let max_w = (ui.available_width() - 32.0).min(500.0);
-                                                                let scale = if orig.x > max_w { max_w / orig.x } else { 1.0 };
-                                                                ui.add(egui::Image::new((texture.id(), orig * scale)).rounding(4.0));
+                                                                let size = inline_image_preview_size(
+                                                                    orig,
+                                                                    ui.available_width(),
+                                                                    ui.clip_rect().height(),
+                                                                );
+                                                                ui.add(egui::Image::new((texture.id(), size)).rounding(4.0));
                                                             }
                                                             Some(ImageState::Loading) | None => {
                                                                 ui.label(egui::RichText::new("Loading image…").color(text_muted).italics().small());
@@ -2429,6 +2696,39 @@ impl eframe::App for WeeChatApp {
                                                         ui.add_space(4.0);
                                                     }
                                                 }
+                                            }
+
+                                            if let Some(media) = &matrix_image {
+                                                ui.add_space(4.0);
+                                                match self.image_cache.get(&media.mxc_uri) {
+                                                    Some(ImageState::Loaded(texture)) => {
+                                                        let size = inline_image_preview_size(
+                                                            texture.size_vec2(),
+                                                            ui.available_width(),
+                                                            ui.clip_rect().height(),
+                                                        );
+                                                        ui.add(egui::Image::new((
+                                                            texture.id(),
+                                                            size,
+                                                        )).rounding(4.0));
+                                                    }
+                                                    Some(ImageState::Loading) | None => {
+                                                        ui.label(
+                                                            egui::RichText::new("Loading image…")
+                                                                .color(text_muted)
+                                                                .italics()
+                                                                .small(),
+                                                        );
+                                                    }
+                                                    Some(ImageState::Failed) => {
+                                                        ui.label(
+                                                            egui::RichText::new("Failed to load image")
+                                                                .color(Color32::from_rgb(220, 80, 80))
+                                                                .small(),
+                                                        );
+                                                    }
+                                                }
+                                                ui.add_space(4.0);
                                             }
 
                                             if self.show_link_previews {
@@ -2472,10 +2772,13 @@ impl eframe::App for WeeChatApp {
                                                                     if let Some(iu) = &img_url {
                                                                         if let Some(ImageState::Loaded(texture)) = self.image_cache.get(iu) {
                                                                             let orig = texture.size_vec2();
-                                                                            let max_w = ui.available_width().min(460.0);
-                                                                            let scale = if orig.x > max_w { max_w / orig.x } else { 1.0 };
+                                                                            let size = inline_image_preview_size(
+                                                                                orig,
+                                                                                ui.available_width(),
+                                                                                ui.clip_rect().height(),
+                                                                            );
                                                                             ui.add_space(4.0);
-                                                                            ui.add(egui::Image::new((texture.id(), orig * scale)).rounding(4.0));
+                                                                            ui.add(egui::Image::new((texture.id(), size)).rounding(4.0));
                                                                         }
                                                                     }
                                                                 });

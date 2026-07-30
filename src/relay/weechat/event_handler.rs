@@ -1,5 +1,6 @@
 use crate::relay::backend::BackendEvent;
 use crate::relay::models::*;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{WeeChatApp, MAX_STORED_LINES};
 use chrono::{Utc, DateTime, Local};
 use serde_json::Value;
@@ -9,6 +10,46 @@ static ANSI_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 fn ansi_re() -> &'static regex::Regex {
     ANSI_RE.get_or_init(|| regex::Regex::new(r"\x1B\[[0-9;]*[A-Za-z]").unwrap())
+}
+
+#[cfg(test)]
+mod matrix_media_tests {
+    use super::WeeChatApp;
+    use serde_json::json;
+
+    #[test]
+    fn matrix_image_metadata_is_read_from_structured_tags() {
+        let object = json!({
+            "tags": [
+                "matrix_media",
+                "matrix_media_kind_image",
+                "matrix_media_name_aW1hZ2UucG5n",
+                "matrix_media_uri_bXhjOi8vbWF0cml4Lm9yZy9zb21lLW1lZGlhLWlk"
+            ]
+        });
+        let media =
+            WeeChatApp::matrix_media_from_tags(object.as_object().unwrap())
+                .expect("valid image metadata");
+        assert_eq!(media.kind, "image");
+        assert_eq!(media.name, "image.png");
+        assert_eq!(media.mxc_uri, "mxc://matrix.org/some-media-id");
+    }
+
+    #[test]
+    fn non_mxc_matrix_media_uri_is_rejected() {
+        let object = json!({
+            "tags": [
+                "matrix_media",
+                "matrix_media_kind_image",
+                "matrix_media_name_aW1hZ2UucG5n",
+                "matrix_media_uri_aHR0cHM6Ly9leGFtcGxlLm9yZy9pbWFnZS5wbmc"
+            ]
+        });
+        assert!(
+            WeeChatApp::matrix_media_from_tags(object.as_object().unwrap())
+                .is_none()
+        );
+    }
 }
 
 
@@ -475,6 +516,63 @@ impl WeeChatApp {
         }
     }
 
+    fn raw_tag_value(
+        obj: &serde_json::Map<String, Value>,
+        prefix: &str,
+    ) -> Option<String> {
+        match obj.get("tags") {
+            Some(Value::Array(tags)) => tags
+                .iter()
+                .filter_map(Value::as_str)
+                .find_map(|tag| tag.strip_prefix(prefix).map(str::to_owned)),
+            Some(Value::String(tags)) => tags
+                .split(',')
+                .map(str::trim)
+                .find_map(|tag| tag.strip_prefix(prefix).map(str::to_owned)),
+            _ => None,
+        }
+    }
+
+    fn decode_media_tag(
+        obj: &serde_json::Map<String, Value>,
+        prefix: &str,
+    ) -> Option<String> {
+        let encoded = Self::raw_tag_value(obj, prefix)?;
+        String::from_utf8(URL_SAFE_NO_PAD.decode(encoded).ok()?).ok()
+    }
+
+    fn matrix_media_from_tags(
+        obj: &serde_json::Map<String, Value>,
+    ) -> Option<MatrixMedia> {
+        if !Self::has_tag(obj, "matrix_media") {
+            return None;
+        }
+
+        let mxc_uri = Self::decode_media_tag(obj, "matrix_media_uri_")?;
+        let parsed = url::Url::parse(&mxc_uri).ok()?;
+        if parsed.scheme() != "mxc"
+            || parsed.host_str().is_none()
+            || parsed.path().trim_matches('/').is_empty()
+        {
+            return None;
+        }
+
+        let kind = Self::raw_tag_value(obj, "matrix_media_kind_")?;
+        if !matches!(kind.as_str(), "audio" | "file" | "image" | "video") {
+            return None;
+        }
+
+        let name = Self::decode_media_tag(obj, "matrix_media_name_")
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "attachment".to_owned());
+
+        Some(MatrixMedia {
+            mxc_uri,
+            name,
+            kind,
+        })
+    }
+
     fn parse_id(v: &Value) -> Option<String> {
         v.as_i64().map(|i| i.to_string())
             .or_else(|| v.as_f64().map(|f| (f as i64).to_string()))
@@ -801,7 +899,17 @@ impl WeeChatApp {
             let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
             let timestamp = Self::parse_date(obj.get("date"));
             let highlight = obj.get("highlight").and_then(|v| v.as_bool()).unwrap_or(false);
-            Some(Line::new(id, timestamp, prefix.to_string(), message.to_string(), displayed, highlight))
+            Some(
+                Line::new(
+                    id,
+                    timestamp,
+                    prefix.to_string(),
+                    message.to_string(),
+                    displayed,
+                    highlight,
+                )
+                .with_matrix_media(Self::matrix_media_from_tags(obj)),
+            )
         }).collect();
 
         let mut log_entry: Option<String> = None;
@@ -979,7 +1087,15 @@ impl WeeChatApp {
                         .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string());
                     let timestamp = Self::parse_date(obj.get("date"));
 
-                    let line = Line::new(id, timestamp, prefix.to_string(), message.to_string(), displayed, is_highlight);
+                    let line = Line::new(
+                        id,
+                        timestamp,
+                        prefix.to_string(),
+                        message.to_string(),
+                        displayed,
+                        is_highlight,
+                    )
+                    .with_matrix_media(Self::matrix_media_from_tags(obj));
 
                     let is_selected = self.selected_buffer_id.as_deref() == Some(&buffer_id);
                     let mut notify_data: Option<(String, String, String)> = None;
@@ -1049,7 +1165,17 @@ impl WeeChatApp {
                             let prefix = obj.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
                             let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
                             let timestamp = Self::parse_date(obj.get("date"));
-                            buffer.messages.push_back(Line::new(line_id, timestamp, prefix.to_string(), message.to_string(), displayed, false));
+                            buffer.messages.push_back(
+                                Line::new(
+                                    line_id,
+                                    timestamp,
+                                    prefix.to_string(),
+                                    message.to_string(),
+                                    displayed,
+                                    false,
+                                )
+                                .with_matrix_media(Self::matrix_media_from_tags(obj)),
+                            );
                             if buffer.messages.len() > MAX_STORED_LINES {
                                 buffer.messages.pop_front();
                             }
