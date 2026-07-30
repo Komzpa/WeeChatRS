@@ -153,6 +153,7 @@ pub const LOAD_MORE_LINES: usize = 300;
 pub const MAX_STORED_LINES: usize = 10_000;
 const THREAD_PANEL_DEFAULT_WIDTH: f32 = 380.0;
 const THREAD_PANEL_MIN_WIDTH: f32 = 280.0;
+const PREFIX_MESSAGE_GAP: f32 = 8.0;
 
 #[derive(Clone)]
 struct ThreadMessageBlock {
@@ -2590,6 +2591,8 @@ impl eframe::App for WeeChatApp {
                                         if !self.prefix_suffix.is_empty() {
                                             ui.label(egui::RichText::new(&self.prefix_suffix).font(font_id.clone()).color(text_muted));
                                         }
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        ui.add_space(PREFIX_MESSAGE_GAP);
 
                                         let msg_col_width = ui.available_width();
                                         ui.vertical(|ui| {
