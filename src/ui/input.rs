@@ -1,10 +1,154 @@
 use egui::text_edit::TextEditState;
 use egui::text::{CCursorRange, CCursor};
-use crate::ui::app::{WeeChatApp, CompletionState};
+use crate::ui::app::{CommandCompletionRequest, CompletionState, WeeChatApp};
 use crate::ui::emoji;
 
+fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
+fn apply_native_completion(
+    input: &str,
+    cursor_byte_idx: usize,
+    position_replace: usize,
+    base_word: &str,
+    matched: &str,
+    add_space: bool,
+) -> Option<(String, usize)> {
+    if position_replace > cursor_byte_idx
+        || cursor_byte_idx > input.len()
+        || !input.is_char_boundary(position_replace)
+        || !input.is_char_boundary(cursor_byte_idx)
+    {
+        return None;
+    }
+
+    let expected_end = position_replace.checked_add(base_word.len())?;
+    let replace_end = if expected_end <= input.len()
+        && input.is_char_boundary(expected_end)
+        && input.get(position_replace..expected_end) == Some(base_word)
+    {
+        expected_end
+    } else {
+        cursor_byte_idx
+    };
+    let suffix = input.get(replace_end..)?;
+
+    let mut completed = input[..position_replace].to_owned();
+    completed.push_str(matched);
+    let cursor_byte = if add_space {
+        if suffix.starts_with(' ') {
+            completed.len() + 1
+        } else {
+            completed.push(' ');
+            completed.len()
+        }
+    } else {
+        completed.len()
+    };
+    completed.push_str(suffix);
+    let cursor_char = completed[..cursor_byte].chars().count();
+
+    Some((completed, cursor_char))
+}
+
 impl WeeChatApp {
+    pub(crate) fn request_command_completion(&mut self, ctx: &egui::Context, id: egui::Id) {
+        let cursor_char_idx = TextEditState::load(ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index)
+            .unwrap_or_else(|| self.input_text.chars().count());
+        let cursor_byte_idx = char_to_byte_idx(&self.input_text, cursor_char_idx);
+
+        if !self.input_text.starts_with('/') {
+            self.command_completion = None;
+            self.command_completion_pending = None;
+            return;
+        }
+        let Some(buffer_id) = self.selected_buffer_id.clone() else {
+            self.command_completion = None;
+            self.command_completion_pending = None;
+            return;
+        };
+        if self.command_completion_pending.as_ref().is_some_and(|pending| {
+            pending.buffer_id == buffer_id
+                && pending.input == self.input_text
+                && pending.cursor_byte_idx == cursor_byte_idx
+        }) {
+            return;
+        }
+
+        self.command_completion_request_seq =
+            self.command_completion_request_seq.wrapping_add(1);
+        let sequence = self.command_completion_request_seq;
+        let input = self.input_text.clone();
+        let sent = self
+            .client_for_buffer(&buffer_id)
+            .is_some_and(|(client, raw_id)| {
+                client.request_completion(&raw_id, &input, cursor_byte_idx, sequence)
+            });
+        self.command_completion = None;
+        self.command_completion_pending = sent.then_some(CommandCompletionRequest {
+            sequence,
+            buffer_id,
+            input,
+            cursor_byte_idx,
+        });
+    }
+
+    pub(crate) fn move_command_completion_selection(&mut self, delta: isize) {
+        let Some(state) = &mut self.command_completion else {
+            return;
+        };
+        state.index =
+            (state.index as isize + delta).rem_euclid(state.matches.len() as isize) as usize;
+    }
+
+    pub(crate) fn accept_command_completion(
+        &mut self,
+        index: Option<usize>,
+        ctx: &egui::Context,
+        id: egui::Id,
+    ) {
+        let Some(state) = self.command_completion.take() else {
+            return;
+        };
+        let index = index.unwrap_or(state.index).min(state.matches.len() - 1);
+        let Some((new_text, cursor_char_idx)) = apply_native_completion(
+            &state.source_text,
+            state.cursor_byte_idx,
+            state.position_replace,
+            &state.base_word,
+            &state.matches[index],
+            state.add_space,
+        ) else {
+            return;
+        };
+
+        self.input_text = new_text;
+        self.command_completion_pending = None;
+        if let Some(mut edit_state) = TextEditState::load(ctx, id) {
+            edit_state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(cursor_char_idx))));
+            edit_state.store(ctx, id);
+        }
+        self.request_command_completion(ctx, id);
+    }
+
     pub(crate) fn perform_completion(&mut self, ctx: &egui::Context, id: egui::Id) {
+        if self.input_text.starts_with('/') {
+            if self.command_completion.is_some() {
+                self.accept_command_completion(None, ctx, id);
+            } else {
+                self.request_command_completion(ctx, id);
+            }
+            return;
+        }
+
         let mut new_cursor_char = 0usize;
 
         if let Some(state) = &mut self.completion {
@@ -233,6 +377,8 @@ impl WeeChatApp {
 
         self.input_text.clear();
         self.completion = None;
+        self.command_completion = None;
+        self.command_completion_pending = None;
         self.history_index = None;
     }
 
@@ -256,5 +402,33 @@ impl WeeChatApp {
             client.send_message(&raw_id, command);
             client.fetch_buffer_list();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_native_completion;
+
+    #[test]
+    fn native_command_completion_keeps_the_slash_and_adds_a_space() {
+        assert_eq!(
+            apply_native_completion("/qu", 3, 1, "qu", "query", true),
+            Some(("/query ".to_owned(), 7)),
+        );
+    }
+
+    #[test]
+    fn native_argument_completion_replaces_only_the_server_selected_word() {
+        assert_eq!(
+            apply_native_completion(
+                "/join #po trailing",
+                9,
+                6,
+                "#po",
+                "#postgis",
+                true,
+            ),
+            Some(("/join #postgis trailing".to_owned(), 15)),
+        );
     }
 }
