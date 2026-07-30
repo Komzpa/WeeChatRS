@@ -151,6 +151,74 @@ fn cap_map<V>(map: &mut HashMap<String, V>, cap: usize) {
 }
 pub const LOAD_MORE_LINES: usize = 300;
 pub const MAX_STORED_LINES: usize = 10_000;
+const THREAD_PANEL_DEFAULT_WIDTH: f32 = 380.0;
+const THREAD_PANEL_MIN_WIDTH: f32 = 280.0;
+
+#[derive(Clone)]
+struct ThreadMessageBlock {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    prefix: String,
+    messages: Vec<String>,
+    matrix_event_id: Option<String>,
+}
+
+fn group_thread_lines(lines: &VecDeque<Line>) -> Vec<ThreadMessageBlock> {
+    let mut blocks: Vec<ThreadMessageBlock> = Vec::new();
+    for line in lines.iter().filter(|line| line.displayed) {
+        let continues_previous = blocks.last().is_some_and(|block| {
+            (line.matrix_event_id.is_some()
+                && block.matrix_event_id == line.matrix_event_id)
+                || (line.matrix_event_id.is_none()
+                    && (line.prefix.is_empty()
+                        || (block.prefix == line.prefix && block.timestamp == line.timestamp)))
+        });
+        if continues_previous {
+            if let Some(block) = blocks.last_mut() {
+                block.messages.push(line.plain_message.clone());
+                continue;
+            }
+        }
+        blocks.push(ThreadMessageBlock {
+            timestamp: line.timestamp,
+            prefix: line.plain_prefix.clone(),
+            messages: vec![line.plain_message.clone()],
+            matrix_event_id: line.matrix_event_id.clone(),
+        });
+    }
+    blocks
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn line(id: &str, prefix: &str, message: &str, event_id: &str) -> Line {
+        let mut line = Line::new(
+            id.to_owned(),
+            Utc::now(),
+            prefix.to_owned(),
+            message.to_owned(),
+            true,
+            false,
+        );
+        line.matrix_event_id = Some(event_id.to_owned());
+        line
+    }
+
+    #[test]
+    fn groups_multiline_matrix_event_into_one_thread_message() {
+        let lines = VecDeque::from([
+            line("1", "alice", "root", "$root:example.org"),
+            line("2", "bot", "first line", "$reply:example.org"),
+            line("3", "bot", "", "$reply:example.org"),
+            line("4", "bot", "last line", "$reply:example.org"),
+        ]);
+        let blocks = group_thread_lines(&lines);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1].messages, ["first line", "", "last line"]);
+    }
+}
 
 /// Reorder `buffers` by moving the dragged item (and its whole server group when it is a server
 /// header) to just before `drop_before_id`, or to the end when `drop_before_id` is `None`.
@@ -501,6 +569,10 @@ pub struct WeeChatApp {
     pub(crate) history_index: Option<usize>,
     pub(crate) focus_input: bool,
     pub(crate) reply_target: Option<ReplyTarget>,
+    pub(crate) open_thread_buffer_id: Option<String>,
+    pub(crate) thread_input_text: String,
+    pub(crate) focus_thread_input: bool,
+    pub(crate) thread_panel_width: f32,
 
     // Search state
     pub(crate) show_search: bool,
@@ -706,6 +778,10 @@ impl WeeChatApp {
             history_index: None,
             focus_input: false,
             reply_target: None,
+            open_thread_buffer_id: None,
+            thread_input_text: String::new(),
+            focus_thread_input: false,
+            thread_panel_width: THREAD_PANEL_DEFAULT_WIDTH,
             show_search: false,
             search_text: String::new(),
             pending_buffer_switch: None,
@@ -834,6 +910,12 @@ impl WeeChatApp {
     }
 
     pub(crate) fn select_buffer(&mut self, id: String) {
+        if self
+            .buffer_by_id(&id)
+            .is_some_and(|buffer| buffer.is_matrix_thread())
+        {
+            return;
+        }
         if let Some(prev_id) = self.selected_buffer_id.clone() {
             if prev_id != id {
                 self.reply_target = None;
@@ -860,6 +942,25 @@ impl WeeChatApp {
                 }
                 client.mark_read(&raw_id);
             }
+        }
+    }
+
+    pub(crate) fn open_thread(&mut self, buffer_id: String) {
+        if !self
+            .buffer_by_id(&buffer_id)
+            .is_some_and(|buffer| buffer.is_matrix_thread())
+        {
+            return;
+        }
+        self.open_thread_buffer_id = Some(buffer_id.clone());
+        self.focus_thread_input = true;
+        if let Some(buffer) = self.buffer_by_id_mut(&buffer_id) {
+            buffer.activity = BufferActivity::None;
+            buffer.unread_count = 0;
+        }
+        if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
+            client.fetch_lines(&raw_id, INITIAL_LINES);
+            client.mark_read(&raw_id);
         }
     }
 
@@ -1320,6 +1421,7 @@ impl eframe::App for WeeChatApp {
         let mut pending_mute: Option<(String, String, bool)> = None;
         let mut pending_load_more: Option<(String, usize)> = None;
         let mut pending_reply_target: Option<ReplyTarget> = None;
+        let mut pending_open_thread_buffer_id: Option<String> = None;
 
         if self.show_toolbar { egui::TopBottomPanel::top("top_panel")
             .frame(Frame::none().fill(surface_color).inner_margin(Margin::symmetric(12.0, 8.0)))
@@ -1411,7 +1513,11 @@ impl eframe::App for WeeChatApp {
                         if let Some(drag_buf) = self.buffer_by_id(drag_id) {
                             if drag_buf.kind == "server" || drag_buf.kind == "core" {
                                 let skey = drag_buf.server.clone();
-                                self.buffers.iter().filter(|b| b.server == skey).map(|b| b.id.clone()).collect()
+                                self.buffers
+                                    .iter()
+                                    .filter(|b| b.server == skey && !b.is_matrix_thread())
+                                    .map(|b| b.id.clone())
+                                    .collect()
                             } else {
                                 std::iter::once(drag_id.clone()).collect()
                             }
@@ -1431,6 +1537,9 @@ impl eframe::App for WeeChatApp {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let mut last_conn_prefix: Option<String> = None;
                         for buffer in &self.buffers {
+                            if buffer.is_matrix_thread() {
+                                continue;
+                            }
                             if buffer.hidden && !self.show_hidden_buffers {
                                 continue;
                             }
@@ -1717,7 +1826,12 @@ impl eframe::App for WeeChatApp {
                         if let Some(drag_id) = self.dragging_buffer_id.take() {
                             let drop_id = self.drag_drop_before_id.take();
                             apply_drag_reorder(&mut self.buffers, &drag_id, drop_id.as_deref());
-                            self.buffer_order = self.buffers.iter().map(|b| b.id.clone()).collect();
+                            self.buffer_order = self
+                                .buffers
+                                .iter()
+                                .filter(|buffer| !buffer.is_matrix_thread())
+                                .map(|buffer| buffer.id.clone())
+                                .collect();
                         }
                         self.drag_drop_before_id = None;
                     }
@@ -1757,7 +1871,9 @@ impl eframe::App for WeeChatApp {
         let current_buffer_id = self.selected_buffer_id.clone();
         let current_buf = current_buffer_id.as_ref().and_then(|id| self.buffer_by_id(id));
         let current_buffer_nicks = current_buf.map(|b| b.nicks.clone());
+        let current_buffer_name = current_buf.map(|b| b.name.clone());
         let current_buffer_full_name = current_buf.map(|b| b.full_name.clone());
+        let current_matrix_room_id = current_buf.and_then(|b| b.matrix_room_id.clone());
         let current_buffer_is_matrix =
             current_buf.is_some_and(|buffer| buffer.plugin == "matrix");
         let current_buffer_messages = current_buf.map(|b| b.messages.clone());
@@ -1766,13 +1882,204 @@ impl eframe::App for WeeChatApp {
         let current_buffer_topic = current_buf.map(|b| b.topic.clone()).unwrap_or_default();
         let current_buffer_modes = current_buf.map(|b| b.modes.clone()).unwrap_or_default();
         let current_buffer_kind = current_buf.map(|b| b.kind.clone()).unwrap_or_default();
+        let thread_summaries: HashMap<String, (String, usize, bool)> = current_matrix_room_id
+            .as_ref()
+            .map(|room_id| {
+                self.buffers
+                    .iter()
+                    .filter(|buffer| {
+                        buffer.is_matrix_thread()
+                            && buffer.matrix_room_id.as_deref() == Some(room_id.as_str())
+                    })
+                    .filter_map(|buffer| {
+                        buffer.matrix_thread_root.as_ref().map(|root| {
+                            (
+                                root.clone(),
+                                (
+                                    buffer.id.clone(),
+                                    group_thread_lines(&buffer.messages)
+                                        .len()
+                                        .saturating_sub(1),
+                                    buffer.activity != BufferActivity::None,
+                                ),
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let font_id = FontId::new(self.font_size, if self.use_monospace { FontFamily::Monospace } else { FontFamily::Proportional });
 
         let any_connected = self.is_any_connected();
 
         let current_buf_has_nicklist = current_buf.map(|b| b.has_nicklist).unwrap_or(false);
-        if self.show_nicklist && current_buf_has_nicklist && any_connected && current_buffer_id.is_some() {
+        let open_thread = self
+            .open_thread_buffer_id
+            .as_ref()
+            .and_then(|thread_id| {
+                self.buffer_by_id(thread_id)
+                    .filter(|buffer| {
+                        buffer.is_matrix_thread()
+                            && buffer.matrix_room_id == current_matrix_room_id
+                    })
+                    .cloned()
+            });
+        if self.open_thread_buffer_id.is_some() && open_thread.is_none() {
+            self.open_thread_buffer_id = None;
+            self.thread_input_text.clear();
+        }
+
+        if let Some(thread) = open_thread {
+            let thread_messages = group_thread_lines(&thread.messages);
+            let room_label = current_buffer_name
+                .clone()
+                .unwrap_or_else(|| "Matrix".to_owned());
+            let max_thread_width =
+                (ctx.available_rect().width() * 0.48).max(THREAD_PANEL_MIN_WIDTH);
+            let panel = egui::SidePanel::right("thread_panel")
+                .resizable(true)
+                .default_width(self.thread_panel_width)
+                .min_width(THREAD_PANEL_MIN_WIDTH)
+                .max_width(max_thread_width)
+                .frame(
+                    Frame::none()
+                        .fill(surface_color)
+                        .inner_margin(Margin::same(12.0))
+                        .stroke(Stroke::new(1.0, border_color)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("Thread")
+                                    .strong()
+                                    .size(self.font_size + 2.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(&room_label)
+                                    .small()
+                                    .color(text_muted),
+                            );
+                        });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .button(egui::RichText::new("×").size(17.0))
+                                    .on_hover_text("Close thread")
+                                    .clicked()
+                                {
+                                    self.open_thread_buffer_id = None;
+                                    self.thread_input_text.clear();
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    let list_height = (ui.available_height() - 58.0).max(100.0);
+                    ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .max_height(list_height)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if thread_messages.is_empty() {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(28.0);
+                                    ui.spinner();
+                                    ui.label(
+                                        egui::RichText::new("Loading thread…")
+                                            .color(text_muted),
+                                    );
+                                });
+                            }
+                            for (index, block) in thread_messages.iter().enumerate() {
+                                Frame::none()
+                                    .fill(if index == 0 {
+                                        accent_color.linear_multiply(0.08)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .rounding(Rounding::same(7.0))
+                                    .inner_margin(Margin::symmetric(9.0, 7.0))
+                                    .show(ui, |ui| {
+                                        if index == 0 {
+                                            ui.label(
+                                                egui::RichText::new("ORIGINAL MESSAGE")
+                                                    .small()
+                                                    .strong()
+                                                    .color(accent_color),
+                                            );
+                                            ui.add_space(3.0);
+                                        }
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&block.prefix)
+                                                    .strong()
+                                                    .color(accent_color),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    block.timestamp
+                                                        .with_timezone(&chrono::Local)
+                                                        .format("%H:%M")
+                                                        .to_string(),
+                                                )
+                                                .small()
+                                                .color(text_muted),
+                                            );
+                                        });
+                                        for message in &block.messages {
+                                            if message.is_empty() {
+                                                ui.add_space(4.0);
+                                            } else {
+                                                ui.label(
+                                                    egui::RichText::new(message)
+                                                        .color(text_secondary),
+                                                );
+                                            }
+                                        }
+                                    });
+                                ui.add_space(3.0);
+                            }
+                        });
+                    ui.separator();
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.thread_input_text)
+                                .hint_text("Reply in thread…")
+                                .margin(Margin::symmetric(8.0, 5.0))
+                                .desired_width(ui.available_width() - 58.0),
+                        );
+                        if std::mem::take(&mut self.focus_thread_input) {
+                            response.request_focus();
+                        }
+                        let enter = response.lost_focus()
+                            && ctx.input(|input| input.key_pressed(egui::Key::Enter));
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Send")
+                                        .color(Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(accent_color),
+                            )
+                            .clicked()
+                            || enter
+                        {
+                            self.send_thread_message();
+                            self.focus_thread_input = true;
+                        }
+                    });
+                });
+            self.thread_panel_width = panel.response.rect.width();
+        } else if self.show_nicklist && current_buf_has_nicklist && any_connected && current_buffer_id.is_some() {
             if self.nicklist_width < 80.0 {
                 self.nicklist_width = 180.0;
             }
@@ -2167,6 +2474,18 @@ impl eframe::App for WeeChatApp {
                                 } else {
                                     Some(self.search_text.to_lowercase())
                                 };
+                                let thread_button_line_ids: HashSet<&str> = thread_summaries
+                                    .keys()
+                                    .filter_map(|event_id| {
+                                        messages
+                                            .iter()
+                                            .rev()
+                                            .find(|line| {
+                                                line.matrix_event_id.as_ref() == Some(event_id)
+                                            })
+                                            .map(|line| line.id.as_str())
+                                    })
+                                    .collect();
                                 for line in messages {
                                     if !self.show_filtered_lines && !line.displayed { continue; }
 
@@ -2390,6 +2709,35 @@ impl eframe::App for WeeChatApp {
                                                     }
                                                 }
                                             });
+                                            if let Some((thread_id, reply_count, unread)) =
+                                                thread_button_line_ids
+                                                    .contains(line.id.as_str())
+                                                    .then(|| line.matrix_event_id.as_ref())
+                                                    .flatten()
+                                                    .and_then(|event_id| {
+                                                        thread_summaries.get(event_id)
+                                                    })
+                                            {
+                                                ui.add_space(3.0);
+                                                let label = if *reply_count == 0 {
+                                                    "💬 Open thread".to_owned()
+                                                } else if *reply_count == 1 {
+                                                    "💬 1 reply".to_owned()
+                                                } else {
+                                                    format!("💬 {} replies", reply_count)
+                                                };
+                                                let text = egui::RichText::new(label)
+                                                    .strong()
+                                                    .color(if *unread {
+                                                        Color32::from_rgb(255, 120, 120)
+                                                    } else {
+                                                        accent_color
+                                                    });
+                                                if ui.small_button(text).clicked() {
+                                                    pending_open_thread_buffer_id =
+                                                        Some(thread_id.clone());
+                                                }
+                                            }
 
                                             if self.show_inline_images {
                                                 for url in &image_urls_in_line {
@@ -2489,6 +2837,12 @@ impl eframe::App for WeeChatApp {
                                     interactable.context_menu(|ui| {
                                         if current_buffer_is_matrix {
                                             let event_id = line.matrix_event_id.clone();
+                                            let thread_buffer_id = event_id
+                                                .as_ref()
+                                                .and_then(|event_id| {
+                                                    thread_summaries.get(event_id)
+                                                })
+                                                .map(|(buffer_id, _, _)| buffer_id.clone());
                                             if ui
                                                 .add_enabled(
                                                     event_id.is_some(),
@@ -2510,6 +2864,15 @@ impl eframe::App for WeeChatApp {
                                                     },
                                                 );
                                                 ui.close_menu();
+                                            }
+                                            if let Some(thread_buffer_id) =
+                                                thread_buffer_id.as_ref()
+                                            {
+                                                if ui.button("Open thread").clicked() {
+                                                    pending_open_thread_buffer_id =
+                                                        Some(thread_buffer_id.clone());
+                                                    ui.close_menu();
+                                                }
                                             }
                                             ui.separator();
                                         }
@@ -2562,6 +2925,9 @@ impl eframe::App for WeeChatApp {
         if let Some(reply_target) = pending_reply_target {
             self.reply_target = Some(reply_target);
             self.focus_input = true;
+        }
+        if let Some(thread_buffer_id) = pending_open_thread_buffer_id {
+            self.open_thread(thread_buffer_id);
         }
 
         if any_connected {

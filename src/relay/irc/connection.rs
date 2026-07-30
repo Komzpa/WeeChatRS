@@ -154,6 +154,8 @@ impl Session {
             hidden: false,
             muted: false,
             has_nicklist: kind == "channel",
+            matrix_room_id: None,
+            matrix_thread_root: None,
             visit_start_marker_id: None,
         }
     }
