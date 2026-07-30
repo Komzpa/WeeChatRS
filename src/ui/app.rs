@@ -778,9 +778,13 @@ impl WeeChatApp {
     }
 
     pub(crate) fn is_image_url(url: &str) -> bool {
-        let path = url.split('?').next().unwrap_or(url).to_lowercase();
+        let filename = url
+            .split_once('#')
+            .map(|(_, fragment)| fragment)
+            .unwrap_or_else(|| url.split('?').next().unwrap_or(url))
+            .to_lowercase();
         matches!(
-            std::path::Path::new(&path).extension().and_then(|e| e.to_str()),
+            std::path::Path::new(&filename).extension().and_then(|e| e.to_str()),
             Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
         )
     }
@@ -1863,7 +1867,7 @@ impl eframe::App for WeeChatApp {
                         if ui.add_enabled(
                             attach_enabled,
                             egui::Button::new(attach_label).frame(false),
-                        ).on_hover_text("Upload a file (or drag & drop onto window)").clicked() {
+                        ).on_hover_text("Upload an image or file (Ctrl-V and drag-and-drop also work)").clicked() {
                             if let Some(buf_id) = self.selected_buffer_id.clone() {
                                 self.file_share_uploading = true;
                                 self.file_share_error = None;
@@ -1893,6 +1897,42 @@ impl eframe::App for WeeChatApp {
                                 .desired_width(ui.available_width() - 80.0);
 
                             let res = ui.add(text_edit);
+
+                            let paste_image = res.has_focus()
+                                && ctx.input(|input| {
+                                    (input.modifiers.command || input.modifiers.ctrl)
+                                        && input.key_pressed(egui::Key::V)
+                                });
+                            if paste_image && !self.file_share_uploading {
+                                if let Some(buf_id) = self.selected_buffer_id.clone() {
+                                    self.file_share_uploading = true;
+                                    self.file_share_error = None;
+                                    let duration = self.file_share_duration.clone();
+                                    let tx = self.file_share_tx.clone();
+                                    tokio::spawn(async move {
+                                        let clipboard = tokio::task::spawn_blocking(
+                                            crate::ui::fileshare::clipboard_png,
+                                        )
+                                        .await;
+                                        let result = match clipboard {
+                                            Ok(Ok(Some(png))) => {
+                                                crate::ui::fileshare::upload_bytes(
+                                                    "clipboard.png",
+                                                    png,
+                                                    &duration,
+                                                )
+                                                .await
+                                            }
+                                            Ok(Ok(None)) => Err(String::new()),
+                                            Ok(Err(error)) => Err(error),
+                                            Err(error) => {
+                                                Err(format!("Clipboard task failed: {}", error))
+                                            }
+                                        };
+                                        let _ = tx.send(result.map(|url| (buf_id, url)));
+                                    });
+                                }
+                            }
 
                             if self.focus_input {
                                 res.request_focus();
@@ -2177,6 +2217,21 @@ impl eframe::App for WeeChatApp {
                                     } else {
                                         Vec::new()
                                     };
+                                    for url in &image_urls_in_line {
+                                        if is_safe_public_url(url) && !self.image_cache.contains_key(url) {
+                                            self.image_expanded.insert(url.clone());
+                                            self.image_cache.insert(url.clone(), ImageState::Loading);
+                                            let tx = self.image_tx.clone();
+                                            let url_owned = url.clone();
+                                            tokio::spawn(async move {
+                                                let result = async {
+                                                    let bytes = reqwest::get(&url_owned).await?.bytes().await?;
+                                                    Ok::<Vec<u8>, reqwest::Error>(bytes.to_vec())
+                                                }.await;
+                                                let _ = tx.send((url_owned, result.map_err(|e| e.to_string())));
+                                            });
+                                        }
+                                    }
                                     let preview_urls_in_line: Vec<String> = if self.show_link_previews {
                                         msg_sections.iter()
                                             .filter_map(|s| s.url.as_ref())

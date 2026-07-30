@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::Cursor, path::PathBuf};
 
 const UPLOAD_URL: &str = "https://files.interdo.me/script.php";
 const DOWNLOAD_BASE: &str = "https://files.interdo.me/f.php";
@@ -19,12 +19,19 @@ pub async fn upload(path: PathBuf, duration: &str) -> Result<String, String> {
         .await
         .map_err(|e| format!("Cannot read file: {}", e))?;
 
+    upload_bytes(filename, bytes, duration).await
+}
+
+pub async fn upload_bytes(
+    filename: impl Into<String>,
+    bytes: Vec<u8>,
+    duration: &str,
+) -> Result<String, String> {
+    let filename = filename.into();
     let mime = mime_for(&filename);
-
     let time = if VALID_TIMES.contains(&duration) { duration } else { "day" };
-
     let file_part = reqwest::multipart::Part::bytes(bytes)
-        .file_name(filename)
+        .file_name(filename.clone())
         .mime_str(mime)
         .map_err(|e| format!("MIME error: {}", e))?;
 
@@ -69,7 +76,40 @@ pub async fn upload(path: PathBuf, duration: &str) -> Result<String, String> {
         return Err(format!("Server error: {}", first_line));
     }
 
-    Ok(format!("{}?h={}", DOWNLOAD_BASE, first_line))
+    direct_download_url(first_line, &filename)
+}
+
+fn direct_download_url(file_code: &str, filename: &str) -> Result<String, String> {
+    let mut url = url::Url::parse(&format!("{}?h={}&p=1", DOWNLOAD_BASE, file_code))
+        .map_err(|e| format!("Invalid download URL: {}", e))?;
+    // The fragment is not sent to Jirafeau, but preserves the extension so
+    // chat clients can identify and display image links inline.
+    url.set_fragment(Some(&filename));
+    Ok(url.to_string())
+}
+
+/// Read a desktop clipboard image and encode it as PNG.
+///
+/// `Ok(None)` means that the clipboard contains text or another non-image
+/// format, allowing ordinary Ctrl-V text paste to continue silently.
+pub fn clipboard_png() -> Result<Option<Vec<u8>>, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("Clipboard unavailable: {}", e))?;
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        Err(_) => return Ok(None),
+    };
+    let rgba = image::RgbaImage::from_raw(
+        image.width as u32,
+        image.height as u32,
+        image.bytes.into_owned(),
+    )
+    .ok_or_else(|| "Clipboard returned an invalid RGBA image".to_string())?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| format!("Cannot encode clipboard image: {}", e))?;
+    Ok(Some(png))
 }
 
 fn mime_for(filename: &str) -> &'static str {
@@ -89,5 +129,26 @@ fn mime_for(filename: &str) -> &'static str {
         "txt" | "log"
             | "md"         => "text/plain",
         _                  => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_link_uses_direct_preview_and_keeps_filename_fragment() {
+        let raw = direct_download_url("abc", "screen shot.png").unwrap();
+        let url = url::Url::parse(&raw).unwrap();
+        assert_eq!(url.query(), Some("h=abc&p=1"));
+        assert_eq!(url.fragment(), Some("screen%20shot.png"));
+        assert!(crate::ui::app::WeeChatApp::is_image_url(&raw));
+    }
+
+    #[test]
+    fn common_image_mime_types_are_preserved() {
+        assert_eq!(mime_for("photo.PNG"), "image/png");
+        assert_eq!(mime_for("photo.jpeg"), "image/jpeg");
+        assert_eq!(mime_for("archive.unknown"), "application/octet-stream");
     }
 }
