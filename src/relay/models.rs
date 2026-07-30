@@ -43,9 +43,19 @@ pub struct Buffer {
     pub hidden: bool,
     pub muted: bool,
     pub has_nicklist: bool,
+    pub matrix_room_id: Option<String>,
+    pub matrix_thread_root: Option<String>,
     /// Snapshot of last_read_id taken when the buffer was first entered this session.
     /// Used to anchor the unread divider while the user views the buffer.
     pub visit_start_marker_id: Option<String>,
+}
+
+impl Buffer {
+    pub fn is_matrix_thread(&self) -> bool {
+        self.plugin == "matrix"
+            && self.matrix_room_id.is_some()
+            && self.matrix_thread_root.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
