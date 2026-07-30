@@ -111,21 +111,25 @@ impl WeeChatApp {
     }
 
     pub(crate) fn cycle_buffer(&mut self, delta: i32) {
-        if self.buffers.is_empty() { return; }
+        let navigable: Vec<String> = self.buffers.iter()
+            .filter(|buffer| !buffer.is_matrix_thread())
+            .map(|buffer| buffer.id.clone())
+            .collect();
+        if navigable.is_empty() { return; }
         let current_id = match self.selected_buffer_id.clone() {
             Some(id) => id,
             None => {
-                if let Some(first) = self.buffers.first() {
-                    let id = first.id.clone();
+                if let Some(first) = navigable.first() {
+                    let id = first.clone();
                     self.select_buffer(id);
                 }
                 return;
             }
         };
 
-        if let Some(idx) = self.buffers.iter().position(|b| b.id == current_id) {
-            let new_idx = (idx as i32 + delta).rem_euclid(self.buffers.len() as i32) as usize;
-            let new_id = self.buffers[new_idx].id.clone();
+        if let Some(idx) = navigable.iter().position(|id| id == &current_id) {
+            let new_idx = (idx as i32 + delta).rem_euclid(navigable.len() as i32) as usize;
+            let new_id = navigable[new_idx].clone();
             self.select_buffer(new_id);
         }
     }
@@ -134,7 +138,7 @@ impl WeeChatApp {
     pub(crate) fn jump_buffer_by_number(&mut self, n: usize) {
         if n == 0 { return; }
         let visible: Vec<String> = self.buffers.iter()
-            .filter(|b| !b.hidden || self.show_hidden_buffers)
+            .filter(|b| !b.is_matrix_thread() && (!b.hidden || self.show_hidden_buffers))
             .map(|b| b.id.clone())
             .collect();
         if let Some(id) = visible.get(n - 1) {
@@ -154,12 +158,33 @@ impl WeeChatApp {
         for i in 1..=len {
             let idx = (start + i) % len;
             let buf = &self.buffers[idx];
+            if buf.is_matrix_thread() { continue; }
             if buf.hidden && !self.show_hidden_buffers { continue; }
             if buf.activity != BufferActivity::None || buf.unread_count > 0 {
                 let id = buf.id.clone();
                 self.select_buffer(id);
                 return;
             }
+        }
+    }
+
+    pub(crate) fn send_thread_message(&mut self) {
+        let message = self.thread_input_text.trim().to_owned();
+        if message.is_empty() {
+            return;
+        }
+        let Some(buffer_id) = self.open_thread_buffer_id.clone() else {
+            return;
+        };
+        if !self
+            .buffer_by_id(&buffer_id)
+            .is_some_and(|buffer| buffer.is_matrix_thread())
+        {
+            return;
+        }
+        if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
+            client.send_message(&raw_id, &message);
+            self.thread_input_text.clear();
         }
     }
 

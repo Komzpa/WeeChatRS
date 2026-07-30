@@ -176,7 +176,11 @@ impl WeeChatApp {
                 self.buffers.retain(|b| b.id != full_id);
                 self.rebuild_buffer_idx();
                 if self.selected_buffer_id.as_deref() == Some(&full_id) {
-                    self.selected_buffer_id = self.buffers.first().map(|b| b.id.clone());
+                    self.selected_buffer_id = self
+                        .buffers
+                        .iter()
+                        .find(|buffer| !buffer.is_matrix_thread())
+                        .map(|buffer| buffer.id.clone());
                 }
             }
             BackendEvent::BuffersLoaded(bufs) => {
@@ -582,6 +586,36 @@ impl WeeChatApp {
         }
     }
 
+    fn extract_matrix_buffer_metadata(
+        obj: &serde_json::Map<String, Value>,
+    ) -> (Option<String>, Option<String>) {
+        let vars = obj.get("local_variables").and_then(|value| value.as_object());
+        let room_id = vars
+            .and_then(|vars| vars.get("room_id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| value.starts_with('!') && !value.chars().any(char::is_whitespace))
+            .map(ToOwned::to_owned);
+        let thread_root = vars
+            .and_then(|vars| vars.get("thread_root"))
+            .and_then(|value| value.as_str())
+            .filter(|value| value.starts_with('$') && !value.chars().any(char::is_whitespace))
+            .map(ToOwned::to_owned);
+        (room_id, thread_root)
+    }
+
+    fn extract_buffer_plugin(obj: &serde_json::Map<String, Value>) -> String {
+        obj.get("plugin")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                obj.get("local_variables")
+                    .and_then(|value| value.as_object())
+                    .and_then(|vars| vars.get("plugin"))
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     fn sort_buffers(buffers: &mut Vec<Buffer>) {
         buffers.sort_by(|a, b| {
             if a.server != b.server {
@@ -611,7 +645,7 @@ impl WeeChatApp {
                     .or_else(|| obj.get("name").and_then(|v| v.as_str()))
                     .unwrap_or("unknown").to_string();
                 let raw_full_name = obj.get("name").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
-                let plugin = obj.get("plugin").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let plugin = Self::extract_buffer_plugin(obj);
                 let hidden = obj.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
                 let has_nicklist = obj.get("nicklist").and_then(|v| v.as_bool()).unwrap_or(true);
                 let relay_last_read_id = obj.get("last_read_line_id").and_then(|v| Self::parse_id(v))
@@ -632,6 +666,8 @@ impl WeeChatApp {
                     let mut unread_count = 0u32;
                     let mut last_read_id = None;
                     let mut visit_start_marker_id = None;
+                    let (matrix_room_id, matrix_thread_root) =
+                        Self::extract_matrix_buffer_metadata(obj);
 
                     if let Some(existing) = self.buffer_by_id(&full_id) {
                         messages = existing.messages.clone();
@@ -673,6 +709,8 @@ impl WeeChatApp {
                         hidden,
                         muted,
                         has_nicklist: effective_nicklist,
+                        matrix_room_id,
+                        matrix_thread_root,
                         visit_start_marker_id,
                         last_markread_ts: None,
                     });
@@ -740,6 +778,26 @@ impl WeeChatApp {
             }
             self.rebuild_buffer_idx();
 
+            let parent_room_id = self
+                .selected_buffer_id
+                .as_ref()
+                .and_then(|selected_id| {
+                    self.buffer_by_id(selected_id)
+                        .filter(|buffer| buffer.is_matrix_thread())
+                        .and_then(|buffer| buffer.matrix_room_id.clone())
+                });
+            if let Some(parent_room_id) = parent_room_id {
+                self.selected_buffer_id = self
+                    .buffers
+                    .iter()
+                    .find(|buffer| {
+                        !buffer.is_matrix_thread()
+                            && buffer.matrix_room_id.as_deref()
+                                == Some(parent_room_id.as_str())
+                    })
+                    .map(|buffer| buffer.id.clone());
+            }
+
             if let Some(target) = self.pending_buffer_switch.take() {
                 if let Some(found) = self.buffers.iter().find(|b| b.name == target || b.full_name.ends_with(&target)) {
                     let id = found.id.clone();
@@ -750,7 +808,9 @@ impl WeeChatApp {
             }
 
             if self.selected_buffer_id.is_none() {
-                if let Some(first) = self.buffers.first() {
+                if let Some(first) =
+                    self.buffers.iter().find(|buffer| !buffer.is_matrix_thread())
+                {
                     let id = first.id.clone();
                     self.select_buffer(id);
                 }
@@ -871,12 +931,20 @@ impl WeeChatApp {
         let body = Self::body_as_vec(&resp);
         for val in body {
             if let Some(obj) = val.as_object() {
+                let refreshed_plugin = Self::extract_buffer_plugin(obj);
+                let (matrix_room_id, matrix_thread_root) =
+                    Self::extract_matrix_buffer_metadata(obj);
                 if let Some(buffer) = self.buffer_by_id_mut(&full_buffer_id) {
                     // Strip prefix from full_name for metadata extraction
                     let pfx = format!("{}/", conn_prefix);
                     let raw_full_name = buffer.full_name.strip_prefix(&pfx).unwrap_or(&buffer.full_name).to_string();
+                    if !refreshed_plugin.is_empty() {
+                        buffer.plugin = refreshed_plugin.clone();
+                    }
                     let plugin = buffer.plugin.clone();
                     Self::extract_metadata(obj, &mut buffer.topic, &mut buffer.modes, &mut buffer.kind, &mut buffer.server, &raw_full_name, &plugin);
+                    buffer.matrix_room_id = matrix_room_id;
+                    buffer.matrix_thread_root = matrix_thread_root;
                 }
             }
         }
@@ -1129,6 +1197,39 @@ mod tests {
         assert_eq!(
             WeeChatApp::tag_value(string.as_object().unwrap(), "matrix_id_"),
             Some("$older:remote.example".to_owned())
+        );
+    }
+
+    #[test]
+    fn matrix_thread_requires_exact_room_and_root_localvars() {
+        let object = serde_json::json!({
+            "local_variables": {
+                "plugin": "matrix",
+                "room_id": "!room:example.org",
+                "thread_root": "$root:example.org"
+            }
+        });
+        assert_eq!(
+            WeeChatApp::extract_matrix_buffer_metadata(object.as_object().unwrap()),
+            (
+                Some("!room:example.org".to_owned()),
+                Some("$root:example.org".to_owned())
+            )
+        );
+        assert_eq!(
+            WeeChatApp::extract_buffer_plugin(object.as_object().unwrap()),
+            "matrix"
+        );
+
+        let malformed = serde_json::json!({
+            "local_variables": {
+                "room_id": "#not-a-room",
+                "thread_root": "$bad root"
+            }
+        });
+        assert_eq!(
+            WeeChatApp::extract_matrix_buffer_metadata(malformed.as_object().unwrap()),
+            (None, None)
         );
     }
 
