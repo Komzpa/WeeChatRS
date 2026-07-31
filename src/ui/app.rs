@@ -6,6 +6,7 @@ use crate::ui::theme::AppTheme;
 use crate::ui::keybinds::KeybindsMap;
 use crate::ui::url_safety::is_safe_public_url;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use futures_util::StreamExt;
 use sha2::Digest;
 use egui::{FontId, ScrollArea, Label, Key, Visuals, TextStyle, FontFamily, Color32, text::LayoutJob, Margin, Frame, Rounding, Stroke, Vec2, Modifiers, Rect, Painter};
 use tokio::sync::mpsc;
@@ -232,6 +233,9 @@ const MAX_INLINE_IMAGE_WIDTH: f32 = 360.0;
 const MAX_INLINE_IMAGE_HEIGHT: f32 = 240.0;
 const MAX_EXPANDED_IMAGE_WIDTH: f32 = 900.0;
 const MAX_EXPANDED_IMAGE_HEIGHT: f32 = 720.0;
+const MAX_INLINE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_INLINE_IMAGE_DIMENSION: u32 = 8192;
+const MAX_INLINE_IMAGE_PIXELS: u64 = 25_000_000;
 
 fn matrix_media_cache_path(mxc_uri: &str) -> PathBuf {
     let cache_root = std::env::var_os("XDG_CACHE_HOME")
@@ -266,6 +270,12 @@ async fn wait_for_matrix_media(path: &Path) -> Result<Vec<u8>, String> {
     loop {
         if let Ok(metadata) = tokio::fs::metadata(path).await {
             let size = metadata.len();
+            if size > MAX_INLINE_IMAGE_BYTES {
+                return Err(format!(
+                    "Matrix media is too large for an inline preview (maximum {} MiB)",
+                    MAX_INLINE_IMAGE_BYTES / 1024 / 1024,
+                ));
+            }
             if size > 0 && previous_size == Some(size) {
                 stable_samples += 1;
                 if stable_samples >= 10 {
@@ -291,6 +301,43 @@ async fn wait_for_matrix_media(path: &Path) -> Result<Vec<u8>, String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+async fn fetch_bounded_image(url: &str) -> Result<Vec<u8>, String> {
+    let response = reqwest::get(url).await.map_err(|error| error.to_string())?;
+    if let Some(length) = response.content_length() {
+        if length > MAX_INLINE_IMAGE_BYTES {
+            return Err("Image is too large for an inline preview".to_owned());
+        }
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_INLINE_IMAGE_BYTES as usize {
+            return Err("Image is too large for an inline preview".to_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn validate_inline_image_dimensions(bytes: &[u8]) -> Result<(), String> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
+    let (width, height) = reader.into_dimensions().map_err(|error| error.to_string())?;
+    if !inline_image_dimensions_allowed(width, height) {
+        return Err("Image dimensions are too large for an inline preview".to_owned());
+    }
+    Ok(())
+}
+
+fn inline_image_dimensions_allowed(width: u32, height: u32) -> bool {
+    width <= MAX_INLINE_IMAGE_DIMENSION
+        && height <= MAX_INLINE_IMAGE_DIMENSION
+        && u64::from(width).saturating_mul(u64::from(height)) <= MAX_INLINE_IMAGE_PIXELS
 }
 
 /// Fit an inline preview into the chat column.
@@ -370,6 +417,7 @@ fn response_primary_clicked(ui: &egui::Ui, response: &egui::Response) -> bool {
 #[cfg(test)]
 mod inline_matrix_image_tests {
     use super::{
+        inline_image_dimensions_allowed,
         inline_image_display_size, inline_image_preview_size, is_matrix_media_status_line,
         matrix_media_cache_path, primary_click_hits_rect,
         quote_weechat_argument,
@@ -385,6 +433,13 @@ mod inline_matrix_image_tests {
         );
         assert!((size.x - 120.0).abs() < 0.01);
         assert!((size.y - 240.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_decode_rejects_excessive_dimensions_and_pixel_counts() {
+        assert!(inline_image_dimensions_allowed(4096, 4096));
+        assert!(!inline_image_dimensions_allowed(8193, 1));
+        assert!(!inline_image_dimensions_allowed(6000, 6000));
     }
 
     #[test]
@@ -890,6 +945,18 @@ pub(crate) fn preferred_chat_buffer_id(
         }))
         .or_else(|| buffers.iter().find(|buffer| is_restorable_chat_buffer(buffer)))
         .map(|buffer| buffer.id.clone())
+}
+
+fn buffer_visible_in_sidebar(
+    buffer: &Buffer,
+    show_hidden_buffers: bool,
+    collapsed_servers: &HashSet<String>,
+) -> bool {
+    if buffer.is_matrix_thread() || (buffer.hidden && !show_hidden_buffers) {
+        return false;
+    }
+    let is_root = buffer.kind == "server" || buffer.kind == "core";
+    is_root || !collapsed_servers.contains(&buffer.server)
 }
 
 #[cfg(test)]
@@ -1886,11 +1953,12 @@ impl SavedReadMarker {
 #[cfg(test)]
 mod saved_read_marker_tests {
     use super::{
-        preferred_chat_buffer_id, visit_marker_location, AppSettings, Buffer, BufferActivity,
-        Line, SavedReadMarker, VisitMarkerLocation, BEFORE_FIRST_LOADED_LINE_ID,
+        buffer_visible_in_sidebar, preferred_chat_buffer_id, visit_marker_location, AppSettings,
+        Buffer, BufferActivity, Line, SavedReadMarker, VisitMarkerLocation,
+        BEFORE_FIRST_LOADED_LINE_ID,
     };
     use chrono::{TimeZone, Utc};
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
 
     fn line(id: &str, timestamp: i64) -> Line {
         Line::new(
@@ -1972,6 +2040,41 @@ mod saved_read_marker_tests {
             preferred_chat_buffer_id(&[thread, other], None),
             Some("local/other".to_owned()),
         );
+    }
+
+    #[test]
+    fn last_chat_restore_falls_back_when_the_saved_room_disappeared() {
+        let first_visible = buffer(
+            "local/other",
+            "local/matrix.matrix.!other:example.org",
+            "channel",
+        );
+
+        assert_eq!(
+            preferred_chat_buffer_id(
+                &[first_visible],
+                Some("local/matrix.matrix.!gone:example.org"),
+            ),
+            Some("local/other".to_owned()),
+        );
+    }
+
+    #[test]
+    fn sidebar_visibility_excludes_threads_hidden_rows_and_collapsed_children() {
+        let root = buffer("local/root", "server", "server");
+        let child = buffer("local/child", "#visible", "channel");
+        let mut hidden = buffer("local/hidden", "#hidden", "channel");
+        hidden.hidden = true;
+        let mut thread = buffer("local/thread", "thread", "channel");
+        thread.matrix_room_id = Some("!room:example.org".to_owned());
+        thread.matrix_thread_root = Some("$root:example.org".to_owned());
+
+        let collapsed = HashSet::from(["matrix".to_owned()]);
+        assert!(buffer_visible_in_sidebar(&root, false, &collapsed));
+        assert!(!buffer_visible_in_sidebar(&child, false, &collapsed));
+        assert!(!buffer_visible_in_sidebar(&hidden, false, &HashSet::new()));
+        assert!(buffer_visible_in_sidebar(&hidden, true, &HashSet::new()));
+        assert!(!buffer_visible_in_sidebar(&thread, true, &HashSet::new()));
     }
 
     #[test]
@@ -2288,15 +2391,38 @@ impl WeeChatApp {
         Ok(())
     }
 
-    fn try_matrix_clipboard_upload(&self, buffer_id: &str) -> Result<bool, String> {
-        if !self.is_matrix_buffer(buffer_id) {
-            return Ok(false);
+    fn start_matrix_clipboard_upload(&mut self, buffer_id: String) -> bool {
+        if !self.is_matrix_buffer(&buffer_id) || self.file_share_uploading {
+            return false;
         }
-        let Some(png) = crate::ui::fileshare::clipboard_png()? else {
-            return Ok(false);
-        };
-        self.send_matrix_attachment(buffer_id, "clipboard.png", "image/png", &png)?;
-        Ok(true)
+        self.file_share_uploading = true;
+        self.file_share_error = None;
+        let tx = self.file_share_tx.clone();
+        tokio::spawn(async move {
+            let result = match tokio::task::spawn_blocking(
+                crate::ui::fileshare::clipboard_png,
+            )
+            .await
+            {
+                Ok(Ok(Some(bytes))) if bytes.len() <= MATRIX_UPLOAD_MAX_BYTES => {
+                    Ok(PreparedFileShare::MatrixAttachment {
+                        buffer_id,
+                        filename: "clipboard.png".to_owned(),
+                        mime: "image/png".to_owned(),
+                        bytes,
+                    })
+                }
+                Ok(Ok(Some(_))) => Err(format!(
+                    "Matrix clipboard images may not exceed {} MiB",
+                    MATRIX_UPLOAD_MAX_BYTES / 1024 / 1024,
+                )),
+                Ok(Ok(None)) => Err(String::new()),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(format!("Clipboard worker failed: {error}")),
+            };
+            let _ = tx.send(result);
+        });
+        true
     }
 
     fn start_file_picker(&mut self, buffer_id: String) {
@@ -2476,12 +2602,8 @@ impl WeeChatApp {
         let tx = self.image_tx.clone();
         let url = url.to_owned();
         tokio::spawn(async move {
-            let result = async {
-                let bytes = reqwest::get(&url).await?.bytes().await?;
-                Ok::<Vec<u8>, reqwest::Error>(bytes.to_vec())
-            }
-            .await;
-            let _ = tx.send((url, result.map_err(|error| error.to_string())));
+            let result = fetch_bounded_image(&url).await;
+            let _ = tx.send((url, result));
         });
     }
 
@@ -3139,7 +3261,9 @@ impl eframe::App for WeeChatApp {
         while let Ok((url, result)) = self.image_rx.try_recv() {
             match result {
                 Ok(bytes) => {
-                    match image::load_from_memory(&bytes) {
+                    match validate_inline_image_dimensions(&bytes)
+                        .and_then(|_| image::load_from_memory(&bytes).map_err(|error| error.to_string()))
+                    {
                         Ok(img) => {
                             let rgba = img.to_rgba8();
                             let size = [rgba.width() as usize, rgba.height() as usize];
@@ -3172,11 +3296,8 @@ impl eframe::App for WeeChatApp {
                             let tx = self.image_tx.clone();
                             let img_url_owned = img_url.clone();
                             tokio::spawn(async move {
-                                let result = async {
-                                    let bytes = reqwest::get(&img_url_owned).await?.bytes().await?;
-                                    Ok::<Vec<u8>, reqwest::Error>(bytes.to_vec())
-                                }.await;
-                                let _ = tx.send((img_url_owned, result.map_err(|e| e.to_string())));
+                                let result = fetch_bounded_image(&img_url_owned).await;
+                                let _ = tx.send((img_url_owned, result));
                             });
                         }
                     }
@@ -3502,7 +3623,13 @@ impl eframe::App for WeeChatApp {
         let longest_buffer_name = self
             .buffers
             .iter()
-            .filter(|buffer| !buffer.hidden || self.show_hidden_buffers)
+            .filter(|buffer| {
+                buffer_visible_in_sidebar(
+                    buffer,
+                    self.show_hidden_buffers,
+                    &self.collapsed_servers,
+                )
+            })
             .map(|buffer| {
                 ctx.fonts(|fonts| {
                     fonts
@@ -3594,19 +3721,16 @@ impl eframe::App for WeeChatApp {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let mut last_conn_prefix: Option<String> = None;
                         for buffer in &self.buffers {
-                            if buffer.is_matrix_thread() {
-                                continue;
-                            }
-                            if buffer.hidden && !self.show_hidden_buffers {
+                            if !buffer_visible_in_sidebar(
+                                buffer,
+                                self.show_hidden_buffers,
+                                &self.collapsed_servers,
+                            ) {
                                 continue;
                             }
                             let is_selected = self.selected_buffer_id.as_deref() == Some(&buffer.id);
                             let is_core  = buffer.kind == "core";
                             let is_root  = buffer.kind == "server" || is_core;
-                            // Skip children of collapsed server groups.
-                            if !is_root && self.collapsed_servers.contains(&buffer.server) {
-                                continue;
-                            }
                             let is_child = buffer.kind == "channel" || buffer.kind == "private";
                             let in_dragged_group = dragged_group_ids.contains(&buffer.id);
 
@@ -4264,9 +4388,7 @@ impl eframe::App for WeeChatApp {
                                 self.open_thread_buffer_id.as_deref(),
                                 current_buffer_id.as_deref(),
                             ) {
-                                if let Err(error) = self.try_matrix_clipboard_upload(&buffer_id) {
-                                    self.file_share_error = Some(error);
-                                }
+                                self.start_matrix_clipboard_upload(buffer_id);
                             }
                         }
                         if std::mem::take(&mut self.focus_thread_input) {
@@ -4696,11 +4818,7 @@ impl eframe::App for WeeChatApp {
                                     None,
                                     self.selected_buffer_id.as_deref(),
                                 ) {
-                                    if let Err(error) =
-                                        self.try_matrix_clipboard_upload(&buffer_id)
-                                    {
-                                        self.file_share_error = Some(error);
-                                    }
+                                    self.start_matrix_clipboard_upload(buffer_id);
                                 }
                             }
 

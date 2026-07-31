@@ -21,7 +21,7 @@ regex = "1.10"
 plist = "1.6"
 rfd = "0.14"
 arboard = "3"
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "multipart", "stream"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 fontdb = "0.22"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }

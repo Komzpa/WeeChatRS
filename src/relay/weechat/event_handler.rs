@@ -1149,18 +1149,17 @@ impl WeeChatApp {
             }
 
             if self.selected_buffer_id.is_none() {
-                let preferred = self.last_chat_buffer_name.as_deref()
-                    .and_then(|name| self.buffers.iter().find(|buffer| {
-                        is_restorable_chat_buffer(buffer) && buffer.full_name == name
-                    }))
-                    .or_else(|| self.last_chat_buffer_name.is_none().then(|| {
-                        self.buffers.iter().find(|buffer| {
-                            buffer.id.starts_with(&format!("{conn_prefix}/"))
-                                && is_restorable_chat_buffer(buffer)
-                        })
-                    }).flatten());
-                if let Some(buffer) = preferred {
-                    self.select_buffer(buffer.id.clone());
+                let connection_buffers = self
+                    .buffers
+                    .iter()
+                    .filter(|buffer| buffer.id.starts_with(&format!("{conn_prefix}/")))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(buffer_id) = preferred_chat_buffer_id(
+                    &connection_buffers,
+                    self.last_chat_buffer_name.as_deref(),
+                ) {
+                    self.select_buffer(buffer_id);
                 }
             }
 
