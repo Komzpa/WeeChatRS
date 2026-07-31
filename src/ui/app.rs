@@ -4348,7 +4348,7 @@ impl eframe::App for WeeChatApp {
                                             self.render_text_with_emoji(ui, &s.text, &fmt, false);
                                         }
                                     }).response.interact(egui::Sense::click());
-                                    if label_res.clicked() {
+                                    if response_primary_clicked(ui, &label_res) {
                                         self.profile_card = Some(UserProfileCard {
                                             buffer_id: current_buffer_id.clone().unwrap_or_default(),
                                             nick: nick.name.clone(),
