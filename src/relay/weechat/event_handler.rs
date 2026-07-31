@@ -2,8 +2,8 @@ use crate::relay::backend::BackendEvent;
 use crate::relay::models::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{
-    history_snapshot_is_exhausted, SavedReadMarker, WeeChatApp, LOAD_MORE_LINES,
-    MAX_STORED_LINES,
+    history_snapshot_is_exhausted, CommandCompletionState, SavedReadMarker, WeeChatApp,
+    LOAD_MORE_LINES, MAX_STORED_LINES,
 };
 use chrono::{Utc, DateTime, Local};
 use serde_json::Value;
@@ -423,7 +423,13 @@ impl WeeChatApp {
 
     pub(crate) fn process_response(&mut self, conn_prefix: &str, resp: WeeChatResponse) {
         if let Some(id) = &resp.request_id {
-            if id == "_list_buffers" {
+            if let Some(sequence) = id
+                .strip_prefix("_completion:")
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                self.handle_command_completion(conn_prefix, sequence, resp);
+                return;
+            } else if id == "_list_buffers" {
                 self.handle_buffer_list(conn_prefix, resp);
                 return;
             } else if id == "_hotlist" {
@@ -559,6 +565,83 @@ impl WeeChatApp {
                 _ => {}
             }
         }
+    }
+
+    fn handle_command_completion(
+        &mut self,
+        conn_prefix: &str,
+        sequence: u64,
+        resp: WeeChatResponse,
+    ) {
+        let Some(pending) = self.command_completion_pending.as_ref() else {
+            return;
+        };
+        if pending.sequence != sequence {
+            return;
+        }
+        let pending = self.command_completion_pending.take().unwrap();
+        let expected_prefix = format!("{conn_prefix}/");
+        if !pending.buffer_id.starts_with(&expected_prefix)
+            || self.selected_buffer_id.as_deref() != Some(pending.buffer_id.as_str())
+            || self.input_text != pending.input
+            || resp.code != Some(200)
+            || resp.body_type.as_deref() != Some("completion")
+        {
+            self.command_completion = None;
+            return;
+        }
+
+        let Some(body) = resp.body.as_ref().and_then(Value::as_object) else {
+            self.command_completion = None;
+            return;
+        };
+        let context = body
+            .get("context")
+            .and_then(Value::as_str)
+            .unwrap_or("null")
+            .to_owned();
+        let base_word = body
+            .get("base_word")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Some(position_replace) = body
+            .get("position_replace")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            self.command_completion = None;
+            return;
+        };
+        let add_space = body
+            .get("add_space")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let matches = body
+            .get("list")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if matches.is_empty() {
+            self.command_completion = None;
+            return;
+        }
+        self.command_completion = Some(CommandCompletionState {
+            context,
+            source_text: pending.input,
+            cursor_byte_idx: pending.cursor_byte_idx,
+            base_word,
+            position_replace,
+            add_space,
+            matches,
+            index: 0,
+        });
     }
 
     fn has_tag(obj: &serde_json::Map<String, Value>, tag: &str) -> bool {

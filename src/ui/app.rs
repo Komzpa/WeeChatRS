@@ -1598,6 +1598,9 @@ pub struct WeeChatApp {
     pub(crate) completion: Option<CompletionState>,
     pub(crate) mention_completion: Option<MentionCompletionState>,
     pub(crate) selected_mentions: Vec<SelectedMention>,
+    pub(crate) command_completion: Option<CommandCompletionState>,
+    pub(crate) command_completion_pending: Option<CommandCompletionRequest>,
+    pub(crate) command_completion_request_seq: u64,
 
     // Command History
     pub(crate) command_history: VecDeque<String>,
@@ -1710,6 +1713,25 @@ pub(crate) struct CompletionState {
     pub(crate) matches: Vec<String>,
     pub(crate) index: usize,
     pub(crate) word_start_idx: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandCompletionState {
+    pub(crate) context: String,
+    pub(crate) source_text: String,
+    pub(crate) cursor_byte_idx: usize,
+    pub(crate) base_word: String,
+    pub(crate) position_replace: usize,
+    pub(crate) add_space: bool,
+    pub(crate) matches: Vec<String>,
+    pub(crate) index: usize,
+}
+
+pub(crate) struct CommandCompletionRequest {
+    pub(crate) sequence: u64,
+    pub(crate) buffer_id: String,
+    pub(crate) input: String,
+    pub(crate) cursor_byte_idx: usize,
 }
 
 #[derive(Clone)]
@@ -2007,6 +2029,9 @@ impl WeeChatApp {
             completion: None,
             mention_completion: None,
             selected_mentions: Vec::new(),
+            command_completion: None,
+            command_completion_pending: None,
+            command_completion_request_seq: 0,
             command_history: VecDeque::new(),
             history_index: None,
             focus_input: false,
@@ -3154,9 +3179,20 @@ impl eframe::App for WeeChatApp {
         let mut mention_accept = false;
         let mut mention_cancel = false;
         let mention_open = self.mention_completion.is_some();
+        let mut command_up = false;
+        let mut command_down = false;
+        let mut command_accept = false;
+        let mut command_cancel = false;
+        let command_open = self.command_completion.is_some();
 
         ctx.input_mut(|i| {
-            if mention_open {
+            if command_open {
+                command_accept = i.consume_key(Modifiers::NONE, Key::Tab)
+                    || i.consume_key(Modifiers::NONE, Key::Enter);
+                command_up = i.consume_key(Modifiers::NONE, Key::ArrowUp);
+                command_down = i.consume_key(Modifiers::NONE, Key::ArrowDown);
+                command_cancel = i.consume_key(Modifiers::NONE, Key::Escape);
+            } else if mention_open {
                 mention_accept = i.consume_key(Modifiers::NONE, Key::Tab)
                     || i.consume_key(Modifiers::NONE, Key::Enter);
                 mention_up = i.consume_key(Modifiers::NONE, Key::ArrowUp);
@@ -4587,7 +4623,19 @@ impl eframe::App for WeeChatApp {
                             }
 
             if res.has_focus() {
-                                if mention_cancel {
+                                if command_cancel {
+                                    self.command_completion = None;
+                                    self.command_completion_pending = None;
+                                } else if command_up {
+                                    self.move_command_completion_selection(-1);
+                                    res.request_focus();
+                                } else if command_down {
+                                    self.move_command_completion_selection(1);
+                                    res.request_focus();
+                                } else if command_accept {
+                                    self.accept_command_completion(None, ctx, res.id);
+                                    res.request_focus();
+                                } else if mention_cancel {
                                     self.mention_completion = None;
                                 } else if mention_up {
                                     self.move_mention_selection(-1);
@@ -4618,6 +4666,7 @@ impl eframe::App for WeeChatApp {
                                 }
                                 if res.changed() {
                                     self.reconcile_selected_mentions();
+                                    self.request_command_completion(ctx, res.id);
                                 }
                             }
 
@@ -4676,6 +4725,76 @@ impl eframe::App for WeeChatApp {
                             }
                             if let Some(index) = clicked_mention {
                                 self.accept_mention(Some(index), ctx, res.id);
+                                res.request_focus();
+                            }
+
+                            let popup_state = self.command_completion.clone();
+                            let mut clicked_command = None;
+                            if let Some(state) = popup_state {
+                                let popup_id = res.id.with("command_popup");
+                                ui.memory_mut(|memory| memory.open_popup(popup_id));
+                                egui::popup::popup_above_or_below_widget(
+                                    ui,
+                                    popup_id,
+                                    &res,
+                                    egui::AboveOrBelow::Above,
+                                    |ui| {
+                                        ui.set_min_width(res.rect.width().min(560.0));
+                                        ui.set_max_width(res.rect.width().min(560.0));
+                                        let title = if state.context == "command" {
+                                            format!("COMMANDS · {}", state.matches.len())
+                                        } else {
+                                            format!("ARGUMENTS · {}", state.matches.len())
+                                        };
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(title)
+                                                    .small()
+                                                    .strong()
+                                                    .color(accent_color),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "↑↓ select · Tab/Enter insert · Esc close",
+                                                        )
+                                                        .small()
+                                                        .color(text_muted),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        egui::ScrollArea::vertical()
+                                            .max_height(320.0)
+                                            .show(ui, |ui| {
+                                                for (index, candidate) in
+                                                    state.matches.iter().enumerate()
+                                                {
+                                                    let label = if state.context == "command"
+                                                        && !candidate.starts_with('/')
+                                                    {
+                                                        format!("/{candidate}")
+                                                    } else {
+                                                        candidate.clone()
+                                                    };
+                                                    if ui
+                                                        .selectable_label(
+                                                            index == state.index,
+                                                            label,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        clicked_command = Some(index);
+                                                    }
+                                                }
+                                            });
+                                    },
+                                );
+                            }
+                            if let Some(index) = clicked_command {
+                                self.accept_command_completion(Some(index), ctx, res.id);
                                 res.request_focus();
                             }
                         });
