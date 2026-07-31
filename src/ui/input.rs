@@ -3,6 +3,177 @@ use egui::text::{CCursorRange, CCursor};
 use crate::ui::app::{WeeChatApp, CompletionState};
 use crate::ui::emoji;
 
+fn selected_char_range(ctx: &egui::Context, id: egui::Id, text: &str) -> (usize, usize) {
+    let end = text.chars().count();
+    let Some(state) = TextEditState::load(ctx, id) else {
+        return (end, end);
+    };
+    let Some(range) = state.cursor.char_range() else {
+        return (end, end);
+    };
+    let [start, finish] = range.sorted();
+    (start.index.min(end), finish.index.min(end))
+}
+
+fn char_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte_index, _)| byte_index)
+}
+
+fn selected_text(text: &str, start: usize, end: usize) -> String {
+    let start = char_to_byte(text, start);
+    let end = char_to_byte(text, end);
+    text[start..end].to_owned()
+}
+
+fn replace_selection(text: &mut String, start: usize, end: usize, replacement: &str) -> usize {
+    let start_byte = char_to_byte(text, start);
+    let end_byte = char_to_byte(text, end);
+    text.replace_range(start_byte..end_byte, replacement);
+    start + replacement.chars().count()
+}
+
+fn store_cursor(ctx: &egui::Context, id: egui::Id, range: CCursorRange) {
+    let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(range));
+    state.store(ctx, id);
+    ctx.memory_mut(|memory| memory.request_focus(id));
+}
+
+fn restore_undo_state(ctx: &egui::Context, id: egui::Id, text: &mut String, redo: bool) -> bool {
+    let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+    let current_range = state
+        .cursor
+        .char_range()
+        .unwrap_or_else(|| CCursorRange::one(CCursor::new(text.chars().count())));
+    let current = (current_range, text.clone());
+    let mut undoer = state.undoer();
+    let restored = if redo {
+        undoer.redo(&current).cloned()
+    } else {
+        undoer.undo(&current).cloned()
+    };
+    state.set_undoer(undoer);
+
+    let Some((range, restored_text)) = restored else {
+        return false;
+    };
+    *text = restored_text;
+    state.cursor.set_char_range(Some(range));
+    state.store(ctx, id);
+    ctx.memory_mut(|memory| memory.request_focus(id));
+    true
+}
+
+/// Add the conventional desktop edit menu to a chat input. Keeping this in one
+/// helper ensures the room composer and thread composer have identical editing
+/// behavior.
+pub(crate) fn input_context_menu(response: &egui::Response, text: &mut String) {
+    response.context_menu(|ui| {
+        let ctx = ui.ctx().clone();
+        let id = response.id;
+        let (start, end) = selected_char_range(&ctx, id, text);
+        let has_selection = start != end;
+        let char_count = text.chars().count();
+        let current_range = TextEditState::load(&ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .unwrap_or_else(|| CCursorRange::one(CCursor::new(char_count)));
+        let current = (current_range, text.clone());
+        let undoer = TextEditState::load(&ctx, id)
+            .map(|state| state.undoer())
+            .unwrap_or_default();
+
+        if ui
+            .add_enabled(
+                undoer.has_undo(&current),
+                egui::Button::new("Undo").shortcut_text("Ctrl+Z"),
+            )
+            .clicked()
+        {
+            restore_undo_state(&ctx, id, text, false);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                undoer.has_redo(&current),
+                egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z"),
+            )
+            .clicked()
+        {
+            restore_undo_state(&ctx, id, text, true);
+            ui.close_menu();
+        }
+
+        ui.separator();
+
+        if ui
+            .add_enabled(
+                has_selection,
+                egui::Button::new("Cut").shortcut_text("Ctrl+X"),
+            )
+            .clicked()
+        {
+            ctx.copy_text(selected_text(text, start, end));
+            let cursor = replace_selection(text, start, end, "");
+            store_cursor(&ctx, id, CCursorRange::one(CCursor::new(cursor)));
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                has_selection,
+                egui::Button::new("Copy").shortcut_text("Ctrl+C"),
+            )
+            .clicked()
+        {
+            ctx.copy_text(selected_text(text, start, end));
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            ui.close_menu();
+        }
+
+        let clipboard_text = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.get_text())
+            .ok()
+            .filter(|contents| !contents.is_empty());
+        if ui
+            .add_enabled(
+                clipboard_text.is_some(),
+                egui::Button::new("Paste").shortcut_text("Ctrl+V"),
+            )
+            .clicked()
+        {
+            if let Some(clipboard_text) = clipboard_text {
+                let cursor = replace_selection(text, start, end, &clipboard_text);
+                store_cursor(&ctx, id, CCursorRange::one(CCursor::new(cursor)));
+            }
+            ui.close_menu();
+        }
+        if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked() {
+            let cursor = replace_selection(text, start, end, "");
+            store_cursor(&ctx, id, CCursorRange::one(CCursor::new(cursor)));
+            ui.close_menu();
+        }
+
+        ui.separator();
+
+        let all_selected = start == 0 && end == char_count && char_count > 0;
+        if ui
+            .add_enabled(
+                char_count > 0 && !all_selected,
+                egui::Button::new("Select All").shortcut_text("Ctrl+A"),
+            )
+            .clicked()
+        {
+            store_cursor(
+                &ctx,
+                id,
+                CCursorRange::two(CCursor::new(0), CCursor::new(char_count)),
+            );
+            ui.close_menu();
+        }
+    });
+}
+
 fn matrix_reply_command(event_id: &str, message: &str) -> String {
     format!("/reply {} {}", event_id, message)
 }
@@ -300,7 +471,7 @@ impl WeeChatApp {
 
 #[cfg(test)]
 mod reply_tests {
-    use super::matrix_reply_command;
+    use super::{matrix_reply_command, replace_selection, selected_text};
 
     #[test]
     fn reply_command_keeps_the_selected_matrix_event() {
@@ -308,5 +479,15 @@ mod reply_tests {
             matrix_reply_command("$chosen:elsewhere.example", "not the latest"),
             "/reply $chosen:elsewhere.example not the latest"
         );
+    }
+
+    #[test]
+    fn context_menu_selection_uses_character_offsets() {
+        let mut text = "aб😺中z".to_owned();
+        assert_eq!(selected_text(&text, 1, 4), "б😺中");
+
+        let cursor = replace_selection(&mut text, 1, 4, "🌍");
+        assert_eq!(text, "a🌍z");
+        assert_eq!(cursor, 2);
     }
 }
