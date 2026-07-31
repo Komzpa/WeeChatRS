@@ -137,6 +137,7 @@ async fn fetch_link_preview(url: String) -> Result<LinkPreview, String> {
 }
 
 pub const INITIAL_LINES: usize = 300;
+const INITIAL_HISTORY_ROWS: usize = 120;
 const IMAGE_CACHE_MAX: usize = 200;
 const PREVIEW_CACHE_MAX: usize = 200;
 const PREFIX_COL_WIDTHS_MAX: usize = 500;
@@ -376,6 +377,46 @@ fn cap_map<V>(map: &mut HashMap<String, V>, cap: usize) {
 }
 pub const LOAD_MORE_LINES: usize = 300;
 pub const MAX_STORED_LINES: usize = 10_000;
+
+fn next_history_request_count(current: usize, previous_request: usize) -> Option<usize> {
+    let base = current.max(previous_request).max(INITIAL_LINES);
+    (base < MAX_STORED_LINES).then(|| (base + LOAD_MORE_LINES).min(MAX_STORED_LINES))
+}
+
+pub(crate) fn history_snapshot_is_exhausted(received: usize, requested: usize) -> bool {
+    received < requested || received >= MAX_STORED_LINES
+}
+
+#[cfg(test)]
+mod scrollback_tests {
+    use super::{
+        history_snapshot_is_exhausted, next_history_request_count, INITIAL_LINES,
+        LOAD_MORE_LINES, MAX_STORED_LINES,
+    };
+
+    #[test]
+    fn expanding_weechat_snapshot_requests_one_older_page() {
+        assert_eq!(
+            next_history_request_count(INITIAL_LINES, INITIAL_LINES),
+            Some(INITIAL_LINES + LOAD_MORE_LINES)
+        );
+        assert_eq!(
+            next_history_request_count(INITIAL_LINES + 50, INITIAL_LINES + LOAD_MORE_LINES),
+            Some(INITIAL_LINES + LOAD_MORE_LINES * 2)
+        );
+    }
+
+    #[test]
+    fn history_snapshot_stops_on_short_page_or_retention_limit() {
+        assert!(!history_snapshot_is_exhausted(600, 600));
+        assert!(history_snapshot_is_exhausted(450, 600));
+        assert!(history_snapshot_is_exhausted(MAX_STORED_LINES, MAX_STORED_LINES));
+        assert_eq!(
+            next_history_request_count(MAX_STORED_LINES, MAX_STORED_LINES),
+            None
+        );
+    }
+}
 const THREAD_PANEL_DEFAULT_WIDTH: f32 = 380.0;
 const THREAD_PANEL_MIN_WIDTH: f32 = 280.0;
 const PREFIX_MESSAGE_GAP: f32 = 8.0;
@@ -1045,6 +1086,14 @@ pub struct WeeChatApp {
 
     // Set to the buffer ID while a "load more" history request is in flight.
     pub(crate) loading_more_buffer_id: Option<String>,
+    /// Largest newest-N snapshot requested from WeeChat for each buffer.
+    pub(crate) history_request_counts: HashMap<String, usize>,
+    /// Buffers whose backend reported that no older retained history remains.
+    pub(crate) history_exhausted_buffer_ids: HashSet<String>,
+    /// Old visible row and line count captured before prepending a page.
+    pub(crate) history_scroll_anchors: HashMap<String, (String, usize)>,
+    /// A top-edge request is armed again only after the user scrolls away.
+    pub(crate) history_top_armed_buffer_ids: HashSet<String>,
 
     // Transient search text inside the font-family dropdown.
     pub(crate) font_search: String,
@@ -1233,6 +1282,10 @@ impl WeeChatApp {
             request_attention: false,
             notify_initialized: false,
             loading_more_buffer_id: None,
+            history_request_counts: HashMap::new(),
+            history_exhausted_buffer_ids: HashSet::new(),
+            history_scroll_anchors: HashMap::new(),
+            history_top_armed_buffer_ids: HashSet::new(),
             font_search: String::new(),
             prefix_align_max: settings.prefix_align_max,
             prefix_suffix: settings.prefix_suffix,
@@ -1345,6 +1398,76 @@ impl WeeChatApp {
             }
         }
         None
+    }
+
+    fn backend_type_for_buffer(&self, buffer_id: &str) -> Option<BackendType> {
+        self.connections.iter().find_map(|conn| {
+            let prefix = format!("{}/", conn.prefix);
+            buffer_id
+                .starts_with(&prefix)
+                .then(|| conn.backend_type.clone())
+        })
+    }
+
+    fn request_older_history(&mut self, buffer_id: &str) {
+        if self.loading_more_buffer_id.is_some()
+            || self.history_exhausted_buffer_ids.contains(buffer_id)
+        {
+            return;
+        }
+
+        let Some(buffer) = self.buffer_by_id(buffer_id) else {
+            return;
+        };
+        let current_len = buffer.messages.len();
+        let anchor = buffer.messages.front().map(|line| line.id.clone());
+        let oldest_timestamp = buffer.messages.front().map(|line| {
+            line.timestamp
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string()
+        });
+        let is_matrix = buffer.plugin == "matrix";
+        let previous_request = self
+            .history_request_counts
+            .get(buffer_id)
+            .copied()
+            .unwrap_or(current_len);
+        let backend_type = self.backend_type_for_buffer(buffer_id);
+
+        let request_count = if is_matrix || backend_type == Some(BackendType::Soju) {
+            None
+        } else {
+            next_history_request_count(current_len, previous_request)
+        };
+        if !is_matrix && backend_type != Some(BackendType::Soju) && request_count.is_none() {
+            self.history_exhausted_buffer_ids.insert(buffer_id.to_owned());
+            return;
+        }
+
+        self.loading_more_buffer_id = Some(buffer_id.to_owned());
+        self.history_top_armed_buffer_ids.remove(buffer_id);
+        if let Some(anchor) = anchor {
+            self.history_scroll_anchors
+                .insert(buffer_id.to_owned(), (anchor, current_len));
+        }
+        if let Some(count) = request_count {
+            self.history_request_counts
+                .insert(buffer_id.to_owned(), count);
+        }
+
+        if let Some((client, raw_id)) = self.client_for_buffer(buffer_id) {
+            if is_matrix {
+                client.send_message(&raw_id, "/matrix history");
+            } else if backend_type == Some(BackendType::Soju) {
+                if let Some(timestamp) = oldest_timestamp {
+                    client.fetch_lines_before(&raw_id, &timestamp);
+                }
+            } else if let Some(count) = request_count {
+                client.fetch_lines(&raw_id, count);
+            }
+        } else {
+            self.loading_more_buffer_id = None;
+        }
     }
 
     fn upload_clipboard_image_to(&mut self, buffer_id: String) {
@@ -2270,7 +2393,9 @@ impl eframe::App for WeeChatApp {
         let mut pending_buffer_command = None;
         let mut next_drag_buffer_id: Option<String> = None;
         let mut pending_mute: Option<(String, String, bool)> = None;
-        let mut pending_load_more: Option<(String, usize)> = None;
+        let mut pending_load_more: Option<String> = None;
+        let mut pending_history_top_rearm: Option<String> = None;
+        let mut pending_clear_history_anchor: Option<String> = None;
         let mut pending_reply_target: Option<ReplyTarget> = None;
         let mut pending_open_thread_buffer_id: Option<String> = None;
 
@@ -3414,11 +3539,19 @@ impl eframe::App for WeeChatApp {
                         ui.separator();
                     }
 
+                    let chat_scroll_id = current_buffer_id
+                        .as_deref()
+                        .unwrap_or("no-buffer");
+                    let mut history_view_at_top = false;
+                    let mut history_view_away_from_top = false;
                     ScrollArea::vertical()
+                        .id_source(("chat-scrollback", chat_scroll_id))
                         .stick_to_bottom(true)
                         .auto_shrink([false, false])
                         .horizontal_scroll_offset(0.0)
-                        .show(ui, |ui| {
+                        .show_viewport(ui, |ui, viewport| {
+                        history_view_at_top = viewport.min.y <= 48.0;
+                        history_view_away_from_top = viewport.min.y >= 96.0;
                         // Capture width inside the scroll area so it reflects inner_size.x
                         // (outer width minus vertical scrollbar), preventing content_is_too_large.x
                         // from going true and enabling horizontal offset drift via drag-to-scroll.
@@ -3427,8 +3560,8 @@ impl eframe::App for WeeChatApp {
                         ui.set_max_width(msg_area_width);
                         ui.spacing_mut().item_spacing.y = 1.0;
                         Frame::none().inner_margin(Margin::same(16.0)).show(ui, |ui| {
-                            if let (Some(buf_id), Some(messages)) = (current_buffer_id.as_ref(), current_buffer_messages.as_ref()) {
-                                if messages.len() >= INITIAL_LINES {
+                            if let (Some(buf_id), Some(_messages)) = (current_buffer_id.as_ref(), current_buffer_messages.as_ref()) {
+                                if !self.history_exhausted_buffer_ids.contains(buf_id) {
                                     ui.add_space(4.0);
                                     ui.horizontal(|ui| {
                                         ui.add_space((ui.available_width() - 180.0).max(0.0) / 2.0);
@@ -3436,7 +3569,7 @@ impl eframe::App for WeeChatApp {
                                             ui.spinner();
                                             ui.label(egui::RichText::new("Loading…").color(text_muted).small());
                                         } else if ui.button("⬆ Load older messages").clicked() {
-                                            pending_load_more = Some((buf_id.clone(), messages.len() + LOAD_MORE_LINES));
+                                            pending_load_more = Some(buf_id.clone());
                                         }
                                     });
                                     ui.add_space(8.0);
@@ -3471,6 +3604,16 @@ impl eframe::App for WeeChatApp {
                                 for line in messages {
                                     if !self.show_filtered_lines && !line.displayed { continue; }
                                     if is_matrix_media_status_line(&line.plain_message) { continue; }
+
+                                    if let Some((anchor_id, previous_len)) = self
+                                        .history_scroll_anchors
+                                        .get(current_buffer_id.as_deref().unwrap_or(""))
+                                    {
+                                        if line.id == *anchor_id && messages.len() > *previous_len {
+                                            ui.scroll_to_cursor(Some(egui::Align::TOP));
+                                            pending_clear_history_anchor = current_buffer_id.clone();
+                                        }
+                                    }
 
                                     if let Some(q) = &search_query {
                                         if !line.plain_prefix_lower.contains(q) && !line.plain_message_lower.contains(q) { continue; }
@@ -3781,25 +3924,36 @@ impl eframe::App for WeeChatApp {
                                 }
                             }
                         });
-                    });
+
+                    if let Some(buf_id) = current_buffer_id.as_ref() {
+                        if history_view_away_from_top {
+                            pending_history_top_rearm = Some(buf_id.clone());
+                        } else if history_view_at_top
+                            && self.loading_more_buffer_id.is_none()
+                            && !self.history_exhausted_buffer_ids.contains(buf_id)
+                            && (current_buffer_messages
+                                .as_ref()
+                                .is_some_and(|messages| messages.len() < INITIAL_HISTORY_ROWS)
+                                || self.history_top_armed_buffer_ids.contains(buf_id))
+                        {
+                            pending_load_more = Some(buf_id.clone());
+                        }
+                    }
+                });
                 });
             } else {
                 ui.centered_and_justified(|ui| { ui.label(egui::RichText::new("Select a buffer to start chatting").color(text_muted).size(16.0)); });
             }
         });
 
-        if let Some((buf_id, count)) = pending_load_more {
-            self.loading_more_buffer_id = Some(buf_id.clone());
-            if let Some((client, raw_id)) = self.client_for_buffer(&buf_id) {
-                let oldest_ts = self.buffers.iter()
-                    .find(|b| b.id == buf_id)
-                    .and_then(|b| b.messages.front())
-                    .map(|l| l.timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
-                if let Some(ts) = oldest_ts {
-                    client.fetch_lines_before(&raw_id, &ts);
-                }
-                client.fetch_lines(&raw_id, count);
-            }
+        if let Some(buf_id) = pending_history_top_rearm {
+            self.history_top_armed_buffer_ids.insert(buf_id);
+        }
+        if let Some(buf_id) = pending_clear_history_anchor {
+            self.history_scroll_anchors.remove(&buf_id);
+        }
+        if let Some(buf_id) = pending_load_more {
+            self.request_older_history(&buf_id);
         }
 
         if let Some(reply_target) = pending_reply_target {

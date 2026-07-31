@@ -1,7 +1,9 @@
 use crate::relay::backend::BackendEvent;
 use crate::relay::models::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use crate::ui::app::{WeeChatApp, MAX_STORED_LINES};
+use crate::ui::app::{
+    history_snapshot_is_exhausted, WeeChatApp, LOAD_MORE_LINES, MAX_STORED_LINES,
+};
 use chrono::{Utc, DateTime, Local};
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -10,6 +12,25 @@ static ANSI_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 fn ansi_re() -> &'static regex::Regex {
     ANSI_RE.get_or_init(|| regex::Regex::new(r"\x1B\[[0-9;]*[A-Za-z]").unwrap())
+}
+
+fn matrix_history_page_status(message: &str) -> Option<(usize, bool)> {
+    let mut fields = message.split_ascii_whitespace();
+    (fields.next()? == "matrix_history_page").then_some(())?;
+    let mut added = None;
+    let mut exhausted = None;
+    for field in fields {
+        if let Some(value) = field.strip_prefix("added=") {
+            added = value.parse::<usize>().ok();
+        } else if let Some(value) = field.strip_prefix("exhausted=") {
+            exhausted = match value {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+        }
+    }
+    Some((added?, exhausted?))
 }
 
 #[cfg(test)]
@@ -330,6 +351,8 @@ impl WeeChatApp {
                 let full_id = format!("{}/{}", conn_prefix, buffer_id);
                 let is_selected = self.selected_buffer_id.as_deref() == Some(full_id.as_str());
                 let is_load_more = self.loading_more_buffer_id.as_deref() == Some(full_id.as_str());
+                let received_count = lines.len();
+                let mut inserted_count = 0;
                 if let Some(buf) = self.buffer_by_id_mut(&full_id) {
                     // Update activity for on-connect chathistory replay, but not for
                     // user-triggered "load more" requests (those are explicitly old history).
@@ -351,7 +374,14 @@ impl WeeChatApp {
                         }
                     }
                     if is_prepend {
-                        for line in lines.into_iter().rev() {
+                        let existing_ids: std::collections::HashSet<_> =
+                            buf.messages.iter().map(|line| line.id.clone()).collect();
+                        let unique_lines: Vec<_> = lines
+                            .into_iter()
+                            .filter(|line| !existing_ids.contains(&line.id))
+                            .collect();
+                        inserted_count = unique_lines.len();
+                        for line in unique_lines.into_iter().rev() {
                             buf.messages.push_front(line);
                         }
                         while buf.messages.len() > MAX_STORED_LINES {
@@ -368,6 +398,9 @@ impl WeeChatApp {
                 }
                 if is_load_more {
                     self.loading_more_buffer_id = None;
+                    if received_count < LOAD_MORE_LINES || inserted_count == 0 {
+                        self.history_exhausted_buffer_ids.insert(full_id);
+                    }
                 }
             }
             BackendEvent::BufferHidden { buffer_id, hidden } => {
@@ -388,8 +421,15 @@ impl WeeChatApp {
                 self.handle_hotlist(conn_prefix, resp);
                 return;
             } else if id.starts_with("_buffer_lines:") {
-                let buffer_id = id[14..].to_string();
-                self.handle_buffer_lines(conn_prefix, &buffer_id, resp);
+                let request = &id[14..];
+                let (buffer_id, requested_count) = request
+                    .rsplit_once(':')
+                    .and_then(|(buffer_id, count)| {
+                        count.parse::<usize>().ok().map(|count| (buffer_id, count))
+                    })
+                    .map(|(buffer_id, count)| (buffer_id.to_owned(), Some(count)))
+                    .unwrap_or_else(|| (request.to_owned(), None));
+                self.handle_buffer_lines(conn_prefix, &buffer_id, requested_count, resp);
                 return;
             } else if id.starts_with("_nicks:") {
                 let buffer_id = id[7..].to_string();
@@ -1011,11 +1051,35 @@ impl WeeChatApp {
         }
     }
 
-    fn handle_buffer_lines(&mut self, conn_prefix: &str, raw_buffer_id: &str, resp: WeeChatResponse) {
+    fn handle_buffer_lines(
+        &mut self,
+        conn_prefix: &str,
+        raw_buffer_id: &str,
+        requested_count: Option<usize>,
+        resp: WeeChatResponse,
+    ) {
         let full_buffer_id = format!("{}/{}", conn_prefix, raw_buffer_id);
+        let is_load_more = self.loading_more_buffer_id.as_deref() == Some(&full_buffer_id);
+        if resp.code.is_some_and(|code| !(200..300).contains(&code)) {
+            if is_load_more {
+                self.loading_more_buffer_id = None;
+            }
+            self.log_conn_for(
+                conn_prefix,
+                format!(
+                    "← GET /api/buffers/{}/lines failed: {}",
+                    raw_buffer_id,
+                    resp.message.unwrap_or_else(|| "unknown relay error".to_owned())
+                ),
+            );
+            return;
+        }
         let body = Self::body_as_vec(&resp);
         let lines: Vec<Line> = body.iter().filter_map(|val| {
             let obj = val.as_object()?;
+            if Self::has_tag(obj, "matrix_history_page") {
+                return None;
+            }
             let displayed = obj.get("displayed").and_then(|v| v.as_bool()).unwrap_or(true);
             let id = obj.get("id").and_then(|v| Self::parse_id(v))
                 .unwrap_or_else(|| "unknown".to_string());
@@ -1038,8 +1102,8 @@ impl WeeChatApp {
         }).collect();
 
         let mut log_entry: Option<String> = None;
-        let is_load_more = self.loading_more_buffer_id.as_deref() == Some(&full_buffer_id);
         let is_selected = self.selected_buffer_id.as_deref() == Some(&full_buffer_id);
+        let mut history_exhausted = false;
         if let Some(idx) = self.buffer_idx_of(&full_buffer_id) {
             let buffer = &mut self.buffers[idx];
             let mut deque: std::collections::VecDeque<Line> = lines.into();
@@ -1048,6 +1112,10 @@ impl WeeChatApp {
                 deque.drain(0..excess);
             }
             let line_count = deque.len();
+            history_exhausted = is_load_more
+                && buffer.plugin != "matrix"
+                && requested_count
+                    .is_some_and(|requested| history_snapshot_is_exhausted(line_count, requested));
             log_entry = Some(format!(
                 "← GET /api/buffers/{}/lines  {} lines{}  [#{}]",
                 raw_buffer_id, line_count,
@@ -1067,6 +1135,9 @@ impl WeeChatApp {
         }
         if is_load_more {
             self.loading_more_buffer_id = None;
+        }
+        if history_exhausted {
+            self.history_exhausted_buffer_ids.insert(full_buffer_id);
         }
         if let Some(entry) = log_entry {
             self.log_conn_for(conn_prefix, entry);
@@ -1216,6 +1287,32 @@ impl WeeChatApp {
                     let buffer_id = format!("{}/{}", conn_prefix, raw_buffer_id);
                     let prefix = obj.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
                     let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    if Self::has_tag(obj, "matrix_history_page") {
+                        if let Some((added, exhausted)) = matrix_history_page_status(message) {
+                            if exhausted {
+                                self.history_exhausted_buffer_ids.insert(buffer_id.clone());
+                            }
+                            if added > 0 {
+                                let current_len = self
+                                    .buffer_by_id(&buffer_id)
+                                    .map_or(added, |buffer| buffer.messages.len());
+                                let count = (current_len + LOAD_MORE_LINES).min(MAX_STORED_LINES);
+                                self.history_request_counts.insert(buffer_id.clone(), count);
+                                if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
+                                    // Matrix rewrites physical WeeChat lines while sorting the
+                                    // newly fetched page. Refresh one authoritative snapshot only
+                                    // after its tagged completion marker, so relay clients see the
+                                    // final chronological order rather than transient line edits.
+                                    client.fetch_lines(&raw_id, count);
+                                } else {
+                                    self.loading_more_buffer_id = None;
+                                }
+                            } else if self.loading_more_buffer_id.as_deref() == Some(&buffer_id) {
+                                self.loading_more_buffer_id = None;
+                            }
+                        }
+                        continue;
+                    }
                     let id = obj.get("id").and_then(|v| Self::parse_id(v))
                         .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string());
                     let timestamp = Self::parse_date(obj.get("date"));
@@ -1237,13 +1334,28 @@ impl WeeChatApp {
                     if let Some(idx) = self.buffer_idx_of(&buffer_id) {
                         let buffer = &mut self.buffers[idx];
                         if !buffer.messages.iter().any(|m| m.id == line.id) {
-                            buffer.messages.push_back(line.clone());
+                            let is_historical = buffer
+                                .messages
+                                .back()
+                                .is_some_and(|latest| line.timestamp < latest.timestamp);
+                            if is_historical {
+                                let insert_at = buffer
+                                    .messages
+                                    .iter()
+                                    .position(|existing| existing.timestamp > line.timestamp)
+                                    .unwrap_or(buffer.messages.len());
+                                buffer.messages.insert(insert_at, line.clone());
+                            } else {
+                                buffer.messages.push_back(line.clone());
+                            }
                             if buffer.messages.len() > MAX_STORED_LINES {
                                 buffer.messages.pop_front();
                             }
 
                             if is_selected {
-                                buffer.last_read_id = Some(line.id.clone());
+                                if !is_historical {
+                                    buffer.last_read_id = Some(line.id.clone());
+                                }
                             } else if displayed && !buffer.muted && !is_notify_none && !is_self_msg {
                                 let activity = if is_highlight || notify_level == 3 {
                                     BufferActivity::Highlight
@@ -1335,7 +1447,22 @@ mod tests {
 
     use crate::relay::models::MatrixReplyLineKind;
 
-    use super::WeeChatApp;
+    use super::{matrix_history_page_status, WeeChatApp};
+
+    #[test]
+    fn parses_matrix_history_completion_marker() {
+        assert_eq!(
+            matrix_history_page_status("matrix_history_page added=200 exhausted=0"),
+            Some((200, false))
+        );
+        assert_eq!(
+            matrix_history_page_status(
+                "matrix_history_page added=0 exhausted=1 state=unavailable"
+            ),
+            Some((0, true))
+        );
+        assert_eq!(matrix_history_page_status("ordinary message"), None);
+    }
 
     #[test]
     fn matrix_event_id_is_read_from_weechat_tags() {
