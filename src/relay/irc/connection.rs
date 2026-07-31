@@ -147,6 +147,7 @@ impl Session {
             messages: VecDeque::new(),
             nicks: Vec::new(),
             mention_candidates: Vec::new(),
+            matrix_member_profiles: Vec::new(),
             activity: BufferActivity::None,
             unread_count: 0,
             last_read_id: None,

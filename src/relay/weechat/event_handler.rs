@@ -797,6 +797,25 @@ impl WeeChatApp {
         (room_id, thread_root)
     }
 
+    fn extract_matrix_member_profiles(
+        obj: &serde_json::Map<String, Value>,
+    ) -> Option<Vec<MatrixMemberProfile>> {
+        let encoded = obj
+            .get("local_variables")?
+            .as_object()?
+            .get("matrix_members_v1")?
+            .as_str()?;
+        let mut profiles: Vec<MatrixMemberProfile> = serde_json::from_str(encoded).ok()?;
+        profiles.retain(|profile| {
+            profile.user_id.starts_with('@')
+                && !profile.user_id.chars().any(char::is_whitespace)
+                && profile.avatar_mxc.as_ref().is_none_or(|uri| {
+                    uri.starts_with("mxc://") && !uri.chars().any(char::is_whitespace)
+                })
+        });
+        Some(profiles)
+    }
+
     fn extract_buffer_plugin(obj: &serde_json::Map<String, Value>) -> String {
         obj.get("plugin")
             .and_then(|value| value.as_str())
@@ -864,6 +883,7 @@ impl WeeChatApp {
                     let mut messages = std::collections::VecDeque::new();
                     let mut nicks = Vec::new();
                     let mut mention_candidates = Vec::new();
+                    let mut matrix_member_profiles = Vec::new();
                     let mut activity = BufferActivity::None;
                     let mut unread_count = 0u32;
                     let mut last_read_id = None;
@@ -875,6 +895,7 @@ impl WeeChatApp {
                         messages = existing.messages.clone();
                         nicks = existing.nicks.clone();
                         mention_candidates = existing.mention_candidates.clone();
+                        matrix_member_profiles = existing.matrix_member_profiles.clone();
                         activity = existing.activity;
                         unread_count = existing.unread_count;
                         last_read_id = existing.last_read_id.clone();
@@ -898,6 +919,9 @@ impl WeeChatApp {
                             mention_candidates = candidates;
                         }
                     }
+                    if let Some(profiles) = Self::extract_matrix_member_profiles(obj) {
+                        matrix_member_profiles = profiles;
+                    }
 
                     // Core and server buffers never have a usable nicklist regardless of
                     // what the relay reports (unwrap_or(true) above can over-report).
@@ -917,6 +941,7 @@ impl WeeChatApp {
                         messages,
                         nicks,
                         mention_candidates,
+                        matrix_member_profiles,
                         activity,
                         unread_count,
                         last_read_id,
@@ -1230,6 +1255,9 @@ impl WeeChatApp {
                             buffer.mention_candidates = candidates;
                         }
                     }
+                    if let Some(profiles) = Self::extract_matrix_member_profiles(obj) {
+                        buffer.matrix_member_profiles = profiles;
+                    }
                 }
             }
         }
@@ -1514,6 +1542,41 @@ impl WeeChatApp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn matrix_member_profiles_require_safe_structured_identity_and_avatar() {
+        let object = serde_json::json!({
+            "local_variables": {
+                "matrix_members_v1": serde_json::to_string(&serde_json::json!([
+                    {
+                        "user_id": "@ada:example.org",
+                        "display_name": "Ada",
+                        "nick": "Ada",
+                        "membership": "join",
+                        "role": "moderator",
+                        "power_level": 50,
+                        "avatar_mxc": "mxc://example.org/avatar"
+                    },
+                    {
+                        "user_id": "@bad id:example.org",
+                        "display_name": "Bad",
+                        "nick": "Bad",
+                        "membership": "join",
+                        "role": "member",
+                        "power_level": 0,
+                        "avatar_mxc": "https://example.org/avatar.png"
+                    }
+                ])).unwrap()
+            }
+        });
+        let profiles = super::WeeChatApp::extract_matrix_member_profiles(
+            object.as_object().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].user_id, "@ada:example.org");
+        assert_eq!(profiles[0].avatar_mxc.as_deref(), Some("mxc://example.org/avatar"));
+    }
+
     use serde_json::json;
 
     use crate::relay::models::{Line, MatrixReplyLineKind};
