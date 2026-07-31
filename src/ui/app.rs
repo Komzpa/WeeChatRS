@@ -387,6 +387,10 @@ pub(crate) fn history_snapshot_is_exhausted(received: usize, requested: usize) -
     received < requested || received >= MAX_STORED_LINES
 }
 
+fn should_auto_request_history(current: usize, attempted: bool, rearmed: bool) -> bool {
+    (current < INITIAL_HISTORY_ROWS && !attempted) || rearmed
+}
+
 #[cfg(test)]
 mod scrollback_tests {
     use super::{
@@ -415,6 +419,13 @@ mod scrollback_tests {
             next_history_request_count(MAX_STORED_LINES, MAX_STORED_LINES),
             None
         );
+    }
+
+    #[test]
+    fn busy_initial_page_does_not_retry_until_rearmed() {
+        assert!(super::should_auto_request_history(20, false, false));
+        assert!(!super::should_auto_request_history(20, true, false));
+        assert!(super::should_auto_request_history(20, true, true));
     }
 }
 const THREAD_PANEL_DEFAULT_WIDTH: f32 = 380.0;
@@ -1453,6 +1464,10 @@ impl WeeChatApp {
         if let Some(count) = request_count {
             self.history_request_counts
                 .insert(buffer_id.to_owned(), count);
+        } else if is_matrix {
+            self.history_request_counts
+                .entry(buffer_id.to_owned())
+                .or_insert(current_len.max(INITIAL_LINES));
         }
 
         if let Some((client, raw_id)) = self.client_for_buffer(buffer_id) {
@@ -3931,10 +3946,13 @@ impl eframe::App for WeeChatApp {
                         } else if history_view_at_top
                             && self.loading_more_buffer_id.is_none()
                             && !self.history_exhausted_buffer_ids.contains(buf_id)
-                            && (current_buffer_messages
-                                .as_ref()
-                                .is_some_and(|messages| messages.len() < INITIAL_HISTORY_ROWS)
-                                || self.history_top_armed_buffer_ids.contains(buf_id))
+                            && current_buffer_messages.as_ref().is_some_and(|messages| {
+                                should_auto_request_history(
+                                    messages.len(),
+                                    self.history_request_counts.contains_key(buf_id),
+                                    self.history_top_armed_buffer_ids.contains(buf_id),
+                                )
+                            })
                         {
                             pending_load_more = Some(buf_id.clone());
                         }
