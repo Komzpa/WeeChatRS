@@ -312,7 +312,7 @@ impl BackendClient for WeeChatClient {
     fn fetch_lines(&self, buffer_id: &str, count: usize) {
         self.send_api(
             &format!("GET /api/buffers/{}/lines?lines=-{}", buffer_id, count),
-            Some(&format!("_buffer_lines:{}", buffer_id)),
+            Some(&format!("_buffer_lines:{}:{}", buffer_id, count)),
             None,
         );
     }
