@@ -42,6 +42,80 @@ fn sort_lines_chronologically(lines: &mut [Line]) {
     lines.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
 }
 
+fn buffer_group_key(buffer: &Buffer) -> (String, String) {
+    let connection = buffer.id.split('/').next().unwrap_or_default();
+    (connection.to_owned(), buffer.server.clone())
+}
+
+fn buffer_groups_are_valid(buffers: &[Buffer]) -> bool {
+    let mut seen_groups = std::collections::HashSet::new();
+    let mut current_group: Option<(String, String)> = None;
+    let mut current_group_has_child = false;
+
+    for buffer in buffers.iter().filter(|buffer| !buffer.is_matrix_thread()) {
+        let group = buffer_group_key(buffer);
+        if current_group.as_ref() != Some(&group) {
+            if !seen_groups.insert(group.clone()) {
+                return false;
+            }
+            current_group = Some(group);
+            current_group_has_child = false;
+        }
+
+        let is_root = buffer.kind == "server" || buffer.kind == "core";
+        if is_root && current_group_has_child {
+            return false;
+        }
+        current_group_has_child |= !is_root;
+    }
+
+    true
+}
+
+/// Apply a saved visual order without allowing stale IDs to tear server groups
+/// apart. Returns false after restoring the already-grouped fallback order.
+fn apply_saved_buffer_order(buffers: &mut [Buffer], order: &[String]) -> bool {
+    if order.is_empty() {
+        return true;
+    }
+
+    let fallback_positions = buffers
+        .iter()
+        .enumerate()
+        .map(|(position, buffer)| (buffer.id.clone(), position))
+        .collect::<std::collections::HashMap<_, _>>();
+    let max_order = order.len();
+    let server_header_pos = buffers
+        .iter()
+        .filter(|buffer| buffer.kind == "server" || buffer.kind == "core")
+        .filter_map(|buffer| {
+            order
+                .iter()
+                .position(|id| id == &buffer.id)
+                .map(|position| (buffer_group_key(buffer), position))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    buffers.sort_by_key(|buffer| {
+        if let Some(position) = order.iter().position(|id| id == &buffer.id) {
+            position * 10_000
+        } else {
+            let base = server_header_pos
+                .get(&buffer_group_key(buffer))
+                .map(|position| position * 10_000 + 1)
+                .unwrap_or(max_order * 10_000 + 1);
+            base + buffer.number.max(0) as usize
+        }
+    });
+
+    if buffer_groups_are_valid(buffers) {
+        true
+    } else {
+        buffers.sort_by_key(|buffer| fallback_positions[&buffer.id]);
+        false
+    }
+}
+
 #[cfg(test)]
 mod matrix_media_tests {
     use super::WeeChatApp;
@@ -1076,29 +1150,18 @@ impl WeeChatApp {
             self.buffers.retain(|b| !b.id.starts_with(&pfx));
             self.buffers.extend(new_conn_buffers);
 
-            // Re-apply user's custom ordering
+            // Re-apply the user's custom ordering only while it preserves
+            // connection/server group boundaries. Legacy relay IDs without a
+            // connection prefix otherwise sort all roots before all children.
             if !self.buffer_order.is_empty() {
-                let order = &self.buffer_order;
-                let max_order = order.len();
-
-                let server_header_pos: std::collections::HashMap<String, usize> = self.buffers.iter()
-                    .filter(|b| b.kind == "server" || b.kind == "core")
-                    .filter_map(|b| {
-                        order.iter().position(|id| id == &b.id)
-                            .map(|pos| (b.server.clone(), pos))
-                    })
-                    .collect();
-
-                self.buffers.sort_by_key(|b| {
-                    if let Some(pos) = order.iter().position(|id| id == &b.id) {
-                        pos * 10_000
-                    } else {
-                        let base = server_header_pos.get(&b.server)
-                            .map(|&p| p * 10_000 + 1)
-                            .unwrap_or(max_order * 10_000 + 1);
-                        base + b.number as usize
-                    }
-                });
+                if !apply_saved_buffer_order(&mut self.buffers, &self.buffer_order) {
+                    self.buffer_order = self
+                        .buffers
+                        .iter()
+                        .filter(|buffer| !buffer.is_matrix_thread())
+                        .map(|buffer| buffer.id.clone())
+                        .collect();
+                }
             }
 
             // When multiple connections are present, group all buffers by connection prefix
@@ -1685,10 +1748,104 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::relay::models::{Line, MatrixReplyLineKind};
+    use crate::relay::models::{Buffer, BufferActivity, Line, MatrixReplyLineKind};
     use chrono::{TimeZone, Utc};
+    use std::collections::VecDeque;
 
-    use super::{matrix_history_page_status, sort_lines_chronologically, WeeChatApp};
+    use super::{
+        apply_saved_buffer_order, buffer_groups_are_valid, matrix_history_page_status,
+        sort_lines_chronologically, WeeChatApp,
+    };
+
+    fn sidebar_buffer(id: &str, number: i32, server: &str, kind: &str) -> Buffer {
+        Buffer {
+            id: id.to_owned(),
+            number,
+            name: id.to_owned(),
+            full_name: id.to_owned(),
+            plugin: if server == "matrix" { "matrix" } else { "irc" }.to_owned(),
+            kind: kind.to_owned(),
+            server: server.to_owned(),
+            own_nick: String::new(),
+            messages: VecDeque::new(),
+            nicks: Vec::new(),
+            mention_candidates: Vec::new(),
+            matrix_member_profiles: Vec::new(),
+            activity: BufferActivity::None,
+            unread_count: 0,
+            last_read_id: None,
+            last_markread_ts: None,
+            topic: String::new(),
+            modes: String::new(),
+            hidden: false,
+            muted: false,
+            has_nicklist: kind != "server",
+            matrix_room_id: None,
+            matrix_thread_root: None,
+            visit_start_marker_id: None,
+        }
+    }
+
+    #[test]
+    fn stale_unprefixed_order_cannot_flatten_server_groups() {
+        let mut buffers = vec![
+            sidebar_buffer("localhost/libera-root", 1, "libera", "server"),
+            sidebar_buffer("localhost/libera-room", 2, "libera", "channel"),
+            sidebar_buffer("localhost/matrix-root", 1, "matrix", "server"),
+            sidebar_buffer("localhost/matrix-room", 3, "matrix", "channel"),
+        ];
+        let grouped_ids = buffers
+            .iter()
+            .map(|buffer| buffer.id.clone())
+            .collect::<Vec<_>>();
+        let legacy_order = vec![
+            "libera-root".to_owned(),
+            "matrix-root".to_owned(),
+            "libera-room".to_owned(),
+            "matrix-room".to_owned(),
+        ];
+
+        assert!(!apply_saved_buffer_order(&mut buffers, &legacy_order));
+        assert!(buffer_groups_are_valid(&buffers));
+        assert_eq!(
+            buffers
+                .iter()
+                .map(|buffer| buffer.id.clone())
+                .collect::<Vec<_>>(),
+            grouped_ids,
+        );
+    }
+
+    #[test]
+    fn valid_saved_order_can_move_complete_server_groups() {
+        let mut buffers = vec![
+            sidebar_buffer("localhost/libera-root", 1, "libera", "server"),
+            sidebar_buffer("localhost/libera-room", 2, "libera", "channel"),
+            sidebar_buffer("localhost/matrix-root", 1, "matrix", "server"),
+            sidebar_buffer("localhost/matrix-room", 3, "matrix", "channel"),
+        ];
+        let order = vec![
+            "localhost/matrix-root".to_owned(),
+            "localhost/matrix-room".to_owned(),
+            "localhost/libera-root".to_owned(),
+            "localhost/libera-room".to_owned(),
+        ];
+
+        assert!(apply_saved_buffer_order(&mut buffers, &order));
+        assert!(buffer_groups_are_valid(&buffers));
+        assert_eq!(
+            buffers
+                .iter()
+                .map(|buffer| buffer.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "localhost/matrix-root",
+                "localhost/matrix-room",
+                "localhost/libera-root",
+                "localhost/libera-room",
+            ],
+        );
+    }
 
     fn timeline_line(id: &str, second: i64) -> Line {
         Line::new(
