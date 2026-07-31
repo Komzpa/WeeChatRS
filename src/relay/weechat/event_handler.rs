@@ -34,6 +34,14 @@ fn matrix_history_page_status(message: &str) -> Option<(usize, bool)> {
     Some((added?, exhausted?))
 }
 
+fn sort_lines_chronologically(lines: &mut [Line]) {
+    // WeeChat's ordinary buffers arrive oldest-first, while Matrix history can
+    // arrive newest-first or as a descending history block followed by newer
+    // live lines. Stable sorting keeps equal-timestamp reply/media fragments in
+    // their relay order while giving every downstream path one invariant.
+    lines.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+}
+
 #[cfg(test)]
 mod matrix_media_tests {
     use super::WeeChatApp;
@@ -1098,7 +1106,7 @@ impl WeeChatApp {
             return;
         }
         let body = Self::body_as_vec(&resp);
-        let lines: Vec<Line> = body.iter().filter_map(|val| {
+        let mut lines: Vec<Line> = body.iter().filter_map(|val| {
             let obj = val.as_object()?;
             if Self::has_tag(obj, "matrix_history_page") {
                 return None;
@@ -1123,6 +1131,7 @@ impl WeeChatApp {
             line.matrix_media = Self::matrix_media_from_tags(obj);
             Some(line)
         }).collect();
+        sort_lines_chronologically(&mut lines);
 
         let mut log_entry: Option<String> = None;
         let is_selected = self.selected_buffer_id.as_deref() == Some(&full_buffer_id);
@@ -1507,9 +1516,38 @@ impl WeeChatApp {
 mod tests {
     use serde_json::json;
 
-    use crate::relay::models::MatrixReplyLineKind;
+    use crate::relay::models::{Line, MatrixReplyLineKind};
+    use chrono::{TimeZone, Utc};
 
-    use super::{matrix_history_page_status, WeeChatApp};
+    use super::{matrix_history_page_status, sort_lines_chronologically, WeeChatApp};
+
+    fn timeline_line(id: &str, second: i64) -> Line {
+        Line::new(
+            id.to_owned(),
+            Utc.timestamp_opt(second, 0).single().unwrap(),
+            String::new(),
+            id.to_owned(),
+            true,
+            false,
+        )
+    }
+
+    #[test]
+    fn relay_snapshots_are_stably_normalized_oldest_first() {
+        let mut lines = vec![
+            timeline_line("newest", 300),
+            timeline_line("same-time-first", 200),
+            timeline_line("same-time-second", 200),
+            timeline_line("oldest", 100),
+        ];
+
+        sort_lines_chronologically(&mut lines);
+
+        assert_eq!(
+            lines.iter().map(|line| line.id.as_str()).collect::<Vec<_>>(),
+            vec!["oldest", "same-time-first", "same-time-second", "newest"],
+        );
+    }
 
     #[test]
     fn parses_matrix_history_completion_marker() {

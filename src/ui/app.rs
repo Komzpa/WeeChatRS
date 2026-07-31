@@ -1695,6 +1695,37 @@ pub(crate) struct SavedReadMarker {
     pub(crate) timestamp_nanos: i64,
 }
 
+const BEFORE_FIRST_LOADED_LINE_ID: &str = "__weechatrs_before_first_loaded_line__";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisitMarkerLocation {
+    BeforeFirst,
+    At(usize),
+    Missing,
+}
+
+impl VisitMarkerLocation {
+    fn is_before(&self, line_index: usize) -> bool {
+        match self {
+            Self::BeforeFirst => true,
+            Self::At(marker_index) => line_index > *marker_index,
+            Self::Missing => false,
+        }
+    }
+}
+
+fn visit_marker_location(lines: &VecDeque<Line>, marker_id: &str) -> VisitMarkerLocation {
+    if marker_id == BEFORE_FIRST_LOADED_LINE_ID {
+        VisitMarkerLocation::BeforeFirst
+    } else {
+        lines
+            .iter()
+            .position(|line| line.id == marker_id)
+            .map(VisitMarkerLocation::At)
+            .unwrap_or(VisitMarkerLocation::Missing)
+    }
+}
+
 impl SavedReadMarker {
     pub(crate) fn from_line(line: &Line) -> Self {
         Self {
@@ -1722,14 +1753,17 @@ impl SavedReadMarker {
     pub(crate) fn restore_visit_line_id(&self, lines: &VecDeque<Line>) -> Option<String> {
         (!lines.is_empty()).then(|| {
             self.restore_line_id(lines)
-                .unwrap_or_else(|| "0".to_owned())
+                .unwrap_or_else(|| BEFORE_FIRST_LOADED_LINE_ID.to_owned())
         })
     }
 }
 
 #[cfg(test)]
 mod saved_read_marker_tests {
-    use super::{AppSettings, Line, SavedReadMarker};
+    use super::{
+        visit_marker_location, AppSettings, Line, SavedReadMarker, VisitMarkerLocation,
+        BEFORE_FIRST_LOADED_LINE_ID,
+    };
     use chrono::{TimeZone, Utc};
     use std::collections::VecDeque;
 
@@ -1783,7 +1817,28 @@ mod saved_read_marker_tests {
             timestamp_nanos: 1_000_000_000,
         };
 
-        assert_eq!(marker.restore_visit_line_id(&lines).as_deref(), Some("0"));
+        assert_eq!(
+            marker.restore_visit_line_id(&lines).as_deref(),
+            Some(BEFORE_FIRST_LOADED_LINE_ID),
+        );
+    }
+
+    #[test]
+    fn visit_divider_uses_timeline_position_not_numeric_line_id_order() {
+        let lines = VecDeque::from([
+            line("10", 100),
+            line("2", 200),
+            line("0", 300),
+        ]);
+
+        let marker = visit_marker_location(&lines, "2");
+        assert_eq!(marker, VisitMarkerLocation::At(1));
+        assert!(!marker.is_before(1));
+        assert!(marker.is_before(2));
+        assert_eq!(
+            visit_marker_location(&lines, BEFORE_FIRST_LOADED_LINE_ID),
+            VisitMarkerLocation::BeforeFirst,
+        );
     }
 }
 
@@ -4505,6 +4560,10 @@ impl eframe::App for WeeChatApp {
 
                             if let Some(messages) = &current_buffer_messages {
                                 let mut marker_shown = false;
+                                let visit_marker_state = current_buffer_visit_marker_id
+                                    .as_deref()
+                                    .map(|marker_id| visit_marker_location(messages, marker_id))
+                                    .unwrap_or(VisitMarkerLocation::Missing);
                                 let search_query = if self.search_text.is_empty() {
                                     None
                                 } else {
@@ -4523,7 +4582,7 @@ impl eframe::App for WeeChatApp {
                                     })
                                     .collect();
                                 let mut previous_matrix_event_id: Option<String> = None;
-                                for line in messages {
+                                for (line_index, line) in messages.iter().enumerate() {
                                     if !self.show_filtered_lines && !line.displayed { continue; }
                                     if is_matrix_media_status_line(&line.plain_message) { continue; }
 
@@ -4545,11 +4604,8 @@ impl eframe::App for WeeChatApp {
                                             .as_ref()
                                             == line.matrix_event_id.as_ref();
 
-                                    let past_visit_marker = current_buffer_visit_marker_id.as_ref().map(|vid| {
-                                        let lid = line.id.parse::<i64>().unwrap_or(0);
-                                        let vid = vid.parse::<i64>().unwrap_or(0);
-                                        lid > vid
-                                    }).unwrap_or(false);
+                                    let past_visit_marker =
+                                        visit_marker_state.is_before(line_index);
                                     if !marker_shown && past_visit_marker {
                                         let elapsed = self.selected_view_since
                                             .map(|t| t.elapsed())
