@@ -517,7 +517,225 @@ mod scrollback_tests {
 }
 const THREAD_PANEL_DEFAULT_WIDTH: f32 = 380.0;
 const THREAD_PANEL_MIN_WIDTH: f32 = 280.0;
+const CHAT_PANEL_MIN_WIDTH: f32 = 360.0;
+const COMPACT_MESSAGE_ROW_WIDTH: f32 = 460.0;
 const PREFIX_MESSAGE_GAP: f32 = 8.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RightPanelKind {
+    None,
+    Thread,
+    Nicklist,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResponsivePanelLayout {
+    show_buffers: bool,
+    buffers_max_width: f32,
+    buffers_constrained: bool,
+    right_width: f32,
+    right_min_width: f32,
+    right_max_width: f32,
+    right_constrained: bool,
+    #[cfg(test)]
+    central_width: f32,
+}
+
+fn responsive_panel_layout(
+    viewport_width: f32,
+    show_buffers: bool,
+    preferred_buffers_width: f32,
+    right_kind: RightPanelKind,
+    preferred_right_width: f32,
+) -> ResponsivePanelLayout {
+    let viewport_width = viewport_width.max(1.0);
+    // On a very small viewport the chat still owns a majority of the width.
+    // At normal sizes it gets a stable readable minimum before side panels.
+    let central_floor = CHAT_PANEL_MIN_WIDTH.min(viewport_width * 0.52);
+    let (right_fraction, natural_right_min) = match right_kind {
+        RightPanelKind::None => (0.0, 0.0),
+        RightPanelKind::Thread => (0.48, THREAD_PANEL_MIN_WIDTH),
+        RightPanelKind::Nicklist => (0.30, 80.0),
+    };
+
+    let right_max_without_buffers = if right_kind == RightPanelKind::None {
+        0.0
+    } else {
+        (viewport_width - central_floor)
+            .max(1.0)
+            .min(viewport_width * right_fraction)
+    };
+    let right_min_without_buffers = natural_right_min.min(right_max_without_buffers);
+    let right_without_buffers = if right_kind == RightPanelKind::None {
+        0.0
+    } else {
+        preferred_right_width.clamp(
+            right_min_without_buffers,
+            right_max_without_buffers.max(right_min_without_buffers),
+        )
+    };
+
+    // Shrink the buffer list before shrinking the explicitly opened thread.
+    // If even its 80 px compact form does not fit, suppress it temporarily;
+    // self.show_buffers remains untouched and restores it after expansion.
+    let buffers_budget = (viewport_width - central_floor - right_without_buffers).max(0.0);
+    let buffers_max_width = (viewport_width * 0.40).min(buffers_budget);
+    let effective_show_buffers = show_buffers && buffers_max_width >= 80.0;
+    let buffers_width = if effective_show_buffers {
+        preferred_buffers_width.clamp(80.0, buffers_max_width)
+    } else {
+        0.0
+    };
+
+    let available_after_buffers = (viewport_width - buffers_width).max(1.0);
+    let central_floor_after_buffers =
+        CHAT_PANEL_MIN_WIDTH.min(available_after_buffers * 0.52);
+    let right_max_width = if right_kind == RightPanelKind::None {
+        0.0
+    } else {
+        (available_after_buffers - central_floor_after_buffers)
+            .max(1.0)
+            .min(available_after_buffers * right_fraction)
+    };
+    let right_min_width = natural_right_min.min(right_max_width);
+    let right_width = if right_kind == RightPanelKind::None {
+        0.0
+    } else {
+        preferred_right_width.clamp(
+            right_min_width,
+            right_max_width.max(right_min_width),
+        )
+    };
+
+    ResponsivePanelLayout {
+        show_buffers: effective_show_buffers,
+        buffers_max_width,
+        buffers_constrained: effective_show_buffers
+            && preferred_buffers_width > buffers_max_width,
+        right_width,
+        right_min_width,
+        right_max_width,
+        right_constrained: right_kind != RightPanelKind::None
+            && preferred_right_width > right_max_width,
+        #[cfg(test)]
+        central_width: (available_after_buffers - right_width).max(0.0),
+    }
+}
+
+fn compact_message_row(width: f32) -> bool {
+    width < COMPACT_MESSAGE_ROW_WIDTH
+}
+
+fn forget_temporary_panel_width(ctx: &egui::Context, panel_id: &'static str, constrained: bool) {
+    if constrained {
+        ctx.data_mut(|data| {
+            data.remove::<egui::containers::panel::PanelState>(egui::Id::new(panel_id));
+        });
+    }
+}
+
+#[cfg(test)]
+mod responsive_layout_tests {
+    use super::*;
+
+    #[test]
+    fn thread_layout_never_starves_the_chat_at_supported_sizes() {
+        for viewport in [1366.0, 1024.0, 900.0, 767.0, 640.0, 400.0] {
+            let layout = responsive_panel_layout(
+                viewport,
+                true,
+                400.0,
+                RightPanelKind::Thread,
+                380.0,
+            );
+            let expected_floor = CHAT_PANEL_MIN_WIDTH.min(viewport * 0.52);
+            assert!(
+                layout.central_width + 0.5 >= expected_floor,
+                "{viewport}px left only {}px for chat",
+                layout.central_width
+            );
+            assert!(
+                layout.central_width + layout.right_width
+                    + if layout.show_buffers {
+                        layout.buffers_max_width.min(400.0)
+                    } else {
+                        0.0
+                    }
+                    <= viewport + 0.5
+            );
+        }
+    }
+
+    #[test]
+    fn supplied_767px_failure_hides_buffers_instead_of_crushing_messages() {
+        let layout = responsive_panel_layout(
+            767.0,
+            true,
+            400.0,
+            RightPanelKind::Thread,
+            380.0,
+        );
+        assert!(!layout.show_buffers);
+        assert!(layout.central_width >= 398.0);
+        assert!(layout.right_width >= 360.0);
+    }
+
+    #[test]
+    fn narrow_rows_stack_metadata_above_full_width_message_content() {
+        assert!(!compact_message_row(640.0));
+        assert!(compact_message_row(459.0));
+        assert!(compact_message_row(208.0));
+    }
+
+    #[test]
+    fn temporary_side_panel_clamp_does_not_survive_window_expansion() {
+        fn render_panel(ctx: &egui::Context, viewport: f32, max_width: f32) -> f32 {
+            let mut rendered_width = 0.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(viewport, 500.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                let response = egui::SidePanel::right("responsive_restore_test")
+                    .resizable(true)
+                    .default_width(380.0)
+                    .min_width(1.0)
+                    .max_width(max_width)
+                    .show(ctx, |ui| {
+                        ui.set_min_width(ui.available_width());
+                    });
+                rendered_width = response.response.rect.width();
+                forget_temporary_panel_width(
+                    ctx,
+                    "responsive_restore_test",
+                    max_width < 380.0,
+                );
+                egui::CentralPanel::default().show(ctx, |_| {});
+            });
+            rendered_width
+        }
+
+        let ctx = egui::Context::default();
+        let original_width = render_panel(&ctx, 1366.0, 500.0);
+        let narrow_width = render_panel(&ctx, 640.0, 307.2);
+        assert!(
+            narrow_width < original_width - 50.0,
+            "panel did not narrow enough: original={original_width}, narrow={narrow_width}"
+        );
+        assert!(
+            egui::containers::panel::PanelState::load(
+                &ctx,
+                egui::Id::new("responsive_restore_test")
+            )
+            .is_none()
+        );
+        let restored_width = render_panel(&ctx, 1366.0, 500.0);
+        assert!((restored_width - original_width).abs() < 1.0);
+    }
+}
 
 #[derive(Clone)]
 struct ThreadReplyContext {
@@ -2818,18 +3036,48 @@ impl eframe::App for WeeChatApp {
             });
         }
 
-        if self.show_buffers {
-            if self.buffers_width == 0.0 {
-                let buf_font_id = FontId::new(self.font_size, if self.use_monospace { FontFamily::Monospace } else { FontFamily::Proportional });
-                let char_w = ctx.fonts(|f| f.glyph_width(&buf_font_id, 'W'));
-                self.buffers_width = char_w * 20.0 + 20.0;
+        if self.buffers_width == 0.0 {
+            let buf_font_id = FontId::new(self.font_size, if self.use_monospace { FontFamily::Monospace } else { FontFamily::Proportional });
+            let char_w = ctx.fonts(|f| f.glyph_width(&buf_font_id, 'W'));
+            self.buffers_width = char_w * 20.0 + 20.0;
+        }
+        let responsive_right_kind = if self.open_thread_buffer_id.is_some() {
+            RightPanelKind::Thread
+        } else if self.show_nicklist
+            && self.selected_buffer_id.as_ref()
+                .and_then(|id| self.buffer_by_id(id))
+                .is_some_and(|buffer| buffer.has_nicklist)
+            && self.is_any_connected()
+        {
+            RightPanelKind::Nicklist
+        } else {
+            RightPanelKind::None
+        };
+        let preferred_right_width = match responsive_right_kind {
+            RightPanelKind::None => 0.0,
+            RightPanelKind::Thread => self.thread_panel_width,
+            RightPanelKind::Nicklist => {
+                if self.nicklist_width < 80.0 {
+                    180.0
+                } else {
+                    self.nicklist_width
+                }
             }
-            let buffers_max_w = (ctx.screen_rect().width() * 0.40).max(80.0);
+        };
+        let responsive_panels = responsive_panel_layout(
+            ctx.available_rect().width(),
+            self.show_buffers,
+            self.buffers_width,
+            responsive_right_kind,
+            preferred_right_width,
+        );
+
+        if responsive_panels.show_buffers {
             let buffers_resp = egui::SidePanel::left("buffers_panel")
                 .resizable(true)
-                .default_width(self.buffers_width)
+                .default_width(self.buffers_width.min(responsive_panels.buffers_max_width))
                 .min_width(80.0)
-                .max_width(buffers_max_w)
+                .max_width(responsive_panels.buffers_max_width)
                 .frame(Frame::none().fill(bg_color).inner_margin(Margin::same(10.0)))
                 .show(ctx, |ui| {
                     ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
@@ -3168,7 +3416,19 @@ impl eframe::App for WeeChatApp {
                     }
                 });
             let w = buffers_resp.response.rect.width();
-            if w >= 80.0 { self.buffers_width = w; }
+            if w >= 80.0
+                && (!responsive_panels.buffers_constrained
+                    || w < responsive_panels.buffers_max_width - 1.0)
+            {
+                self.buffers_width = w;
+            }
+            // SidePanel persists its clamped rectangle. Drop only that temporary
+            // value so widening the window restores the user's preferred width.
+            forget_temporary_panel_width(
+                ctx,
+                "buffers_panel",
+                responsive_panels.buffers_constrained,
+            );
         }
 
         if let Some(id) = next_selected_buffer_id {
@@ -3273,16 +3533,12 @@ impl eframe::App for WeeChatApp {
             let room_label = current_buffer_name
                 .clone()
                 .unwrap_or_else(|| "Matrix".to_owned());
-            let max_thread_width =
-                (ctx.available_rect().width() * 0.48).max(THREAD_PANEL_MIN_WIDTH);
-            let thread_width = self
-                .thread_panel_width
-                .clamp(THREAD_PANEL_MIN_WIDTH, max_thread_width);
+            let thread_width = responsive_panels.right_width;
             let panel = egui::SidePanel::right("thread_panel")
                 .resizable(true)
                 .default_width(thread_width)
-                .min_width(THREAD_PANEL_MIN_WIDTH)
-                .max_width(max_thread_width)
+                .min_width(responsive_panels.right_min_width)
+                .max_width(responsive_panels.right_max_width)
                 .frame(
                     Frame::none()
                         .fill(surface_color)
@@ -3507,7 +3763,7 @@ impl eframe::App for WeeChatApp {
                             egui::TextEdit::singleline(&mut self.thread_input_text)
                                 .hint_text("Reply in thread…")
                                 .margin(Margin::symmetric(8.0, 5.0))
-                                .desired_width(ui.available_width() - 86.0),
+                                .desired_width((ui.available_width() - 86.0).max(40.0)),
                         );
                         crate::ui::input::input_context_menu(
                             &response,
@@ -3551,17 +3807,26 @@ impl eframe::App for WeeChatApp {
                         }
                     });
                 });
-            self.thread_panel_width = panel.response.rect.width();
+            let width = panel.response.rect.width();
+            if !responsive_panels.right_constrained
+                || width < responsive_panels.right_max_width - 1.0
+            {
+                self.thread_panel_width = width;
+            }
+            forget_temporary_panel_width(
+                ctx,
+                "thread_panel",
+                responsive_panels.right_constrained,
+            );
         } else if self.show_nicklist && current_buf_has_nicklist && any_connected && current_buffer_id.is_some() {
             if self.nicklist_width < 80.0 {
                 self.nicklist_width = 180.0;
             }
-            let nicks_max_w = (ctx.screen_rect().width() * 0.30).max(80.0);
             let nicks_resp = egui::SidePanel::right("nicks_panel_2")
                 .resizable(true)
-                .default_width(self.nicklist_width)
-                .min_width(80.0)
-                .max_width(nicks_max_w)
+                .default_width(responsive_panels.right_width)
+                .min_width(responsive_panels.right_min_width)
+                .max_width(responsive_panels.right_max_width)
                 .frame(Frame::none().fill(bg_color).inner_margin(Margin::same(10.0)))
                 .show(ctx, |ui| {
                     ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
@@ -3613,7 +3878,17 @@ impl eframe::App for WeeChatApp {
                             }
                         });
                 });
-            self.nicklist_width = nicks_resp.response.rect.width();
+            let width = nicks_resp.response.rect.width();
+            if !responsive_panels.right_constrained
+                || width < responsive_panels.right_max_width - 1.0
+            {
+                self.nicklist_width = width;
+            }
+            forget_temporary_panel_width(
+                ctx,
+                "nicks_panel_2",
+                responsive_panels.right_constrained,
+            );
         }
 
         if current_buffer_id.is_some() {
@@ -3701,7 +3976,7 @@ impl eframe::App for WeeChatApp {
                                 .hint_text(hint)
                                 .margin(Margin::symmetric(8.0, 4.0))
                                 .lock_focus(true)
-                                .desired_width(ui.available_width() - 80.0);
+                                .desired_width((ui.available_width() - 80.0).max(40.0));
 
                             let res = ui.add(text_edit);
                             crate::ui::input::input_context_menu(&res, &mut self.input_text);
@@ -4116,7 +4391,12 @@ impl eframe::App for WeeChatApp {
                                         .stroke(row_stroke)
                                         .rounding(Rounding::same(3.0))
                                         .show(ui, |ui| {
-                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                                    let row_width = ui.available_width();
+                                    let compact_row = compact_message_row(row_width);
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::TOP)
+                                            .with_main_wrap(compact_row),
+                                        |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
                                         if self.show_timestamps {
                                             ui.scope(|ui| {
@@ -4141,7 +4421,14 @@ impl eframe::App for WeeChatApp {
                                         };
                                         let entry = self.prefix_col_widths.entry(current_buffer_id.clone().unwrap_or_default()).or_insert(0.0);
                                         *entry = entry.max(measured_w).min(cap_px);
-                                        let col_width = *entry;
+                                        let compact_prefix_cap = (row_width
+                                            - if self.show_timestamps { 92.0 } else { 24.0 })
+                                            .max(40.0);
+                                        let col_width = if compact_row {
+                                            (*entry).min(compact_prefix_cap)
+                                        } else {
+                                            *entry
+                                        };
 
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(col_width, ui.text_style_height(&TextStyle::Body)),
@@ -4153,7 +4440,7 @@ impl eframe::App for WeeChatApp {
                                                 let mut prefix_job = LayoutJob::default();
                                                 prefix_job.halign = egui::Align::RIGHT;
                                                 for s in prefix_sections { prefix_job.append(&s.text, 0.0, s.style.to_format(font_id.clone(), &render_theme)); }
-                                                ui.add(Label::new(prefix_job).wrap(false));
+                                                ui.add(Label::new(prefix_job).wrap(false).truncate(true));
                                             }
                                         );
                                         if !self.prefix_suffix.is_empty() {
@@ -4167,9 +4454,17 @@ impl eframe::App for WeeChatApp {
                                         ui.spacing_mut().item_spacing.x = 0.0;
                                         ui.add_space(PREFIX_MESSAGE_GAP);
 
-                                        let msg_col_width = ui.available_width();
-                                        ui.vertical(|ui| {
+                                        let msg_col_width = if compact_row {
+                                            row_width
+                                        } else {
+                                            ui.available_width()
+                                        };
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(msg_col_width, 0.0),
+                                            egui::Layout::top_down(egui::Align::LEFT),
+                                            |ui| {
                                             ui.set_min_width(msg_col_width);
+                                            ui.set_max_width(msg_col_width);
                                             let message_previews = if let Some(reply) = &line.matrix_reply {
                                                 let reply_card = Frame::none()
                                                     .fill(card_bg)
@@ -4293,8 +4588,8 @@ impl eframe::App for WeeChatApp {
                                                     accent_color,
                                                 );
                                             }
-                                        }); // end vertical (message column)
-                                    }); // end horizontal (full message row)
+                                        }); // end message column
+                                    }); // end responsive message row
                                     }); // end highlight frame
                                     let plain_message = line.plain_message.clone();
                                     let plain_prefix = line.plain_prefix.clone();
