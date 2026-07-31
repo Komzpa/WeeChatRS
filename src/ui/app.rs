@@ -878,6 +878,38 @@ mod thread_tests {
     }
 }
 
+fn highlight_row_style(highlight: bool, accent: Color32) -> (Color32, Stroke) {
+    if highlight {
+        (
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 48),
+            Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 140),
+            ),
+        )
+    } else {
+        (Color32::TRANSPARENT, Stroke::NONE)
+    }
+}
+
+#[cfg(test)]
+mod highlight_row_tests {
+    use super::*;
+
+    #[test]
+    fn highlighted_rows_get_visible_accent_fill_and_border() {
+        let accent = Color32::from_rgb(72, 128, 220);
+        let (fill, stroke) = highlight_row_style(true, accent);
+        assert_eq!(fill, Color32::from_rgba_unmultiplied(72, 128, 220, 48));
+        assert_eq!(stroke.width, 1.0);
+        assert_eq!(stroke.color, Color32::from_rgba_unmultiplied(72, 128, 220, 140));
+
+        let (fill, stroke) = highlight_row_style(false, accent);
+        assert_eq!(fill, Color32::TRANSPARENT);
+        assert_eq!(stroke, Stroke::NONE);
+    }
+}
+
 /// Reorder `buffers` by moving the dragged item (and its whole server group when it is a server
 /// header) to just before `drop_before_id`, or to the end when `drop_before_id` is `None`.
 fn apply_drag_reorder(buffers: &mut Vec<Buffer>, drag_id: &str, drop_before_id: Option<&str>) {
@@ -4067,15 +4099,12 @@ impl eframe::App for WeeChatApp {
                                         marker_shown = true;
                                     }
 
-                                    let row_bg = if line.highlight {
-                                        let c = Color32::from(render_theme.ansi[3]);
-                                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 28)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    };
+                                    let (row_bg, row_stroke) =
+                                        highlight_row_style(line.highlight, accent_color);
                                     let mut row_hovered_url: Option<String> = None;
                                     let row_resp = Frame::none()
                                         .fill(row_bg)
+                                        .stroke(row_stroke)
                                         .rounding(Rounding::same(3.0))
                                         .show(ui, |ui| {
                                     ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
