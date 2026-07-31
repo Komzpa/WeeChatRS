@@ -36,6 +36,7 @@ pub struct Buffer {
     pub messages: VecDeque<Line>,
     pub nicks: Vec<Nick>,
     pub mention_candidates: Vec<MentionCandidate>,
+    pub matrix_member_profiles: Vec<MatrixMemberProfile>,
     pub activity: BufferActivity,
     pub unread_count: u32,
     pub last_read_id: Option<String>,
@@ -137,6 +138,7 @@ mod mention_highlight_tests {
                 display_name: "Darafei Praliaskouski".to_owned(),
                 user_id: "@komzpa:matrix.org".to_owned(),
             }],
+            matrix_member_profiles: Vec::new(),
             activity: BufferActivity::None,
             unread_count: 0,
             last_read_id: None,
@@ -193,6 +195,17 @@ pub struct MatrixMedia {
 pub struct MentionCandidate {
     pub display_name: String,
     pub user_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MatrixMemberProfile {
+    pub user_id: String,
+    pub display_name: String,
+    pub nick: String,
+    pub membership: String,
+    pub role: String,
+    pub power_level: Option<i64>,
+    pub avatar_mxc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
