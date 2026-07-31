@@ -2314,11 +2314,11 @@ impl WeeChatApp {
         });
     }
 
-    fn render_text_with_emoji(&mut self, ui: &mut egui::Ui, text: &str, format: &egui::TextFormat) {
+    fn render_text_with_emoji(&mut self, ui: &mut egui::Ui, text: &str, format: &egui::TextFormat, wrap: bool) {
         if !self.emoji_rendering {
             let mut job = LayoutJob::default();
             job.append(text, 0.0, format.clone());
-            ui.add(Label::new(job).wrap(true));
+            ui.add(Label::new(job).wrap(wrap));
             return;
         }
 
@@ -2328,7 +2328,7 @@ impl WeeChatApp {
                 crate::ui::emoji::TextSpan::Text(text) => {
                     let mut job = LayoutJob::default();
                     job.append(&text, 0.0, format.clone());
-                    ui.add(Label::new(job).wrap(true));
+                    ui.add(Label::new(job).wrap(wrap));
                 }
                 crate::ui::emoji::TextSpan::Emoji(emoji) => {
                     let url = crate::ui::emoji::emoji_to_twemoji_url(&emoji);
@@ -2358,7 +2358,7 @@ impl WeeChatApp {
                     } else {
                         let mut job = LayoutJob::default();
                         job.append(&emoji, 0.0, format.clone());
-                        ui.add(Label::new(job).wrap(true));
+                        ui.add(Label::new(job).wrap(wrap));
                     }
                 }
             }
@@ -2462,7 +2462,7 @@ impl WeeChatApp {
                         }
                     } else {
                         let format = section.style.to_format(font_id.clone(), render_theme);
-                        self.render_text_with_emoji(ui, &section.text, &format);
+                        self.render_text_with_emoji(ui, &section.text, &format, true);
                     }
                 }
             });
@@ -3872,6 +3872,7 @@ impl eframe::App for WeeChatApp {
                                                     ui,
                                                     &section.text,
                                                     &format,
+                                                    false,
                                                 );
                                             }
                                             ui.label(
@@ -4105,17 +4106,17 @@ impl eframe::App for WeeChatApp {
                                         }
                                     } else { text };
                                     let sections = ANSIParser::parse(&input);
-                                    let mut job = LayoutJob::default();
-                                    for s in sections {
-                                        let mut fmt = s.style.to_format(font_id.clone(), &render_theme);
-                                        if nick.away {
-                                            fmt.color = text_muted;
-                                            fmt.italics = true;
+                                    let label_res = ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        for s in sections {
+                                            let mut fmt = s.style.to_format(font_id.clone(), &render_theme);
+                                            if nick.away {
+                                                fmt.color = text_muted;
+                                                fmt.italics = true;
+                                            }
+                                            self.render_text_with_emoji(ui, &s.text, &fmt, false);
                                         }
-                                        job.append(&s.text, 0.0, fmt);
-                                    }
-
-                                    let label_res = ui.add(Label::new(job).truncate(true).sense(egui::Sense::click()));
+                                    }).response.interact(egui::Sense::click());
                                     label_res.context_menu(|ui| {
                                         if ui.button(format!("Query {}", nick.name)).clicked() {
                                             self.send_command(&format!("/query {}", nick.name));
@@ -4690,10 +4691,12 @@ impl eframe::App for WeeChatApp {
                                                 if continues_matrix_event {
                                                     ui.set_opacity(0.0);
                                                 }
-                                                let mut prefix_job = LayoutJob::default();
-                                                prefix_job.halign = egui::Align::RIGHT;
-                                                for s in prefix_sections { prefix_job.append(&s.text, 0.0, s.style.to_format(font_id.clone(), &render_theme)); }
-                                                ui.add(Label::new(prefix_job).wrap(false).truncate(true));
+                                                ui.spacing_mut().item_spacing.x = 0.0;
+                                                ui.add_space((col_width - measured_w).max(0.0));
+                                                for s in prefix_sections {
+                                                    let format = s.style.to_format(font_id.clone(), &render_theme);
+                                                    self.render_text_with_emoji(ui, &s.text, &format, false);
+                                                }
                                             }
                                         );
                                         if !self.prefix_suffix.is_empty() {
@@ -4824,7 +4827,8 @@ impl eframe::App for WeeChatApp {
                                                     } else {
                                                         accent_color
                                                     });
-                                                if ui.small_button(text).clicked() {
+                                                let button = ui.small_button(text);
+                                                if response_primary_clicked(ui, &button) {
                                                     pending_open_thread_buffer_id =
                                                         Some(thread_id.clone());
                                                 }
