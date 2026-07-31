@@ -77,6 +77,19 @@ fn selected_text(text: &str, start: usize, end: usize) -> String {
     text[start..end].to_owned()
 }
 
+fn contains_complete_mention(text: &str, label: &str) -> bool {
+    text.match_indices(label).any(|(start, matched)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + matched.len()..].chars().next();
+        let continues_identifier = |character: char| {
+            character.is_alphanumeric() || matches!(character, '_' | '-' | ':' | '.')
+        };
+        before.is_none_or(|character| {
+            !continues_identifier(character) && character != '@'
+        }) && after.is_none_or(|character| !continues_identifier(character))
+    })
+}
+
 fn replace_selection(text: &mut String, start: usize, end: usize, replacement: &str) -> usize {
     let start_byte = char_to_byte(text, start);
     let end_byte = char_to_byte(text, end);
@@ -466,7 +479,9 @@ impl WeeChatApp {
     }
 
     pub(crate) fn reconcile_selected_mentions(&mut self) {
-        self.selected_mentions.retain(|mention| self.input_text.contains(&mention.label));
+        self.selected_mentions.retain(|mention| {
+            contains_complete_mention(&self.input_text, &mention.label)
+        });
     }
 
     pub(crate) fn perform_completion(&mut self, ctx: &egui::Context, id: egui::Id) {
@@ -799,8 +814,8 @@ impl WeeChatApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_native_completion, matching_mentions, matrix_reply_command, mention_query,
-        replace_selection, selected_text,
+        apply_native_completion, contains_complete_mention, matching_mentions,
+        matrix_reply_command, mention_query, replace_selection, selected_text,
     };
     use crate::relay::models::MentionCandidate;
 
@@ -866,6 +881,15 @@ mod tests {
             matching_mentions(&candidates, "amazing"),
             vec![candidate("Grace Hopper", "@amazing:example.org")],
         );
+    }
+
+    #[test]
+    fn semantic_mentions_require_the_complete_accepted_label() {
+        assert!(contains_complete_mention("hi @Ada!", "@Ada"));
+        assert!(contains_complete_mention("(@Ada Lovelace)", "@Ada Lovelace"));
+        assert!(!contains_complete_mention("hi @Adam", "@Ada"));
+        assert!(!contains_complete_mention("hi @Ada_example", "@Ada"));
+        assert!(!contains_complete_mention("mail@Ada", "@Ada"));
     }
 
     #[test]

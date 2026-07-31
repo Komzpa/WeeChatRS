@@ -731,11 +731,11 @@ impl State {
         // represent (for example physical A -> Russian "ф").  Do not change
         // normal text entry, but desktop command shortcuts must remain tied to
         // their physical letter keys so Ctrl/Cmd+A/C/X/V/Z/Y keep working.
-        let shortcut_key = if self.egui_input.modifiers.command {
-            logical_key.or(physical_key)
-        } else {
-            logical_key
-        };
+        let shortcut_key = command_shortcut_key(
+            self.egui_input.modifiers,
+            logical_key,
+            physical_key,
+        );
 
         if let Some(logical_key) = shortcut_key {
             if pressed {
@@ -752,7 +752,11 @@ impl State {
                             self.egui_input.events.push(egui::Event::Paste(contents));
                         }
                     }
-                    return;
+                    // Also emit the key event below. Native applications may
+                    // own non-text clipboard formats (for example an image)
+                    // while TextEdit still needs the normalized Paste event
+                    // when text is present. Command-modified text is filtered
+                    // below, so this cannot insert a literal `v`.
                 }
             }
 
@@ -997,6 +1001,54 @@ fn is_printable_char(chr: char) -> bool {
         || '\u{100000}' <= chr && chr <= '\u{10fffd}';
 
     !is_in_private_use_area && !chr.is_ascii_control()
+}
+
+fn command_shortcut_key(
+    modifiers: egui::Modifiers,
+    logical_key: Option<egui::Key>,
+    physical_key: Option<egui::Key>,
+) -> Option<egui::Key> {
+    if modifiers.command {
+        logical_key.or(physical_key)
+    } else {
+        logical_key
+    }
+}
+
+#[cfg(test)]
+mod weechatrs_shortcut_tests {
+    use super::command_shortcut_key;
+
+    #[test]
+    fn command_letters_fall_back_to_physical_keys_on_non_latin_layouts() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        for key in [
+            egui::Key::A,
+            egui::Key::C,
+            egui::Key::X,
+            egui::Key::V,
+            egui::Key::Z,
+            egui::Key::Y,
+        ] {
+            assert_eq!(command_shortcut_key(modifiers, None, Some(key)), Some(key));
+        }
+    }
+
+    #[test]
+    fn ordinary_non_latin_typing_does_not_use_the_physical_letter() {
+        assert_eq!(
+            command_shortcut_key(
+                egui::Modifiers::default(),
+                None,
+                Some(egui::Key::A),
+            ),
+            None,
+        );
+    }
 }
 
 fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {

@@ -1,5 +1,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+// AI assistance disclosure for this integration branch: OpenAI Codex and
+// Anthropic Claude assisted with implementation and review; the contributor
+// remains responsible for understanding, testing, and maintaining the code.
+
 mod relay;
 mod ui;
 
@@ -24,7 +28,6 @@ async fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 768.0])
             .with_min_inner_size([400.0, 300.0])
-            .with_active(false)
             .with_transparent(true)
             .with_icon(icon),
         ..Default::default()
