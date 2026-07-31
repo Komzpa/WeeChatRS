@@ -230,11 +230,31 @@ fn inline_image_preview_size(
     original * scale
 }
 
+fn primary_click_hits_rect(
+    primary_clicked: bool,
+    interact_pos: Option<egui::Pos2>,
+    rect: egui::Rect,
+) -> bool {
+    primary_clicked && interact_pos.is_some_and(|pos| rect.contains(pos))
+}
+
+fn response_primary_clicked(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.clicked()
+        || ui.input(|input| {
+            primary_click_hits_rect(
+                input.pointer.primary_clicked(),
+                input.pointer.interact_pos(),
+                response.rect,
+            )
+        })
+}
+
 #[cfg(test)]
 mod inline_matrix_image_tests {
     use super::{
         inline_image_preview_size, is_matrix_media_status_line,
-        matrix_media_cache_path, quote_weechat_argument,
+        matrix_media_cache_path, primary_click_hits_rect,
+        quote_weechat_argument,
     };
     use egui::Vec2;
 
@@ -284,6 +304,26 @@ mod inline_matrix_image_tests {
             ),
             Vec2::new(1000.0, 440.0),
         );
+    }
+
+    #[test]
+    fn intercepted_primary_click_still_hits_child_control() {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 50.0));
+        assert!(primary_click_hits_rect(
+            true,
+            Some(egui::pos2(60.0, 35.0)),
+            rect
+        ));
+        assert!(!primary_click_hits_rect(
+            true,
+            Some(egui::pos2(120.0, 35.0)),
+            rect
+        ));
+        assert!(!primary_click_hits_rect(
+            false,
+            Some(egui::pos2(60.0, 35.0)),
+            rect
+        ));
     }
 
     #[test]
@@ -3176,17 +3216,14 @@ impl eframe::App for WeeChatApp {
                                                             row_hovered_url = Some(url.clone());
                                                         }
                                                         let url_for_click = url.clone();
-                                                        let link_rect = link_resp.rect;
-                                                        if ui.input(|i| {
-                                                            i.pointer.primary_clicked()
-                                                            && i.pointer.interact_pos().map_or(false, |p| link_rect.contains(p))
-                                                        }) {
+                                                        if response_primary_clicked(ui, &link_resp) {
                                                             ui.ctx().output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(url_for_click)));
                                                         }
                                                         if self.show_inline_images && Self::is_image_url(url) && is_safe_public_url(url) {
                                                             let is_expanded = self.image_expanded.contains(url);
                                                             let btn = if is_expanded { "🖼" } else { "🖼 preview" };
-                                                            if ui.small_button(btn).clicked() {
+                                                            let button = ui.small_button(btn);
+                                                            if response_primary_clicked(ui, &button) {
                                                                 if is_expanded {
                                                                     self.image_expanded.remove(url);
                                                                 } else {
@@ -3209,7 +3246,8 @@ impl eframe::App for WeeChatApp {
                                                         if self.show_link_previews && !Self::is_image_url(url) && is_safe_public_url(url) {
                                                             let is_expanded = self.preview_expanded.contains(url);
                                                             let btn = if is_expanded { "🔗" } else { "🔗 preview" };
-                                                            if ui.small_button(btn).clicked() {
+                                                            let button = ui.small_button(btn);
+                                                            if response_primary_clicked(ui, &button) {
                                                                 if is_expanded {
                                                                     self.preview_expanded.remove(url);
                                                                 } else {
