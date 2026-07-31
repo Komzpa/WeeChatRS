@@ -2,8 +2,8 @@ use crate::relay::backend::BackendEvent;
 use crate::relay::models::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{
-    history_snapshot_is_exhausted, CommandCompletionState, SavedReadMarker, WeeChatApp,
-    LOAD_MORE_LINES, MAX_STORED_LINES,
+    history_snapshot_is_exhausted, is_restorable_chat_buffer, preferred_chat_buffer_id,
+    CommandCompletionState, SavedReadMarker, WeeChatApp, LOAD_MORE_LINES, MAX_STORED_LINES,
 };
 use chrono::{Utc, DateTime, Local};
 use serde_json::Value;
@@ -224,8 +224,17 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                     self.rebuild_buffer_idx();
                 }
-                // Auto-select when nothing is currently selected (e.g. first buffer on connect).
-                if self.selected_buffer_id.is_none() {
+                // Incremental backends can announce a service buffer first. If a
+                // remembered chat belongs to this connection, wait for that exact
+                // chat instead of replacing the user's restart destination.
+                let should_select = self.buffer_by_id(&full_id)
+                    .is_some_and(|buffer| {
+                        is_restorable_chat_buffer(buffer)
+                            && (self.last_chat_buffer_name.is_none()
+                                || self.last_chat_buffer_name.as_deref()
+                                    == Some(buffer.full_name.as_str()))
+                    });
+                if self.selected_buffer_id.is_none() && should_select {
                     self.select_buffer(full_id.clone());
                 }
                 // Resolve a pending /join or /query switch
@@ -264,6 +273,14 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                 }
                 self.rebuild_buffer_idx();
+                if self.selected_buffer_id.is_none() {
+                    if let Some(id) = preferred_chat_buffer_id(
+                        &self.buffers,
+                        self.last_chat_buffer_name.as_deref(),
+                    ) {
+                        self.select_buffer(id);
+                    }
+                }
             }
             BackendEvent::LineAdded { buffer_id, line } => {
                 let full_id = format!("{}/{}", conn_prefix, buffer_id);
@@ -1132,11 +1149,18 @@ impl WeeChatApp {
             }
 
             if self.selected_buffer_id.is_none() {
-                if let Some(first) =
-                    self.buffers.iter().find(|buffer| !buffer.is_matrix_thread())
-                {
-                    let id = first.id.clone();
-                    self.select_buffer(id);
+                let preferred = self.last_chat_buffer_name.as_deref()
+                    .and_then(|name| self.buffers.iter().find(|buffer| {
+                        is_restorable_chat_buffer(buffer) && buffer.full_name == name
+                    }))
+                    .or_else(|| self.last_chat_buffer_name.is_none().then(|| {
+                        self.buffers.iter().find(|buffer| {
+                            buffer.id.starts_with(&format!("{conn_prefix}/"))
+                                && is_restorable_chat_buffer(buffer)
+                        })
+                    }).flatten());
+                if let Some(buffer) = preferred {
+                    self.select_buffer(buffer.id.clone());
                 }
             }
 
