@@ -90,14 +90,19 @@ fn direct_download_url(file_code: &str, filename: &str) -> Result<String, String
 
 /// Read a desktop clipboard image and encode it as PNG.
 ///
-/// `Ok(None)` means that the clipboard contains text or another non-image
-/// format, allowing ordinary Ctrl-V text paste to continue silently.
+/// `Ok(None)` means that the clipboard contains non-empty text, allowing the
+/// ordinary text paste event to continue without also uploading an image.
 pub fn clipboard_png() -> Result<Option<Vec<u8>>, String> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|e| format!("Clipboard unavailable: {}", e))?;
     let image = match clipboard.get_image() {
         Ok(image) => image,
-        Err(_) => return Ok(None),
+        Err(image_error) => {
+            return classify_non_image_clipboard(
+                clipboard.get_text().map_err(|error| error.to_string()),
+                &image_error.to_string(),
+            );
+        }
     };
     let rgba = image::RgbaImage::from_raw(
         image.width as u32,
@@ -110,6 +115,19 @@ pub fn clipboard_png() -> Result<Option<Vec<u8>>, String> {
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|e| format!("Cannot encode clipboard image: {}", e))?;
     Ok(Some(png))
+}
+
+fn classify_non_image_clipboard(
+    text: Result<String, String>,
+    image_error: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    match text {
+        Ok(text) if !text.is_empty() => Ok(None),
+        Ok(_) => Err("Cannot paste: the clipboard is empty".to_owned()),
+        Err(_) => Err(format!(
+            "Cannot paste: the clipboard contains neither readable text nor an image ({image_error})"
+        )),
+    }
 }
 
 pub(crate) fn mime_for(filename: &str) -> &'static str {
@@ -150,5 +168,26 @@ mod tests {
         assert_eq!(mime_for("photo.PNG"), "image/png");
         assert_eq!(mime_for("photo.jpeg"), "image/jpeg");
         assert_eq!(mime_for("archive.unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn non_image_text_clipboard_stays_silent_for_native_text_paste() {
+        assert_eq!(
+            classify_non_image_clipboard(Ok("ordinary text".to_owned()), "not an image"),
+            Ok(None),
+        );
+    }
+
+    #[test]
+    fn unsupported_or_empty_clipboard_has_visible_reason() {
+        assert_eq!(
+            classify_non_image_clipboard(Ok(String::new()), "not an image"),
+            Err("Cannot paste: the clipboard is empty".to_owned()),
+        );
+        let error =
+            classify_non_image_clipboard(Err("text unavailable".to_owned()), "image unavailable")
+                .unwrap_err();
+        assert!(error.contains("neither readable text nor an image"));
+        assert!(error.contains("image unavailable"));
     }
 }
