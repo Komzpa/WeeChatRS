@@ -140,10 +140,8 @@ pub const INITIAL_LINES: usize = 300;
 const IMAGE_CACHE_MAX: usize = 200;
 const PREVIEW_CACHE_MAX: usize = 200;
 const PREFIX_COL_WIDTHS_MAX: usize = 500;
-const MAX_INLINE_IMAGE_WIDTH: f32 = 1200.0;
-const MAX_INLINE_IMAGE_HEIGHT: f32 = 800.0;
-const MAX_INLINE_IMAGE_UPSCALE: f32 = 2.0;
-const INLINE_IMAGE_VIEWPORT_FRACTION: f32 = 0.78;
+const MAX_INLINE_IMAGE_WIDTH: f32 = 500.0;
+const MAX_INLINE_IMAGE_HEIGHT: f32 = 360.0;
 
 fn matrix_media_cache_path(mxc_uri: &str) -> PathBuf {
     let cache_root = std::env::var_os("XDG_CACHE_HOME")
@@ -207,10 +205,8 @@ async fn wait_for_matrix_media(path: &Path) -> Result<Vec<u8>, String> {
 
 /// Fit an inline preview into the chat column.
 ///
-/// Matrix servers and clients commonly expose conservative thumbnails even
-/// when the attachment is a screenshot. A bounded 2x upscale keeps those
-/// previews readable without allowing tiny assets or large portraits to take
-/// over the timeline.
+/// Keep the source dimensions for small images and bound larger images so
+/// previews cannot take over either the room timeline or the thread panel.
 fn inline_image_preview_size(
     original: Vec2,
     available_width: f32,
@@ -222,11 +218,10 @@ fn inline_image_preview_size(
 
     let max_width =
         (available_width - 32.0).clamp(1.0, MAX_INLINE_IMAGE_WIDTH);
-    let max_height = (viewport_height * INLINE_IMAGE_VIEWPORT_FRACTION)
-        .clamp(240.0, MAX_INLINE_IMAGE_HEIGHT);
+    let max_height = viewport_height.min(MAX_INLINE_IMAGE_HEIGHT);
     let scale = (max_width / original.x)
         .min(max_height / original.y)
-        .min(MAX_INLINE_IMAGE_UPSCALE);
+        .min(1.0);
     original * scale
 }
 
@@ -236,6 +231,19 @@ fn primary_click_hits_rect(
     rect: egui::Rect,
 ) -> bool {
     primary_clicked && interact_pos.is_some_and(|pos| rect.contains(pos))
+}
+
+/// A thread composer must never silently fall back to the room buffer.
+fn clipboard_upload_target(
+    thread_composer_focused: bool,
+    thread_buffer_id: Option<&str>,
+    room_buffer_id: Option<&str>,
+) -> Option<String> {
+    if thread_composer_focused {
+        thread_buffer_id.map(ToOwned::to_owned)
+    } else {
+        room_buffer_id.map(ToOwned::to_owned)
+    }
 }
 
 fn response_primary_clicked(ui: &egui::Ui, response: &egui::Response) -> bool {
@@ -266,7 +274,7 @@ mod inline_matrix_image_tests {
                 1200.0,
                 900.0,
             ),
-            Vec2::new(351.0, 702.0),
+            Vec2::new(180.0, 360.0),
         );
     }
 
@@ -278,31 +286,31 @@ mod inline_matrix_image_tests {
                 1200.0,
                 900.0,
             ),
-            Vec2::new(1168.0, 584.0),
+            Vec2::new(500.0, 250.0),
         );
     }
 
     #[test]
-    fn small_preview_is_upscaled_but_stays_bounded() {
+    fn small_preview_is_not_upscaled() {
         assert_eq!(
             inline_image_preview_size(
                 Vec2::new(200.0, 100.0),
                 1200.0,
                 900.0,
             ),
-            Vec2::new(400.0, 200.0),
+            Vec2::new(200.0, 100.0),
         );
     }
 
     #[test]
-    fn screenshot_thumbnail_becomes_readable() {
+    fn image_at_the_width_cap_keeps_its_source_size() {
         assert_eq!(
             inline_image_preview_size(
                 Vec2::new(500.0, 220.0),
                 1600.0,
                 1000.0,
             ),
-            Vec2::new(1000.0, 440.0),
+            Vec2::new(500.0, 220.0),
         );
     }
 
@@ -379,10 +387,23 @@ struct ThreadReplyContext {
 }
 
 #[derive(Clone)]
+struct ThreadMessageContent {
+    message: String,
+    media: Option<MatrixMedia>,
+}
+
+struct MessagePreviewTargets {
+    image_urls: Vec<String>,
+    preview_urls: Vec<String>,
+    matrix_image_key: Option<String>,
+    hovered_url: Option<String>,
+}
+
+#[derive(Clone)]
 struct ThreadMessageBlock {
     timestamp: chrono::DateTime<chrono::Utc>,
     prefix: String,
-    messages: Vec<String>,
+    content: Vec<ThreadMessageContent>,
     matrix_event_id: Option<String>,
     reply: Option<ThreadReplyContext>,
 }
@@ -412,7 +433,10 @@ fn append_thread_line(block: &mut ThreadMessageBlock, line: &Line) {
                 .quotes
                 .push(quote);
         }
-        None => block.messages.push(line.plain_message.clone()),
+        None => block.content.push(ThreadMessageContent {
+            message: line.message.clone(),
+            media: line.matrix_media.clone(),
+        }),
     }
 }
 
@@ -434,8 +458,8 @@ fn group_thread_lines(lines: &VecDeque<Line>) -> Vec<ThreadMessageBlock> {
         }
         let mut block = ThreadMessageBlock {
             timestamp: line.timestamp,
-            prefix: line.plain_prefix.clone(),
-            messages: Vec::new(),
+            prefix: line.prefix.clone(),
+            content: Vec::new(),
             matrix_event_id: line.matrix_event_id.clone(),
             reply: None,
         };
@@ -443,6 +467,17 @@ fn group_thread_lines(lines: &VecDeque<Line>) -> Vec<ThreadMessageBlock> {
         blocks.push(block);
     }
     blocks
+}
+
+/// Keep the last complete thread visible while a buffer refresh is in flight.
+fn stable_thread_snapshot(current: Option<&Buffer>, previous: Option<&Buffer>) -> Option<Buffer> {
+    let mut snapshot = current.cloned().or_else(|| previous.cloned())?;
+    if snapshot.messages.is_empty() {
+        if let Some(previous) = previous.filter(|buffer| !buffer.messages.is_empty()) {
+            snapshot.messages = previous.messages.clone();
+        }
+    }
+    Some(snapshot)
 }
 
 #[cfg(test)]
@@ -473,7 +508,14 @@ mod thread_tests {
         ]);
         let blocks = group_thread_lines(&lines);
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[1].messages, ["first line", "", "last line"]);
+        assert_eq!(
+            blocks[1]
+                .content
+                .iter()
+                .map(|content| content.message.as_str())
+                .collect::<Vec<_>>(),
+            ["first line", "", "last line"]
+        );
     }
 
     #[test]
@@ -506,10 +548,107 @@ mod thread_tests {
             group_thread_lines(&VecDeque::from([header, quote, body]));
 
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].messages, ["new message"]);
+        assert_eq!(
+            blocks[0]
+                .content
+                .iter()
+                .map(|content| content.message.as_str())
+                .collect::<Vec<_>>(),
+            ["new message"]
+        );
         let reply = blocks[0].reply.as_ref().expect("reply context");
         assert_eq!(reply.sender.as_deref(), Some("Alice"));
         assert_eq!(reply.quotes, ["original message"]);
+    }
+
+    #[test]
+    fn grouping_preserves_matrix_media_with_its_message() {
+        let mut media_line = line("1", "alice", "image", "$image:example.org");
+        media_line.matrix_media = Some(MatrixMedia {
+            mxc_uri: "mxc://example.org/screenshot".to_owned(),
+            name: "screenshot.png".to_owned(),
+            kind: "image".to_owned(),
+        });
+
+        let blocks = group_thread_lines(&VecDeque::from([media_line]));
+
+        let media = blocks[0].content[0]
+            .media
+            .as_ref()
+            .expect("grouped Matrix media");
+        assert_eq!(media.mxc_uri, "mxc://example.org/screenshot");
+        assert_eq!(media.name, "screenshot.png");
+        assert_eq!(media.kind, "image");
+    }
+
+    #[test]
+    fn clipboard_target_never_falls_back_from_thread_to_room() {
+        assert_eq!(
+            clipboard_upload_target(true, Some("thread"), Some("room")),
+            Some("thread".to_owned())
+        );
+        assert_eq!(clipboard_upload_target(true, None, Some("room")), None);
+        assert_eq!(
+            clipboard_upload_target(false, None, Some("room")),
+            Some("room".to_owned())
+        );
+    }
+
+    #[test]
+    fn captured_clipboard_target_survives_room_change() {
+        let upload_target = clipboard_upload_target(true, Some("thread"), Some("room-a"));
+        let current_room_after_upload = "room-b";
+
+        assert_eq!(current_room_after_upload, "room-b");
+        assert_eq!(upload_target, Some("thread".to_owned()));
+    }
+
+    #[test]
+    fn transient_empty_refresh_keeps_visible_thread_messages() {
+        let mut previous = thread_buffer("thread");
+        previous
+            .messages
+            .push_back(line("1", "alice", "existing message", "$event:example.org"));
+        let current = thread_buffer("thread");
+
+        let snapshot = stable_thread_snapshot(Some(&current), Some(&previous))
+            .expect("stable thread snapshot");
+
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].message, "existing message");
+        assert_eq!(
+            stable_thread_snapshot(None, Some(&previous))
+                .expect("missing refresh keeps previous snapshot")
+                .messages
+                .len(),
+            1
+        );
+    }
+
+    fn thread_buffer(id: &str) -> Buffer {
+        Buffer {
+            id: id.to_owned(),
+            number: 1,
+            name: "thread".to_owned(),
+            full_name: "matrix.thread".to_owned(),
+            plugin: "matrix".to_owned(),
+            kind: "channel".to_owned(),
+            server: "matrix".to_owned(),
+            messages: VecDeque::new(),
+            nicks: Vec::new(),
+            activity: BufferActivity::None,
+            unread_count: 0,
+            last_read_id: None,
+            last_markread_ts: None,
+            topic: String::new(),
+            modes: String::new(),
+            hidden: true,
+            muted: false,
+            has_nicklist: false,
+            matrix_room_id: Some("!room:example.org".to_owned()),
+            matrix_thread_root: Some("$root:example.org".to_owned()),
+            visit_start_marker_id: None,
+        }
     }
 }
 
@@ -863,6 +1002,7 @@ pub struct WeeChatApp {
     pub(crate) focus_input: bool,
     pub(crate) reply_target: Option<ReplyTarget>,
     pub(crate) open_thread_buffer_id: Option<String>,
+    pub(crate) open_thread_snapshot: Option<Buffer>,
     pub(crate) thread_input_text: String,
     pub(crate) focus_thread_input: bool,
     pub(crate) thread_panel_width: f32,
@@ -1072,6 +1212,7 @@ impl WeeChatApp {
             focus_input: false,
             reply_target: None,
             open_thread_buffer_id: None,
+            open_thread_snapshot: None,
             thread_input_text: String::new(),
             focus_thread_input: false,
             thread_panel_width: THREAD_PANEL_DEFAULT_WIDTH,
@@ -1206,6 +1347,28 @@ impl WeeChatApp {
         None
     }
 
+    fn upload_clipboard_image_to(&mut self, buffer_id: String) {
+        if self.file_share_uploading {
+            return;
+        }
+        self.file_share_uploading = true;
+        self.file_share_error = None;
+        let duration = self.file_share_duration.clone();
+        let tx = self.file_share_tx.clone();
+        tokio::spawn(async move {
+            let clipboard = tokio::task::spawn_blocking(crate::ui::fileshare::clipboard_png).await;
+            let result = match clipboard {
+                Ok(Ok(Some(png))) => {
+                    crate::ui::fileshare::upload_bytes("clipboard.png", png, &duration).await
+                }
+                Ok(Ok(None)) => Err(String::new()),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(format!("Clipboard task failed: {error}")),
+            };
+            let _ = tx.send(result.map(|url| (buffer_id, url)));
+        });
+    }
+
     fn ensure_matrix_media_loading(
         &mut self,
         buffer_id: &str,
@@ -1259,6 +1422,329 @@ impl WeeChatApp {
         });
     }
 
+    fn ensure_image_loading(&mut self, url: &str) {
+        self.image_expanded.insert(url.to_owned());
+        if self.image_cache.contains_key(url) || !is_safe_public_url(url) {
+            return;
+        }
+        self.image_cache.insert(url.to_owned(), ImageState::Loading);
+        let tx = self.image_tx.clone();
+        let url = url.to_owned();
+        tokio::spawn(async move {
+            let result = async {
+                let bytes = reqwest::get(&url).await?.bytes().await?;
+                Ok::<Vec<u8>, reqwest::Error>(bytes.to_vec())
+            }
+            .await;
+            let _ = tx.send((url, result.map_err(|error| error.to_string())));
+        });
+    }
+
+    fn ensure_link_preview_loading(&mut self, url: &str) {
+        if self.preview_cache.contains_key(url) || !is_safe_public_url(url) {
+            return;
+        }
+        self.preview_cache
+            .insert(url.to_owned(), PreviewState::Loading);
+        let tx = self.preview_tx.clone();
+        let url = url.to_owned();
+        tokio::spawn(async move {
+            let result = fetch_link_preview(url.clone()).await;
+            let _ = tx.send((url, result));
+        });
+    }
+
+    fn render_text_with_emoji(&mut self, ui: &mut egui::Ui, text: &str, format: &egui::TextFormat) {
+        if !self.emoji_rendering {
+            let mut job = LayoutJob::default();
+            job.append(text, 0.0, format.clone());
+            ui.add(Label::new(job).wrap(true));
+            return;
+        }
+
+        let emoji_size = format.font_id.size + 2.0;
+        for span in crate::ui::emoji::split_emoji(text) {
+            match span {
+                crate::ui::emoji::TextSpan::Text(text) => {
+                    let mut job = LayoutJob::default();
+                    job.append(&text, 0.0, format.clone());
+                    ui.add(Label::new(job).wrap(true));
+                }
+                crate::ui::emoji::TextSpan::Emoji(emoji) => {
+                    let url = crate::ui::emoji::emoji_to_twemoji_url(&emoji);
+                    if !self.image_cache.contains_key(&url) {
+                        self.image_cache.insert(url.clone(), ImageState::Loading);
+                        let tx = self.image_tx.clone();
+                        let url_owned = url.clone();
+                        tokio::spawn(async move {
+                            let result = async {
+                                let bytes = reqwest::get(&url_owned)
+                                    .await
+                                    .map_err(|error| error.to_string())?
+                                    .bytes()
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                Ok(bytes.to_vec())
+                            }
+                            .await;
+                            let _ = tx.send((url_owned, result));
+                        });
+                    }
+                    if let Some(ImageState::Loaded(texture)) = self.image_cache.get(&url) {
+                        ui.add(egui::Image::new((
+                            texture.id(),
+                            egui::Vec2::splat(emoji_size),
+                        )));
+                    } else {
+                        let mut job = LayoutJob::default();
+                        job.append(&emoji, 0.0, format.clone());
+                        ui.add(Label::new(job).wrap(true));
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_message_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        message: &str,
+        matrix_media: Option<&MatrixMedia>,
+        matrix_buffer_id: Option<&str>,
+        font_id: &FontId,
+        render_theme: &AppTheme,
+    ) -> MessagePreviewTargets {
+        let matrix_image = matrix_media.filter(|media| media.kind == "image");
+        if self.show_inline_images {
+            if let (Some(buffer_id), Some(media)) = (matrix_buffer_id, matrix_image) {
+                if !self.image_cache.contains_key(&media.mxc_uri) {
+                    self.ensure_matrix_media_loading(buffer_id, media);
+                }
+            }
+        }
+
+        let rendered_message = if self.show_inline_images {
+            matrix_image
+                .map(|media| format!("📎 {}", media.name))
+                .unwrap_or_else(|| message.to_owned())
+        } else {
+            message.to_owned()
+        };
+        let sections = ANSIParser::parse(&rendered_message);
+        let urls: Vec<String> = sections
+            .iter()
+            .filter_map(|section| section.url.clone())
+            .filter(|url| !Self::is_twemoji_url(url) && is_safe_public_url(url))
+            .collect();
+        let image_urls = if self.show_inline_images {
+            urls.iter()
+                .filter(|url| Self::is_image_url(url))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for url in &image_urls {
+            if !self.image_cache.contains_key(url) {
+                self.ensure_image_loading(url);
+            }
+        }
+        let preview_urls = if self.show_link_previews {
+            urls.iter()
+                .filter(|url| !Self::is_image_url(url))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut hovered_url = None;
+
+        if !rendered_message.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for section in &sections {
+                    if let Some(url) = &section.url {
+                        let link =
+                            ui.link(egui::RichText::new(&section.text).font(font_id.clone()));
+                        if link.hovered() {
+                            hovered_url = Some(url.clone());
+                        }
+                        if response_primary_clicked(ui, &link) {
+                            ui.ctx().output_mut(|output| {
+                                output.open_url = Some(egui::OpenUrl::new_tab(url.clone()));
+                            });
+                        }
+                        if self.show_inline_images && Self::is_image_url(url) {
+                            let expanded = self.image_expanded.contains(url);
+                            let button =
+                                ui.small_button(if expanded { "🖼" } else { "🖼 preview" });
+                            if response_primary_clicked(ui, &button) {
+                                if expanded {
+                                    self.image_expanded.remove(url);
+                                } else {
+                                    self.ensure_image_loading(url);
+                                }
+                            }
+                        }
+                        if self.show_link_previews && !Self::is_image_url(url) {
+                            let expanded = self.preview_expanded.contains(url);
+                            let button =
+                                ui.small_button(if expanded { "🔗" } else { "🔗 preview" });
+                            if response_primary_clicked(ui, &button) {
+                                if expanded {
+                                    self.preview_expanded.remove(url);
+                                } else {
+                                    self.preview_expanded.insert(url.clone());
+                                    self.ensure_link_preview_loading(url);
+                                }
+                            }
+                        }
+                    } else {
+                        let format = section.style.to_format(font_id.clone(), render_theme);
+                        self.render_text_with_emoji(ui, &section.text, &format);
+                    }
+                }
+            });
+        }
+
+        MessagePreviewTargets {
+            image_urls,
+            preview_urls,
+            matrix_image_key: matrix_image.map(|media| media.mxc_uri.clone()),
+            hovered_url,
+        }
+    }
+
+    fn render_image_preview(&self, ui: &mut egui::Ui, cache_key: &str, text_muted: Color32) {
+        ui.add_space(4.0);
+        match self.image_cache.get(cache_key) {
+            Some(ImageState::Loaded(texture)) => {
+                let size = inline_image_preview_size(
+                    texture.size_vec2(),
+                    ui.available_width(),
+                    ui.clip_rect().height(),
+                );
+                ui.add(egui::Image::new((texture.id(), size)).rounding(4.0));
+            }
+            Some(ImageState::Loading) | None => {
+                ui.label(
+                    egui::RichText::new("Loading image…")
+                        .color(text_muted)
+                        .italics()
+                        .small(),
+                );
+            }
+            Some(ImageState::Failed) => {
+                ui.label(
+                    egui::RichText::new("Failed to load image")
+                        .color(Color32::from_rgb(220, 80, 80))
+                        .small(),
+                );
+            }
+        }
+        ui.add_space(4.0);
+    }
+
+    fn render_message_previews(
+        &self,
+        ui: &mut egui::Ui,
+        previews: &MessagePreviewTargets,
+        text_secondary: Color32,
+        text_muted: Color32,
+        card_bg: Color32,
+        border_color: Color32,
+        accent_color: Color32,
+    ) {
+        if self.show_inline_images {
+            for url in &previews.image_urls {
+                if self.image_expanded.contains(url) {
+                    self.render_image_preview(ui, url, text_muted);
+                }
+            }
+            if let Some(cache_key) = &previews.matrix_image_key {
+                self.render_image_preview(ui, cache_key, text_muted);
+            }
+        }
+        if self.show_link_previews {
+            for url in &previews.preview_urls {
+                if !self.preview_expanded.contains(url) {
+                    continue;
+                }
+                ui.add_space(4.0);
+                match self.preview_cache.get(url) {
+                    Some(PreviewState::Loading) | None => {
+                        ui.label(
+                            egui::RichText::new("Loading preview…")
+                                .color(text_muted)
+                                .italics()
+                                .small(),
+                        );
+                    }
+                    Some(PreviewState::Failed) => {
+                        ui.label(
+                            egui::RichText::new("No preview available")
+                                .color(text_muted)
+                                .small(),
+                        );
+                    }
+                    Some(PreviewState::Loaded(preview)) => {
+                        let card = Frame::none()
+                            .fill(card_bg)
+                            .rounding(Rounding::same(6.0))
+                            .stroke(Stroke::new(1.0, border_color))
+                            .inner_margin(Margin {
+                                left: 14.0,
+                                right: 12.0,
+                                top: 8.0,
+                                bottom: 8.0,
+                            })
+                            .show(ui, |ui| {
+                                ui.set_max_width(ui.available_width().min(520.0));
+                                if let Some(site) = &preview.site_name {
+                                    ui.label(egui::RichText::new(site).small().color(text_muted));
+                                }
+                                if let Some(title) = &preview.title {
+                                    ui.label(egui::RichText::new(title).strong());
+                                }
+                                if let Some(description) = &preview.description {
+                                    let mut chars = description.chars();
+                                    let mut text: String = chars.by_ref().take(240).collect();
+                                    if chars.next().is_some() {
+                                        text.push('…');
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(text).small().color(text_secondary),
+                                    );
+                                }
+                                if let Some(image_url) = &preview.image_url {
+                                    if let Some(ImageState::Loaded(texture)) =
+                                        self.image_cache.get(image_url)
+                                    {
+                                        let size = inline_image_preview_size(
+                                            texture.size_vec2(),
+                                            ui.available_width(),
+                                            ui.clip_rect().height(),
+                                        );
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            egui::Image::new((texture.id(), size)).rounding(4.0),
+                                        );
+                                    }
+                                }
+                            });
+                        let bar = egui::Rect::from_min_max(
+                            card.response.rect.min,
+                            egui::pos2(card.response.rect.min.x + 3.0, card.response.rect.max.y),
+                        );
+                        ui.painter()
+                            .rect_filled(bar, Rounding::same(3.0), accent_color);
+                    }
+                }
+                ui.add_space(4.0);
+            }
+        }
+    }
+
     pub(crate) fn select_buffer(&mut self, id: String) {
         if self
             .buffer_by_id(&id)
@@ -1296,22 +1782,37 @@ impl WeeChatApp {
     }
 
     pub(crate) fn open_thread(&mut self, buffer_id: String) {
-        if !self
+        let Some(thread) = self
             .buffer_by_id(&buffer_id)
-            .is_some_and(|buffer| buffer.is_matrix_thread())
-        {
+            .filter(|buffer| buffer.is_matrix_thread())
+            .cloned()
+        else {
             return;
+        };
+        let needs_lines = thread.messages.is_empty();
+        if self.open_thread_buffer_id.as_deref() != Some(buffer_id.as_str()) {
+            self.thread_input_text.clear();
         }
         self.open_thread_buffer_id = Some(buffer_id.clone());
-        self.focus_thread_input = true;
+        self.open_thread_snapshot = Some(thread);
+        self.focus_thread_input = false;
         if let Some(buffer) = self.buffer_by_id_mut(&buffer_id) {
             buffer.activity = BufferActivity::None;
             buffer.unread_count = 0;
         }
         if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
-            client.fetch_lines(&raw_id, INITIAL_LINES);
+            if needs_lines {
+                client.fetch_lines(&raw_id, INITIAL_LINES);
+            }
             client.mark_read(&raw_id);
         }
+    }
+
+    fn close_thread(&mut self) {
+        self.open_thread_buffer_id = None;
+        self.open_thread_snapshot = None;
+        self.thread_input_text.clear();
+        self.focus_thread_input = false;
     }
 
     pub(crate) fn log_conn_for(&mut self, conn_prefix: &str, msg: impl Into<String>) {
@@ -2264,21 +2765,25 @@ impl eframe::App for WeeChatApp {
         let any_connected = self.is_any_connected();
 
         let current_buf_has_nicklist = current_buf.map(|b| b.has_nicklist).unwrap_or(false);
-        let open_thread = self
-            .open_thread_buffer_id
+        let thread_room_changed = self
+            .open_thread_snapshot
             .as_ref()
-            .and_then(|thread_id| {
-                self.buffer_by_id(thread_id)
-                    .filter(|buffer| {
-                        buffer.is_matrix_thread()
-                            && buffer.matrix_room_id == current_matrix_room_id
-                    })
-                    .cloned()
-            });
-        if self.open_thread_buffer_id.is_some() && open_thread.is_none() {
-            self.open_thread_buffer_id = None;
-            self.thread_input_text.clear();
+            .is_some_and(|thread| thread.matrix_room_id != current_matrix_room_id);
+        if thread_room_changed {
+            self.close_thread();
         }
+        if let Some(thread_id) = self.open_thread_buffer_id.as_deref() {
+            let current_thread = self
+                .buffer_by_id(thread_id)
+                .filter(|buffer| {
+                    buffer.is_matrix_thread()
+                        && buffer.matrix_room_id == current_matrix_room_id
+                })
+                .cloned();
+            self.open_thread_snapshot =
+                stable_thread_snapshot(current_thread.as_ref(), self.open_thread_snapshot.as_ref());
+        }
+        let open_thread = self.open_thread_snapshot.clone();
 
         if let Some(thread) = open_thread {
             let thread_messages = group_thread_lines(&thread.messages);
@@ -2287,9 +2792,12 @@ impl eframe::App for WeeChatApp {
                 .unwrap_or_else(|| "Matrix".to_owned());
             let max_thread_width =
                 (ctx.available_rect().width() * 0.48).max(THREAD_PANEL_MIN_WIDTH);
+            let thread_width = self
+                .thread_panel_width
+                .clamp(THREAD_PANEL_MIN_WIDTH, max_thread_width);
             let panel = egui::SidePanel::right("thread_panel")
                 .resizable(true)
-                .default_width(self.thread_panel_width)
+                .default_width(thread_width)
                 .min_width(THREAD_PANEL_MIN_WIDTH)
                 .max_width(max_thread_width)
                 .frame(
@@ -2320,8 +2828,7 @@ impl eframe::App for WeeChatApp {
                                     .on_hover_text("Close thread")
                                     .clicked()
                                 {
-                                    self.open_thread_buffer_id = None;
-                                    self.thread_input_text.clear();
+                                    self.close_thread();
                                 }
                             },
                         );
@@ -2340,9 +2847,8 @@ impl eframe::App for WeeChatApp {
                             if thread_messages.is_empty() {
                                 ui.vertical_centered(|ui| {
                                     ui.add_space(28.0);
-                                    ui.spinner();
                                     ui.label(
-                                        egui::RichText::new("Loading thread…")
+                                        egui::RichText::new("No thread messages yet")
                                             .color(text_muted),
                                     );
                                 });
@@ -2367,11 +2873,16 @@ impl eframe::App for WeeChatApp {
                                             ui.add_space(3.0);
                                         }
                                         ui.horizontal_wrapped(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(&block.prefix)
-                                                    .strong()
-                                                    .color(accent_color),
-                                            );
+                                            for section in ANSIParser::parse(&block.prefix) {
+                                                let format = section
+                                                    .style
+                                                    .to_format(font_id.clone(), &render_theme);
+                                                self.render_text_with_emoji(
+                                                    ui,
+                                                    &section.text,
+                                                    &format,
+                                                );
+                                            }
                                             ui.label(
                                                 egui::RichText::new(
                                                     block.timestamp
@@ -2461,15 +2972,28 @@ impl eframe::App for WeeChatApp {
                                             );
                                             ui.add_space(4.0);
                                         }
-                                        for message in &block.messages {
-                                            if message.is_empty() {
+                                        for content in &block.content {
+                                            if content.message.is_empty() && content.media.is_none() {
                                                 ui.add_space(4.0);
-                                            } else {
-                                                ui.label(
-                                                    egui::RichText::new(message)
-                                                        .color(text_secondary),
-                                                );
+                                                continue;
                                             }
+                                            let previews = self.render_message_content(
+                                                ui,
+                                                &content.message,
+                                                content.media.as_ref(),
+                                                Some(&thread.id),
+                                                &font_id,
+                                                &render_theme,
+                                            );
+                                            self.render_message_previews(
+                                                ui,
+                                                &previews,
+                                                text_secondary,
+                                                text_muted,
+                                                card_bg,
+                                                border_color,
+                                                accent_color,
+                                            );
                                         }
                                     });
                                 ui.add_space(3.0);
@@ -2484,6 +3008,20 @@ impl eframe::App for WeeChatApp {
                                 .margin(Margin::symmetric(8.0, 5.0))
                                 .desired_width(ui.available_width() - 58.0),
                         );
+                        let paste_image = response.has_focus()
+                            && ctx.input(|input| {
+                                (input.modifiers.command || input.modifiers.ctrl)
+                                    && input.key_pressed(egui::Key::V)
+                            });
+                        if paste_image {
+                            if let Some(buffer_id) = clipboard_upload_target(
+                                true,
+                                self.open_thread_buffer_id.as_deref(),
+                                current_buffer_id.as_deref(),
+                            ) {
+                                self.upload_clipboard_image_to(buffer_id);
+                            }
+                        }
                         if std::mem::take(&mut self.focus_thread_input) {
                             response.request_focus();
                         }
@@ -2672,34 +3210,13 @@ impl eframe::App for WeeChatApp {
                                     (input.modifiers.command || input.modifiers.ctrl)
                                         && input.key_pressed(egui::Key::V)
                                 });
-                            if paste_image && !self.file_share_uploading {
-                                if let Some(buf_id) = self.selected_buffer_id.clone() {
-                                    self.file_share_uploading = true;
-                                    self.file_share_error = None;
-                                    let duration = self.file_share_duration.clone();
-                                    let tx = self.file_share_tx.clone();
-                                    tokio::spawn(async move {
-                                        let clipboard = tokio::task::spawn_blocking(
-                                            crate::ui::fileshare::clipboard_png,
-                                        )
-                                        .await;
-                                        let result = match clipboard {
-                                            Ok(Ok(Some(png))) => {
-                                                crate::ui::fileshare::upload_bytes(
-                                                    "clipboard.png",
-                                                    png,
-                                                    &duration,
-                                                )
-                                                .await
-                                            }
-                                            Ok(Ok(None)) => Err(String::new()),
-                                            Ok(Err(error)) => Err(error),
-                                            Err(error) => {
-                                                Err(format!("Clipboard task failed: {}", error))
-                                            }
-                                        };
-                                        let _ = tx.send(result.map(|url| (buf_id, url)));
-                                    });
+                            if paste_image {
+                                if let Some(buffer_id) = clipboard_upload_target(
+                                    false,
+                                    None,
+                                    self.selected_buffer_id.as_deref(),
+                                ) {
+                                    self.upload_clipboard_image_to(buffer_id);
                                 }
                             }
 
@@ -2993,75 +3510,6 @@ impl eframe::App for WeeChatApp {
                                         marker_shown = true;
                                     }
 
-                                    let matrix_image = line
-                                        .matrix_media
-                                        .as_ref()
-                                        .filter(|media| media.kind == "image")
-                                        .cloned();
-                                    if self.show_inline_images {
-                                        if let (
-                                            Some(buffer_id),
-                                            Some(media),
-                                        ) = (
-                                            current_buffer_id.as_deref(),
-                                            matrix_image.as_ref(),
-                                        ) {
-                                            if !self
-                                                .image_cache
-                                                .contains_key(&media.mxc_uri)
-                                            {
-                                                self.ensure_matrix_media_loading(
-                                                    buffer_id,
-                                                    media,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    let matrix_message_sections =
-                                        matrix_image.as_ref().map(|media| {
-                                            ANSIParser::parse(&format!(
-                                                "📎 {}",
-                                                media.name
-                                            ))
-                                        });
-                                    let msg_sections = matrix_message_sections
-                                        .as_deref()
-                                        .unwrap_or(&line.parsed_message);
-
-                                    let image_urls_in_line: Vec<String> = if self.show_inline_images {
-                                        msg_sections.iter()
-                                            .filter_map(|s| s.url.as_ref())
-                                            .filter(|u| Self::is_image_url(u) && !Self::is_twemoji_url(u))
-                                            .cloned()
-                                            .collect()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    for url in &image_urls_in_line {
-                                        if is_safe_public_url(url) && !self.image_cache.contains_key(url) {
-                                            self.image_expanded.insert(url.clone());
-                                            self.image_cache.insert(url.clone(), ImageState::Loading);
-                                            let tx = self.image_tx.clone();
-                                            let url_owned = url.clone();
-                                            tokio::spawn(async move {
-                                                let result = async {
-                                                    let bytes = reqwest::get(&url_owned).await?.bytes().await?;
-                                                    Ok::<Vec<u8>, reqwest::Error>(bytes.to_vec())
-                                                }.await;
-                                                let _ = tx.send((url_owned, result.map_err(|e| e.to_string())));
-                                            });
-                                        }
-                                    }
-                                    let preview_urls_in_line: Vec<String> = if self.show_link_previews {
-                                        msg_sections.iter()
-                                            .filter_map(|s| s.url.as_ref())
-                                            .filter(|u| !Self::is_image_url(u) && !Self::is_twemoji_url(u))
-                                            .cloned()
-                                            .collect()
-                                    } else {
-                                        Vec::new()
-                                    };
-
                                     let row_bg = if line.highlight {
                                         let c = Color32::from(render_theme.ansi[3]);
                                         Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 28)
@@ -3127,7 +3575,7 @@ impl eframe::App for WeeChatApp {
                                         let msg_col_width = ui.available_width();
                                         ui.vertical(|ui| {
                                             ui.set_min_width(msg_col_width);
-                                            if let Some(reply) = &line.matrix_reply {
+                                            let message_previews = if let Some(reply) = &line.matrix_reply {
                                                 let reply_card = Frame::none()
                                                     .fill(card_bg)
                                                     .rounding(Rounding::same(6.0))
@@ -3196,121 +3644,19 @@ impl eframe::App for WeeChatApp {
                                                             "Reply target: {event_id}"
                                                         ));
                                                 }
+                                                None
                                             } else {
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.spacing_mut().item_spacing.x = 6.0;
-                                                for s in msg_sections {
-                                                    if let Some(url) = &s.url {
-                                                        // Use hover-only sense so the row's context_menu (which needs
-                                                        // Sense::click on the frame) doesn't compete with link clicks.
-                                                        // URL left-click is detected via raw input instead.
-                                                        let link_style = s.style.to_format(font_id.clone(), &render_theme);
-                                                        let mut link_format = link_style;
-                                                        link_format.color = ui.visuals().hyperlink_color;
-                                                        link_format.underline = egui::Stroke::new(1.0, ui.visuals().hyperlink_color);
-                                                        let mut job = egui::text::LayoutJob::default();
-                                                        job.append(&s.text, 0.0, link_format);
-                                                        let link_resp = ui.add(egui::Label::new(job).sense(egui::Sense::hover()));
-                                                        if link_resp.hovered() {
-                                                            ui.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-                                                            row_hovered_url = Some(url.clone());
-                                                        }
-                                                        let url_for_click = url.clone();
-                                                        if response_primary_clicked(ui, &link_resp) {
-                                                            ui.ctx().output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(url_for_click)));
-                                                        }
-                                                        if self.show_inline_images && Self::is_image_url(url) && is_safe_public_url(url) {
-                                                            let is_expanded = self.image_expanded.contains(url);
-                                                            let btn = if is_expanded { "🖼" } else { "🖼 preview" };
-                                                            let button = ui.small_button(btn);
-                                                            if response_primary_clicked(ui, &button) {
-                                                                if is_expanded {
-                                                                    self.image_expanded.remove(url);
-                                                                } else {
-                                                                    self.image_expanded.insert(url.clone());
-                                                                    if !self.image_cache.contains_key(url) {
-                                                                        self.image_cache.insert(url.clone(), ImageState::Loading);
-                                                                        let tx = self.image_tx.clone();
-                                                                        let url_owned = url.clone();
-                                                                        tokio::spawn(async move {
-                                                                            let result = async {
-                                                                                let bytes = reqwest::get(&url_owned).await?.bytes().await?;
-                                                                                Ok::<Vec<u8>, reqwest::Error>(bytes.to_vec())
-                                                                            }.await;
-                                                                            let _ = tx.send((url_owned, result.map_err(|e| e.to_string())));
-                                                                        });
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        if self.show_link_previews && !Self::is_image_url(url) && is_safe_public_url(url) {
-                                                            let is_expanded = self.preview_expanded.contains(url);
-                                                            let btn = if is_expanded { "🔗" } else { "🔗 preview" };
-                                                            let button = ui.small_button(btn);
-                                                            if response_primary_clicked(ui, &button) {
-                                                                if is_expanded {
-                                                                    self.preview_expanded.remove(url);
-                                                                } else {
-                                                                    self.preview_expanded.insert(url.clone());
-                                                                    if !self.preview_cache.contains_key(url) {
-                                                                        self.preview_cache.insert(url.clone(), PreviewState::Loading);
-                                                                        let tx = self.preview_tx.clone();
-                                                                        let url_owned = url.clone();
-                                                                        tokio::spawn(async move {
-                                                                            let result = fetch_link_preview(url_owned.clone()).await;
-                                                                            let _ = tx.send((url_owned, result));
-                                                                        });
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    } else if !self.emoji_rendering {
-                                                        let mut job = LayoutJob::default();
-                                                        job.append(&s.text, 0.0, s.style.to_format(font_id.clone(), &render_theme));
-                                                        ui.add(Label::new(job).wrap(true));
-                                                    } else {
-                                                        let emoji_size = font_id.size + 2.0;
-                                                        for span in crate::ui::emoji::split_emoji(&s.text) {
-                                                            match span {
-                                                                crate::ui::emoji::TextSpan::Text(t) => {
-                                                                    let mut job = LayoutJob::default();
-                                                                    job.append(&t, 0.0, s.style.to_format(font_id.clone(), &render_theme));
-                                                                    ui.add(Label::new(job).wrap(true));
-                                                                }
-                                                                crate::ui::emoji::TextSpan::Emoji(e) => {
-                                                                    let eurl = crate::ui::emoji::emoji_to_twemoji_url(&e);
-                                                                    if !self.image_cache.contains_key(&eurl) {
-                                                                        self.image_cache.insert(eurl.clone(), ImageState::Loading);
-                                                                        let tx = self.image_tx.clone();
-                                                                        let url_owned = eurl.clone();
-                                                                        tokio::spawn(async move {
-                                                                            let result: Result<Vec<u8>, String> = async {
-                                                                                let bytes = reqwest::get(&url_owned).await
-                                                                                    .map_err(|e| e.to_string())?
-                                                                                    .bytes().await
-                                                                                    .map_err(|e| e.to_string())?;
-                                                                                Ok(bytes.to_vec())
-                                                                            }.await;
-                                                                            let _ = tx.send((url_owned, result));
-                                                                        });
-                                                                    }
-                                                                    match self.image_cache.get(&eurl) {
-                                                                        Some(ImageState::Loaded(texture)) => {
-                                                                            ui.add(egui::Image::new((texture.id(), egui::Vec2::splat(emoji_size))));
-                                                                        }
-                                                                        _ => {
-                                                                            let mut job = LayoutJob::default();
-                                                                            job.append(&e, 0.0, s.style.to_format(font_id.clone(), &render_theme));
-                                                                            ui.add(Label::new(job).wrap(true));
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                            }
+                                                let previews = self.render_message_content(
+                                                    ui,
+                                                    &line.message,
+                                                    line.matrix_media.as_ref(),
+                                                    current_buffer_id.as_deref(),
+                                                    &font_id,
+                                                    &render_theme,
+                                                );
+                                                row_hovered_url = previews.hovered_url.clone();
+                                                Some(previews)
+                                            };
                                             if let Some((thread_id, reply_count, unread)) =
                                                 thread_button_line_ids
                                                     .contains(line.id.as_str())
@@ -3341,125 +3687,16 @@ impl eframe::App for WeeChatApp {
                                                 }
                                             }
 
-                                            if self.show_inline_images {
-                                                for url in &image_urls_in_line {
-                                                    if self.image_expanded.contains(url) {
-                                                        ui.add_space(4.0);
-                                                        match self.image_cache.get(url) {
-                                                            Some(ImageState::Loaded(texture)) => {
-                                                                let orig = texture.size_vec2();
-                                                                let size = inline_image_preview_size(
-                                                                    orig,
-                                                                    ui.available_width(),
-                                                                    ui.clip_rect().height(),
-                                                                );
-                                                                ui.add(egui::Image::new((texture.id(), size)).rounding(4.0));
-                                                            }
-                                                            Some(ImageState::Loading) | None => {
-                                                                ui.label(egui::RichText::new("Loading image…").color(text_muted).italics().small());
-                                                            }
-                                                            Some(ImageState::Failed) => {
-                                                                ui.label(egui::RichText::new("Failed to load image").color(Color32::from_rgb(220, 80, 80)).small());
-                                                            }
-                                                        }
-                                                        ui.add_space(4.0);
-                                                    }
-                                                }
-                                            }
-
-                                            if let Some(media) = &matrix_image {
-                                                ui.add_space(4.0);
-                                                match self.image_cache.get(&media.mxc_uri) {
-                                                    Some(ImageState::Loaded(texture)) => {
-                                                        let size = inline_image_preview_size(
-                                                            texture.size_vec2(),
-                                                            ui.available_width(),
-                                                            ui.clip_rect().height(),
-                                                        );
-                                                        ui.add(egui::Image::new((
-                                                            texture.id(),
-                                                            size,
-                                                        )).rounding(4.0));
-                                                    }
-                                                    Some(ImageState::Loading) | None => {
-                                                        ui.label(
-                                                            egui::RichText::new("Loading image…")
-                                                                .color(text_muted)
-                                                                .italics()
-                                                                .small(),
-                                                        );
-                                                    }
-                                                    Some(ImageState::Failed) => {
-                                                        ui.label(
-                                                            egui::RichText::new("Failed to load image")
-                                                                .color(Color32::from_rgb(220, 80, 80))
-                                                                .small(),
-                                                        );
-                                                    }
-                                                }
-                                                ui.add_space(4.0);
-                                            }
-
-                                            if self.show_link_previews {
-                                                for url in &preview_urls_in_line {
-                                                    if !self.preview_expanded.contains(url) { continue; }
-                                                    ui.add_space(4.0);
-                                                    match self.preview_cache.get(url) {
-                                                        Some(PreviewState::Loading) | None => {
-                                                            ui.label(egui::RichText::new("Loading preview…").color(text_muted).italics().small());
-                                                        }
-                                                        Some(PreviewState::Failed) => {
-                                                            ui.label(egui::RichText::new("No preview available").color(text_muted).small());
-                                                        }
-                                                        Some(PreviewState::Loaded(preview)) => {
-                                                            let title = preview.title.clone();
-                                                            let desc = preview.description.clone();
-                                                            let site = preview.site_name.clone();
-                                                            let img_url = preview.image_url.clone();
-
-                                                            let card = Frame::none()
-                                                                .fill(card_bg)
-                                                                .rounding(Rounding::same(6.0))
-                                                                .stroke(Stroke::new(1.0, border_color))
-                                                                .inner_margin(Margin { left: 14.0, right: 12.0, top: 8.0, bottom: 8.0 })
-                                                                .show(ui, |ui| {
-                                                                    ui.set_max_width(ui.available_width().min(520.0));
-                                                                    if let Some(s) = &site {
-                                                                        ui.label(egui::RichText::new(s).small().color(text_muted));
-                                                                    }
-                                                                    if let Some(t) = &title {
-                                                                        ui.label(egui::RichText::new(t).strong());
-                                                                    }
-                                                                    if let Some(d) = &desc {
-                                                                        let truncated: String = {
-                                                                            let mut chars = d.chars();
-                                                                            let s: String = chars.by_ref().take(240).collect();
-                                                                            if chars.next().is_some() { s + "…" } else { s }
-                                                                        };
-                                                                        ui.label(egui::RichText::new(truncated).small().color(text_secondary));
-                                                                    }
-                                                                    if let Some(iu) = &img_url {
-                                                                        if let Some(ImageState::Loaded(texture)) = self.image_cache.get(iu) {
-                                                                            let orig = texture.size_vec2();
-                                                                            let size = inline_image_preview_size(
-                                                                                orig,
-                                                                                ui.available_width(),
-                                                                                ui.clip_rect().height(),
-                                                                            );
-                                                                            ui.add_space(4.0);
-                                                                            ui.add(egui::Image::new((texture.id(), size)).rounding(4.0));
-                                                                        }
-                                                                    }
-                                                                });
-                                                            let bar = egui::Rect::from_min_max(
-                                                                card.response.rect.min,
-                                                                egui::pos2(card.response.rect.min.x + 3.0, card.response.rect.max.y),
-                                                            );
-                                                            ui.painter().rect_filled(bar, Rounding::same(3.0), accent_color);
-                                                        }
-                                                    }
-                                                    ui.add_space(4.0);
-                                                }
+                                            if let Some(previews) = message_previews.as_ref() {
+                                                self.render_message_previews(
+                                                    ui,
+                                                    previews,
+                                                    text_secondary,
+                                                    text_muted,
+                                                    card_bg,
+                                                    border_color,
+                                                    accent_color,
+                                                );
                                             }
                                         }); // end vertical (message column)
                                     }); // end horizontal (full message row)
