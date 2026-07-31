@@ -58,6 +58,19 @@ impl Buffer {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum MatrixReplyLineKind {
+    Header,
+    Quote,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatrixReplyContext {
+    pub event_id: Option<String>,
+    pub sender: Option<String>,
+    pub kind: MatrixReplyLineKind,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Line {
@@ -66,6 +79,7 @@ pub struct Line {
     pub prefix: String,
     pub message: String,
     pub matrix_event_id: Option<String>,
+    pub matrix_reply: Option<MatrixReplyContext>,
     pub displayed: bool,
     pub highlight: bool,
     // Cached: parsed once at insertion. Theme/font-independent — resolved at render.
@@ -99,6 +113,7 @@ impl Line {
             prefix,
             message,
             matrix_event_id: None,
+            matrix_reply: None,
             displayed,
             highlight,
             parsed_prefix,
