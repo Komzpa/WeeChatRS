@@ -624,6 +624,28 @@ mod thread_tests {
     use super::*;
     use chrono::Utc;
 
+    #[test]
+    fn legacy_localhost_relay_is_migrated_and_autoconnected() {
+        let mut settings = AppSettings::default();
+        settings.host = "localhost".to_owned();
+        settings.port = "9000".to_owned();
+        settings.use_ssl = false;
+        settings.save_password = true;
+
+        let profile = migrate_legacy_profile(&settings).expect("legacy profile");
+        assert_eq!(profile.label, "localhost");
+        assert_eq!(profile.host, "localhost");
+        assert_eq!(profile.port, "9000");
+        assert!(!profile.use_ssl);
+        assert!(profile.auto_connect);
+        assert!(profile.save_password);
+    }
+
+    #[test]
+    fn untouched_defaults_do_not_create_a_phantom_connection() {
+        assert!(migrate_legacy_profile(&AppSettings::default()).is_none());
+    }
+
     fn line(id: &str, prefix: &str, message: &str, event_id: &str) -> Line {
         let mut line = Line::new(
             id.to_owned(),
@@ -1086,6 +1108,49 @@ fn default_nicklist_width() -> f32 { 180.0 }
 fn default_prefix_suffix() -> String { "│".to_string() }
 fn default_file_share_duration() -> String { "day".to_string() }
 
+fn migrate_legacy_profile(settings: &AppSettings) -> Option<ConnectionProfile> {
+    if !settings.connections.is_empty() || settings.host.is_empty() {
+        return None;
+    }
+
+    let defaults = AppSettings::default();
+    let legacy_connection_was_configured = settings.host != defaults.host
+        || settings.port != defaults.port
+        || settings.use_ssl != defaults.use_ssl
+        || settings.accept_invalid_certs != defaults.accept_invalid_certs
+        || settings.save_password
+        || !settings.irc_nick.is_empty();
+    if !legacy_connection_was_configured {
+        return None;
+    }
+
+    Some(ConnectionProfile {
+        label: settings.host.clone(),
+        backend_type: settings.backend_type.clone(),
+        host: settings.host.clone(),
+        port: settings.port.clone(),
+        nick: settings.irc_nick.clone(),
+        username: String::new(),
+        sasl_username: String::new(),
+        use_ssl: settings.use_ssl,
+        accept_invalid_certs: settings.accept_invalid_certs,
+        auto_connect: true,
+        save_password: settings.save_password,
+        channel: String::new(),
+        ssh_enabled: false,
+        ssh_host: String::new(),
+        ssh_port: None,
+        ssh_user: String::new(),
+        ssh_save_password: false,
+        auto_reconnect: settings.auto_reconnect,
+    })
+}
+
+pub(crate) fn load_profile_password(profile: &ConnectionProfile) -> Option<String> {
+    crate::ui::secure_storage::load_by_key(&profile.keyring_host_key())
+        .or_else(|| crate::ui::secure_storage::load(&profile.host, &profile.port))
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -1333,28 +1398,8 @@ impl WeeChatApp {
 
         // Build profiles list: use saved connections if present, else migrate legacy fields
         let mut profiles: Vec<ConnectionProfile> = settings.connections.clone();
-        if profiles.is_empty() && !settings.host.is_empty() && settings.host != "localhost" {
-            // Migrate from old single-connection settings
-            profiles.push(ConnectionProfile {
-                label: settings.host.clone(),
-                backend_type: settings.backend_type.clone(),
-                host: settings.host.clone(),
-                port: settings.port.clone(),
-                nick: settings.irc_nick.clone(),
-                username: String::new(),
-                sasl_username: String::new(),
-                use_ssl: settings.use_ssl,
-                accept_invalid_certs: settings.accept_invalid_certs,
-                auto_connect: false,
-                save_password: settings.save_password,
-                channel: String::new(),
-                ssh_enabled: false,
-                ssh_host: String::new(),
-                ssh_port: None,
-                ssh_user: String::new(),
-                ssh_save_password: false,
-                auto_reconnect: true,
-            });
+        if let Some(legacy_profile) = migrate_legacy_profile(&settings) {
+            profiles.push(legacy_profile);
         }
 
         if !settings.font_path.is_empty() {
@@ -1478,8 +1523,7 @@ impl WeeChatApp {
             .collect();
         for profile in auto_profiles {
             let password = if profile.save_password {
-                crate::ui::secure_storage::load_by_key(&profile.keyring_host_key())
-                    .unwrap_or_default()
+                load_profile_password(&profile).unwrap_or_default()
             } else {
                 String::new()
             };
@@ -3397,6 +3441,10 @@ impl eframe::App for WeeChatApp {
                                 .margin(Margin::symmetric(8.0, 5.0))
                                 .desired_width(ui.available_width() - 86.0),
                         );
+                        crate::ui::input::input_context_menu(
+                            &response,
+                            &mut self.thread_input_text,
+                        );
                         let paste_image = response.has_focus()
                             && ctx.input(|input| {
                                 (input.modifiers.command || input.modifiers.ctrl)
@@ -3588,6 +3636,7 @@ impl eframe::App for WeeChatApp {
                                 .desired_width(ui.available_width() - 80.0);
 
                             let res = ui.add(text_edit);
+                            crate::ui::input::input_context_menu(&res, &mut self.input_text);
 
                             let paste_image = res.has_focus()
                                 && ctx.input(|input| {

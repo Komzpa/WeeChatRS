@@ -707,7 +707,7 @@ impl WeeChatApp {
                                                     if ui.button("Connect").clicked() {
                                                         // Check session cache, then keyring — skip prompt if password found.
                                                         let relay_pw = self.session_passwords.get(&prefix).cloned()
-                                                            .or_else(|| crate::ui::secure_storage::load_by_key(&profile.keyring_host_key()));
+                                                            .or_else(|| crate::ui::app::load_profile_password(profile));
                                                         let ssh_pw_known = !profile.ssh_enabled
                                                             || self.session_ssh_passwords.contains_key(&prefix)
                                                             || profile.ssh_save_password;
@@ -767,7 +767,7 @@ impl WeeChatApp {
                         if let Some(idx) = do_edit {
                             if idx < self.profiles.len() {
                                 let profile = &self.profiles[idx];
-                                self.editing_password = crate::ui::secure_storage::load_by_key(&profile.keyring_host_key()).unwrap_or_default();
+                                self.editing_password = crate::ui::app::load_profile_password(profile).unwrap_or_default();
                                 self.editing_ssh_password = crate::ui::secure_storage::load_by_key(&profile.ssh_keyring_key()).unwrap_or_default();
                                 self.editing_profile = profile.clone();
                                 self.editing_profile_idx = Some(idx);
