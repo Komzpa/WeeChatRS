@@ -872,6 +872,26 @@ fn stable_thread_snapshot(current: Option<&Buffer>, previous: Option<&Buffer>) -
     Some(snapshot)
 }
 
+/// Service buffers and Matrix thread buffers are implementation details, not a
+/// useful chat destination to reopen after restart.
+pub(crate) fn is_restorable_chat_buffer(buffer: &Buffer) -> bool {
+    !buffer.hidden
+        && !buffer.is_matrix_thread()
+        && !matches!(buffer.kind.as_str(), "core" | "server")
+}
+
+pub(crate) fn preferred_chat_buffer_id(
+    buffers: &[Buffer],
+    last_chat_buffer_name: Option<&str>,
+) -> Option<String> {
+    last_chat_buffer_name
+        .and_then(|name| buffers.iter().find(|buffer| {
+            is_restorable_chat_buffer(buffer) && buffer.full_name == name
+        }))
+        .or_else(|| buffers.iter().find(|buffer| is_restorable_chat_buffer(buffer)))
+        .map(|buffer| buffer.id.clone())
+}
+
 #[cfg(test)]
 mod thread_tests {
     use super::*;
@@ -1432,6 +1452,9 @@ pub struct AppSettings {
     /// Derive theme colours from the current desktop wallpaper.
     #[serde(default)]
     pub adaptive_theme: bool,
+    /// Stable prefixed full name of the last selected user-visible chat.
+    #[serde(default)]
+    pub last_chat_buffer_name: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -1524,6 +1547,7 @@ impl Default for AppSettings {
             keybinds: KeybindsMap::default(),
             collapsed_servers: HashSet::new(),
             adaptive_theme: false,
+            last_chat_buffer_name: None,
         }
     }
 }
@@ -1556,6 +1580,7 @@ pub struct WeeChatApp {
     /// called after every push/retain/extend/sort/clear of `buffers`.
     pub(crate) buffer_idx: HashMap<String, usize>,
     pub(crate) selected_buffer_id: Option<String>,
+    pub(crate) last_chat_buffer_name: Option<String>,
     pub(crate) input_text: String,
     // Settings
     pub(crate) show_settings: bool,
@@ -1861,8 +1886,8 @@ impl SavedReadMarker {
 #[cfg(test)]
 mod saved_read_marker_tests {
     use super::{
-        visit_marker_location, AppSettings, Line, SavedReadMarker, VisitMarkerLocation,
-        BEFORE_FIRST_LOADED_LINE_ID,
+        preferred_chat_buffer_id, visit_marker_location, AppSettings, Buffer, BufferActivity,
+        Line, SavedReadMarker, VisitMarkerLocation, BEFORE_FIRST_LOADED_LINE_ID,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::VecDeque;
@@ -1878,6 +1903,34 @@ mod saved_read_marker_tests {
         )
     }
 
+    fn buffer(id: &str, full_name: &str, kind: &str) -> Buffer {
+        Buffer {
+            id: id.to_owned(),
+            number: 1,
+            name: full_name.to_owned(),
+            full_name: full_name.to_owned(),
+            plugin: "matrix".to_owned(),
+            kind: kind.to_owned(),
+            server: "matrix".to_owned(),
+            own_nick: String::new(),
+            messages: VecDeque::new(),
+            nicks: Vec::new(),
+            mention_candidates: Vec::new(),
+            activity: BufferActivity::None,
+            unread_count: 0,
+            last_read_id: None,
+            last_markread_ts: None,
+            topic: String::new(),
+            modes: String::new(),
+            hidden: false,
+            muted: false,
+            has_nicklist: true,
+            matrix_room_id: None,
+            matrix_thread_root: None,
+            visit_start_marker_id: None,
+        }
+    }
+
     #[test]
     fn saved_read_marker_survives_settings_round_trip() {
         let mut settings = AppSettings::default();
@@ -1888,10 +1941,36 @@ mod saved_read_marker_tests {
                 timestamp_nanos: 1_750_000_000_000_000_000,
             },
         );
+        settings.last_chat_buffer_name =
+            Some("local/matrix.matrix.!room:example.org".to_owned());
 
         let encoded = serde_json::to_string(&settings).unwrap();
         let restored: AppSettings = serde_json::from_str(&encoded).unwrap();
         assert_eq!(restored.read_markers, settings.read_markers);
+        assert_eq!(restored.last_chat_buffer_name, settings.last_chat_buffer_name);
+    }
+
+    #[test]
+    fn last_chat_restore_prefers_the_exact_visible_room_over_service_buffers() {
+        let core = buffer("local/core", "local/core.weechat", "core");
+        let server = buffer("local/server", "local/irc.server.libera", "server");
+        let mut thread = buffer("local/thread", "local/matrix.matrix.!room:example.org", "channel");
+        thread.matrix_room_id = Some("!room:example.org".to_owned());
+        thread.matrix_thread_root = Some("$root:example.org".to_owned());
+        let other = buffer("local/other", "local/matrix.matrix.!other:example.org", "channel");
+        let remembered = buffer("local/room", "local/matrix.matrix.!room:example.org", "channel");
+
+        assert_eq!(
+            preferred_chat_buffer_id(
+                &[core, server, thread.clone(), other.clone(), remembered],
+                Some("local/matrix.matrix.!room:example.org"),
+            ),
+            Some("local/room".to_owned()),
+        );
+        assert_eq!(
+            preferred_chat_buffer_id(&[thread, other], None),
+            Some("local/other".to_owned()),
+        );
     }
 
     #[test]
@@ -1996,6 +2075,7 @@ impl WeeChatApp {
             buffers: Vec::new(),
             buffer_idx: HashMap::new(),
             selected_buffer_id: None,
+            last_chat_buffer_name: settings.last_chat_buffer_name,
             input_text: String::new(),
             show_settings: false,
             show_filtered_lines: settings.show_filtered_lines,
@@ -2774,6 +2854,11 @@ impl WeeChatApp {
         }
 
         self.selected_buffer_id = Some(id.clone());
+        if let Some(buffer) = self.buffer_by_id(&id).filter(|buffer| {
+            is_restorable_chat_buffer(buffer)
+        }) {
+            self.last_chat_buffer_name = Some(buffer.full_name.clone());
+        }
         self.focus_input = true;
         self.selected_view_since = Some(std::time::Instant::now());
         self.cleared_buffer_ids.insert(id.clone());
@@ -3007,6 +3092,7 @@ impl eframe::App for WeeChatApp {
             keybinds: self.keybinds.clone(),
             collapsed_servers: self.collapsed_servers.clone(),
             adaptive_theme: self.adaptive_theme,
+            last_chat_buffer_name: self.last_chat_buffer_name.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &settings);
     }
