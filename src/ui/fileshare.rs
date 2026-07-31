@@ -112,7 +112,7 @@ pub fn clipboard_png() -> Result<Option<Vec<u8>>, String> {
     Ok(Some(png))
 }
 
-fn mime_for(filename: &str) -> &'static str {
+pub(crate) fn mime_for(filename: &str) -> &'static str {
     let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
     match ext.as_str() {
         "png"              => "image/png",
