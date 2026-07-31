@@ -156,11 +156,47 @@ const THREAD_PANEL_MIN_WIDTH: f32 = 280.0;
 const PREFIX_MESSAGE_GAP: f32 = 8.0;
 
 #[derive(Clone)]
+struct ThreadReplyContext {
+    sender: Option<String>,
+    quotes: Vec<String>,
+}
+
+#[derive(Clone)]
 struct ThreadMessageBlock {
     timestamp: chrono::DateTime<chrono::Utc>,
     prefix: String,
     messages: Vec<String>,
     matrix_event_id: Option<String>,
+    reply: Option<ThreadReplyContext>,
+}
+
+fn append_thread_line(block: &mut ThreadMessageBlock, line: &Line) {
+    match line.matrix_reply.as_ref().map(|reply| reply.kind) {
+        Some(MatrixReplyLineKind::Header) => {
+            let reply = line.matrix_reply.as_ref().expect("reply header");
+            block.reply = Some(ThreadReplyContext {
+                sender: reply.sender.clone(),
+                quotes: Vec::new(),
+            });
+        }
+        Some(MatrixReplyLineKind::Quote) => {
+            let quote = line
+                .plain_message
+                .strip_prefix("> ")
+                .unwrap_or(&line.plain_message)
+                .to_owned();
+            let reply = line.matrix_reply.as_ref().expect("reply quote");
+            block
+                .reply
+                .get_or_insert_with(|| ThreadReplyContext {
+                    sender: reply.sender.clone(),
+                    quotes: Vec::new(),
+                })
+                .quotes
+                .push(quote);
+        }
+        None => block.messages.push(line.plain_message.clone()),
+    }
 }
 
 fn group_thread_lines(lines: &VecDeque<Line>) -> Vec<ThreadMessageBlock> {
@@ -175,16 +211,19 @@ fn group_thread_lines(lines: &VecDeque<Line>) -> Vec<ThreadMessageBlock> {
         });
         if continues_previous {
             if let Some(block) = blocks.last_mut() {
-                block.messages.push(line.plain_message.clone());
+                append_thread_line(block, line);
                 continue;
             }
         }
-        blocks.push(ThreadMessageBlock {
+        let mut block = ThreadMessageBlock {
             timestamp: line.timestamp,
             prefix: line.plain_prefix.clone(),
-            messages: vec![line.plain_message.clone()],
+            messages: Vec::new(),
             matrix_event_id: line.matrix_event_id.clone(),
-        });
+            reply: None,
+        };
+        append_thread_line(&mut block, line);
+        blocks.push(block);
     }
     blocks
 }
@@ -218,6 +257,42 @@ mod thread_tests {
         let blocks = group_thread_lines(&lines);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[1].messages, ["first line", "", "last line"]);
+    }
+
+    #[test]
+    fn separates_reply_context_from_thread_message_body() {
+        let mut header = line(
+            "1",
+            "bob",
+            "Reply to Alice:",
+            "$reply:example.org",
+        );
+        header.matrix_reply = Some(MatrixReplyContext {
+            event_id: Some("$original:example.org".to_owned()),
+            sender: Some("Alice".to_owned()),
+            kind: MatrixReplyLineKind::Header,
+        });
+        let mut quote = line(
+            "2",
+            "bob",
+            "> original message",
+            "$reply:example.org",
+        );
+        quote.matrix_reply = Some(MatrixReplyContext {
+            event_id: Some("$original:example.org".to_owned()),
+            sender: Some("Alice".to_owned()),
+            kind: MatrixReplyLineKind::Quote,
+        });
+        let body = line("3", "bob", "new message", "$reply:example.org");
+
+        let blocks =
+            group_thread_lines(&VecDeque::from([header, quote, body]));
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].messages, ["new message"]);
+        let reply = blocks[0].reply.as_ref().expect("reply context");
+        assert_eq!(reply.sender.as_deref(), Some("Alice"));
+        assert_eq!(reply.quotes, ["original message"]);
     }
 }
 
@@ -2034,6 +2109,84 @@ impl eframe::App for WeeChatApp {
                                                 .color(text_muted),
                                             );
                                         });
+                                        if let Some(reply) = &block.reply {
+                                            ui.add_space(4.0);
+                                            let reply_card = Frame::none()
+                                                .fill(card_bg)
+                                                .rounding(Rounding::same(6.0))
+                                                .stroke(Stroke::new(
+                                                    1.0,
+                                                    border_color,
+                                                ))
+                                                .inner_margin(Margin {
+                                                    left: 13.0,
+                                                    right: 10.0,
+                                                    top: 7.0,
+                                                    bottom: 7.0,
+                                                })
+                                                .show(ui, |ui| {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                "↩ Reply to",
+                                                            )
+                                                            .small()
+                                                            .color(text_muted),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                reply
+                                                                    .sender
+                                                                    .as_deref()
+                                                                    .unwrap_or(
+                                                                        "unknown sender",
+                                                                    ),
+                                                            )
+                                                            .strong()
+                                                            .color(
+                                                                accent_color,
+                                                            ),
+                                                        );
+                                                    });
+                                                    for quote in &reply.quotes {
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                quote,
+                                                            )
+                                                            .color(
+                                                                text_secondary,
+                                                            )
+                                                            .italics(),
+                                                        );
+                                                    }
+                                                });
+                                            let bar =
+                                                egui::Rect::from_min_max(
+                                                    reply_card
+                                                        .response
+                                                        .rect
+                                                        .min,
+                                                    egui::pos2(
+                                                        reply_card
+                                                                .response
+                                                                .rect
+                                                                .min
+                                                                .x
+                                                            + 3.0,
+                                                        reply_card
+                                                            .response
+                                                            .rect
+                                                            .max
+                                                            .y,
+                                                    ),
+                                                );
+                                            ui.painter().rect_filled(
+                                                bar,
+                                                Rounding::same(3.0),
+                                                accent_color,
+                                            );
+                                            ui.add_space(4.0);
+                                        }
                                         for message in &block.messages {
                                             if message.is_empty() {
                                                 ui.add_space(4.0);
@@ -2487,12 +2640,17 @@ impl eframe::App for WeeChatApp {
                                             .map(|line| line.id.as_str())
                                     })
                                     .collect();
+                                let mut previous_matrix_event_id: Option<String> = None;
                                 for line in messages {
                                     if !self.show_filtered_lines && !line.displayed { continue; }
 
                                     if let Some(q) = &search_query {
                                         if !line.plain_prefix_lower.contains(q) && !line.plain_message_lower.contains(q) { continue; }
                                     }
+                                    let continues_matrix_event = line.matrix_event_id.is_some()
+                                        && previous_matrix_event_id
+                                            .as_ref()
+                                            == line.matrix_event_id.as_ref();
 
                                     let past_visit_marker = current_buffer_visit_marker_id.as_ref().map(|vid| {
                                         let lid = line.id.parse::<i64>().unwrap_or(0);
@@ -2559,7 +2717,12 @@ impl eframe::App for WeeChatApp {
                                     ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
                                         if self.show_timestamps {
-                                            ui.label(egui::RichText::new(line.timestamp.with_timezone(&chrono::Local).format("%H:%M:%S").to_string()).font(font_id.clone()).color(text_muted));
+                                            ui.scope(|ui| {
+                                                if continues_matrix_event {
+                                                    ui.set_opacity(0.0);
+                                                }
+                                                ui.label(egui::RichText::new(line.timestamp.with_timezone(&chrono::Local).format("%H:%M:%S").to_string()).font(font_id.clone()).color(text_muted));
+                                            });
                                         }
                                         let prefix_sections = &line.parsed_prefix;
 
@@ -2582,6 +2745,9 @@ impl eframe::App for WeeChatApp {
                                             egui::vec2(col_width, ui.text_style_height(&TextStyle::Body)),
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
+                                                if continues_matrix_event {
+                                                    ui.set_opacity(0.0);
+                                                }
                                                 let mut prefix_job = LayoutJob::default();
                                                 prefix_job.halign = egui::Align::RIGHT;
                                                 for s in prefix_sections { prefix_job.append(&s.text, 0.0, s.style.to_format(font_id.clone(), &render_theme)); }
@@ -2589,7 +2755,12 @@ impl eframe::App for WeeChatApp {
                                             }
                                         );
                                         if !self.prefix_suffix.is_empty() {
-                                            ui.label(egui::RichText::new(&self.prefix_suffix).font(font_id.clone()).color(text_muted));
+                                            ui.scope(|ui| {
+                                                if continues_matrix_event {
+                                                    ui.set_opacity(0.0);
+                                                }
+                                                ui.label(egui::RichText::new(&self.prefix_suffix).font(font_id.clone()).color(text_muted));
+                                            });
                                         }
                                         ui.spacing_mut().item_spacing.x = 0.0;
                                         ui.add_space(PREFIX_MESSAGE_GAP);
@@ -2597,6 +2768,76 @@ impl eframe::App for WeeChatApp {
                                         let msg_col_width = ui.available_width();
                                         ui.vertical(|ui| {
                                             ui.set_min_width(msg_col_width);
+                                            if let Some(reply) = &line.matrix_reply {
+                                                let reply_card = Frame::none()
+                                                    .fill(card_bg)
+                                                    .rounding(Rounding::same(6.0))
+                                                    .stroke(Stroke::new(1.0, border_color))
+                                                    .inner_margin(Margin {
+                                                        left: 14.0,
+                                                        right: 12.0,
+                                                        top: 7.0,
+                                                        bottom: 7.0,
+                                                    })
+                                                    .show(ui, |ui| {
+                                                        ui.set_max_width(
+                                                            ui.available_width().min(620.0),
+                                                        );
+                                                        match reply.kind {
+                                                            MatrixReplyLineKind::Header => {
+                                                                ui.horizontal_wrapped(|ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new("↩ Reply to")
+                                                                            .small()
+                                                                            .color(text_muted),
+                                                                    );
+                                                                    ui.label(
+                                                                        egui::RichText::new(
+                                                                            reply.sender.as_deref().unwrap_or(
+                                                                                "unknown sender",
+                                                                            ),
+                                                                        )
+                                                                        .strong()
+                                                                        .color(accent_color),
+                                                                    );
+                                                                });
+                                                            }
+                                                            MatrixReplyLineKind::Quote => {
+                                                                let quote = line
+                                                                    .plain_message
+                                                                    .strip_prefix("> ")
+                                                                    .unwrap_or(&line.plain_message);
+                                                                ui.label(
+                                                                    egui::RichText::new(quote)
+                                                                        .color(text_secondary)
+                                                                        .italics(),
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                let bar = egui::Rect::from_min_max(
+                                                    reply_card.response.rect.min,
+                                                    egui::pos2(
+                                                        reply_card.response.rect.min.x + 3.0,
+                                                        reply_card.response.rect.max.y,
+                                                    ),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    bar,
+                                                    Rounding::same(3.0),
+                                                    accent_color,
+                                                );
+                                                if let Some(event_id) =
+                                                    reply.event_id.as_deref()
+                                                {
+                                                    reply_card
+                                                        .response
+                                                        .clone()
+                                                        .on_hover_text(format!(
+                                                            "Reply target: {event_id}"
+                                                        ));
+                                                }
+                                            } else {
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 6.0;
                                                 for s in msg_sections {
@@ -2712,6 +2953,7 @@ impl eframe::App for WeeChatApp {
                                                     }
                                                 }
                                             });
+                                            }
                                             if let Some((thread_id, reply_count, unread)) =
                                                 thread_button_line_ids
                                                     .contains(line.id.as_str())
@@ -2901,6 +3143,8 @@ impl eframe::App for WeeChatApp {
                                             }
                                         }
                                     });
+                                    previous_matrix_event_id =
+                                        line.matrix_event_id.clone();
                                 }
                             }
                         });
