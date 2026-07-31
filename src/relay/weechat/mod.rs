@@ -375,6 +375,28 @@ impl BackendClient for WeeChatClient {
         self.send_api("GET /api/hotlist", Some("_hotlist"), None);
     }
 
+    fn request_completion(
+        &self,
+        buffer_id: &str,
+        input: &str,
+        position: usize,
+        request_id: u64,
+    ) -> bool {
+        let Ok(buffer_id) = buffer_id.parse::<i64>() else {
+            return false;
+        };
+        self.send_api(
+            "POST /api/completion",
+            Some(&format!("_completion:{request_id}")),
+            Some(serde_json::json!({
+                "buffer_id": buffer_id,
+                "command": input,
+                "position": position,
+            })),
+        );
+        true
+    }
+
     fn sync_subscriptions(&self) {
         self.send_api(
             "POST /api/sync",

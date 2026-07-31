@@ -118,6 +118,19 @@ pub trait BackendClient: Send {
     /// client-side; default is a no-op.
     fn fetch_hotlist(&self) {}
 
+    /// Request backend-native input completion for a buffer.
+    ///
+    /// Returns false when the backend has no completion API.
+    fn request_completion(
+        &self,
+        _buffer_id: &str,
+        _input: &str,
+        _position: usize,
+        _request_id: u64,
+    ) -> bool {
+        false
+    }
+
     /// Subscribe to server-push events. WeeChat uses POST /api/sync; IRC has
     /// no equivalent; default is a no-op.
     fn sync_subscriptions(&self) {}
