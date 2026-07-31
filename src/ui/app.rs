@@ -228,8 +228,10 @@ const INITIAL_HISTORY_ROWS: usize = 120;
 const IMAGE_CACHE_MAX: usize = 200;
 const PREVIEW_CACHE_MAX: usize = 200;
 const PREFIX_COL_WIDTHS_MAX: usize = 500;
-const MAX_INLINE_IMAGE_WIDTH: f32 = 500.0;
-const MAX_INLINE_IMAGE_HEIGHT: f32 = 360.0;
+const MAX_INLINE_IMAGE_WIDTH: f32 = 360.0;
+const MAX_INLINE_IMAGE_HEIGHT: f32 = 240.0;
+const MAX_EXPANDED_IMAGE_WIDTH: f32 = 900.0;
+const MAX_EXPANDED_IMAGE_HEIGHT: f32 = 720.0;
 
 fn matrix_media_cache_path(mxc_uri: &str) -> PathBuf {
     let cache_root = std::env::var_os("XDG_CACHE_HOME")
@@ -313,6 +315,26 @@ fn inline_image_preview_size(
     original * scale
 }
 
+fn inline_image_display_size(
+    original: Vec2,
+    available_width: f32,
+    viewport_height: f32,
+    expanded: bool,
+) -> Vec2 {
+    if !expanded {
+        return inline_image_preview_size(original, available_width, viewport_height);
+    }
+    if original.x <= 0.0 || original.y <= 0.0 {
+        return original;
+    }
+    let max_width = (available_width - 32.0).clamp(1.0, MAX_EXPANDED_IMAGE_WIDTH);
+    let max_height = viewport_height.min(MAX_EXPANDED_IMAGE_HEIGHT);
+    let scale = (max_width / original.x)
+        .min(max_height / original.y)
+        .min(1.0);
+    original * scale
+}
+
 fn primary_click_hits_rect(
     primary_clicked: bool,
     interact_pos: Option<egui::Pos2>,
@@ -348,7 +370,7 @@ fn response_primary_clicked(ui: &egui::Ui, response: &egui::Response) -> bool {
 #[cfg(test)]
 mod inline_matrix_image_tests {
     use super::{
-        inline_image_preview_size, is_matrix_media_status_line,
+        inline_image_display_size, inline_image_preview_size, is_matrix_media_status_line,
         matrix_media_cache_path, primary_click_hits_rect,
         quote_weechat_argument,
     };
@@ -356,14 +378,13 @@ mod inline_matrix_image_tests {
 
     #[test]
     fn portrait_preview_is_capped_by_height() {
-        assert_eq!(
-            inline_image_preview_size(
-                Vec2::new(900.0, 1800.0),
-                1200.0,
-                900.0,
-            ),
-            Vec2::new(180.0, 360.0),
+        let size = inline_image_preview_size(
+            Vec2::new(900.0, 1800.0),
+            1200.0,
+            900.0,
         );
+        assert!((size.x - 120.0).abs() < 0.01);
+        assert!((size.y - 240.0).abs() < 0.01);
     }
 
     #[test]
@@ -374,7 +395,7 @@ mod inline_matrix_image_tests {
                 1200.0,
                 900.0,
             ),
-            Vec2::new(500.0, 250.0),
+            Vec2::new(360.0, 180.0),
         );
     }
 
@@ -394,12 +415,24 @@ mod inline_matrix_image_tests {
     fn image_at_the_width_cap_keeps_its_source_size() {
         assert_eq!(
             inline_image_preview_size(
-                Vec2::new(500.0, 220.0),
+                Vec2::new(360.0, 220.0),
                 1600.0,
                 1000.0,
             ),
-            Vec2::new(500.0, 220.0),
+            Vec2::new(360.0, 220.0),
         );
+    }
+
+    #[test]
+    fn click_expansion_uses_a_larger_but_still_bounded_size() {
+        let size = inline_image_display_size(
+            Vec2::new(1119.0, 1159.0),
+            1200.0,
+            900.0,
+            true,
+        );
+        assert!((size.x - 695.151).abs() < 0.01);
+        assert_eq!(size.y, 720.0);
     }
 
     #[test]
@@ -1318,6 +1351,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub cleared_buffer_ids: HashSet<String>,
     #[serde(default)]
+    pub read_markers: HashMap<String, SavedReadMarker>,
+    #[serde(default)]
     pub save_password: bool,
     #[serde(default)]
     pub font_name: String,
@@ -1427,6 +1462,7 @@ impl Default for AppSettings {
             show_hidden_buffers: false,
             buffer_order: Vec::new(),
             cleared_buffer_ids: HashSet::new(),
+            read_markers: HashMap::new(),
             save_password: false,
             font_name: String::new(),
             font_path: String::new(),
@@ -1497,6 +1533,7 @@ pub struct WeeChatApp {
     // Image preview state
     pub(crate) image_cache: HashMap<String, ImageState>,
     pub(crate) image_expanded: HashSet<String>,
+    pub(crate) image_full_size: HashSet<String>,
     pub(crate) image_tx: mpsc::UnboundedSender<(String, Result<Vec<u8>, String>)>,
     pub(crate) image_rx: mpsc::UnboundedReceiver<(String, Result<Vec<u8>, String>)>,
 
@@ -1543,6 +1580,10 @@ pub struct WeeChatApp {
 
     // Buffers the user has explicitly read this session; suppresses stale hotlist entries.
     pub(crate) cleared_buffer_ids: HashSet<String>,
+
+    // Last read line per stable connection/buffer name. WeeChat's Relay API does not
+    // return the backend read marker, so this is the reload-safe source for the divider.
+    pub(crate) read_markers: HashMap<String, SavedReadMarker>,
 
     // Font selection
     pub(crate) font_name: String,
@@ -1648,6 +1689,104 @@ pub(crate) struct SelectedMention {
     pub(crate) user_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedReadMarker {
+    pub(crate) line_id: String,
+    pub(crate) timestamp_nanos: i64,
+}
+
+impl SavedReadMarker {
+    pub(crate) fn from_line(line: &Line) -> Self {
+        Self {
+            line_id: line.id.clone(),
+            timestamp_nanos: line.timestamp.timestamp_nanos_opt().unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn restore_line_id(&self, lines: &VecDeque<Line>) -> Option<String> {
+        lines
+            .iter()
+            .find(|line| line.id == self.line_id)
+            .or_else(|| {
+                lines
+                    .iter()
+                    .rev()
+                    .find(|line| {
+                        line.timestamp.timestamp_nanos_opt().unwrap_or_default()
+                            <= self.timestamp_nanos
+                    })
+            })
+            .map(|line| line.id.clone())
+    }
+
+    pub(crate) fn restore_visit_line_id(&self, lines: &VecDeque<Line>) -> Option<String> {
+        (!lines.is_empty()).then(|| {
+            self.restore_line_id(lines)
+                .unwrap_or_else(|| "0".to_owned())
+        })
+    }
+}
+
+#[cfg(test)]
+mod saved_read_marker_tests {
+    use super::{AppSettings, Line, SavedReadMarker};
+    use chrono::{TimeZone, Utc};
+    use std::collections::VecDeque;
+
+    fn line(id: &str, timestamp: i64) -> Line {
+        Line::new(
+            id.to_owned(),
+            Utc.timestamp_opt(timestamp, 0).single().unwrap(),
+            "alice".to_owned(),
+            "message".to_owned(),
+            true,
+            false,
+        )
+    }
+
+    #[test]
+    fn saved_read_marker_survives_settings_round_trip() {
+        let mut settings = AppSettings::default();
+        settings.read_markers.insert(
+            "local/matrix.matrix.!room:example.org".to_owned(),
+            SavedReadMarker {
+                line_id: "123".to_owned(),
+                timestamp_nanos: 1_750_000_000_000_000_000,
+            },
+        );
+
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.read_markers, settings.read_markers);
+    }
+
+    #[test]
+    fn saved_read_marker_restores_after_relay_line_ids_change() {
+        let lines = VecDeque::from([
+            line("new-id-1", 100),
+            line("new-id-2", 200),
+            line("new-id-3", 300),
+        ]);
+        let marker = SavedReadMarker {
+            line_id: "old-id-2".to_owned(),
+            timestamp_nanos: 200_000_000_000,
+        };
+
+        assert_eq!(marker.restore_line_id(&lines).as_deref(), Some("new-id-2"));
+    }
+
+    #[test]
+    fn saved_marker_before_loaded_page_places_divider_before_first_line() {
+        let lines = VecDeque::from([line("301", 301), line("302", 302)]);
+        let marker = SavedReadMarker {
+            line_id: "1".to_owned(),
+            timestamp_nanos: 1_000_000_000,
+        };
+
+        assert_eq!(marker.restore_visit_line_id(&lines).as_deref(), Some("0"));
+    }
+}
+
 impl WeeChatApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (shared_event_tx, event_rx) = mpsc::unbounded_channel::<(String, BackendEvent)>();
@@ -1725,6 +1864,7 @@ impl WeeChatApp {
             show_hidden_buffers: settings.show_hidden_buffers,
             image_cache: HashMap::new(),
             image_expanded: HashSet::new(),
+            image_full_size: HashSet::new(),
             image_tx,
             image_rx,
             preview_cache: HashMap::new(),
@@ -1750,6 +1890,7 @@ impl WeeChatApp {
             dragging_buffer_id: None,
             drag_drop_before_id: None,
             cleared_buffer_ids: settings.cleared_buffer_ids,
+            read_markers: settings.read_markers,
             font_name: settings.font_name,
             font_path: settings.font_path.clone(),
             applied_font_path: settings.font_path,
@@ -2245,6 +2386,7 @@ impl WeeChatApp {
                             if response_primary_clicked(ui, &button) {
                                 if expanded {
                                     self.image_expanded.remove(url);
+                                    self.image_full_size.remove(url);
                                 } else {
                                     self.ensure_image_loading(url);
                                 }
@@ -2279,16 +2421,47 @@ impl WeeChatApp {
         }
     }
 
-    fn render_image_preview(&self, ui: &mut egui::Ui, cache_key: &str, text_muted: Color32) {
+    fn render_image_preview(&mut self, ui: &mut egui::Ui, cache_key: &str, text_muted: Color32) {
         ui.add_space(4.0);
         match self.image_cache.get(cache_key) {
             Some(ImageState::Loaded(texture)) => {
-                let size = inline_image_preview_size(
+                let original = texture.size_vec2();
+                let expanded = self.image_full_size.contains(cache_key);
+                let size = inline_image_display_size(
                     texture.size_vec2(),
                     ui.available_width(),
                     ui.clip_rect().height(),
+                    expanded,
                 );
-                ui.add(egui::Image::new((texture.id(), size)).rounding(4.0));
+                let response = Frame::none()
+                    .fill(Color32::BLACK.linear_multiply(0.18))
+                    .rounding(Rounding::same(7.0))
+                    .inner_margin(Margin::same(4.0))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Image::new((texture.id(), size))
+                                .rounding(4.0)
+                                .sense(egui::Sense::click()),
+                        )
+                    })
+                    .inner;
+                if response_primary_clicked(ui, &response) {
+                    if expanded {
+                        self.image_full_size.remove(cache_key);
+                    } else {
+                        self.image_full_size.insert(cache_key.to_owned());
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} × {}  ·  click to {}",
+                        original.x as usize,
+                        original.y as usize,
+                        if expanded { "shrink" } else { "enlarge" },
+                    ))
+                    .color(text_muted)
+                    .small(),
+                );
             }
             Some(ImageState::Loading) | None => {
                 ui.label(
@@ -2310,7 +2483,7 @@ impl WeeChatApp {
     }
 
     fn render_message_previews(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         previews: &MessagePreviewTargets,
         text_secondary: Color32,
@@ -2409,6 +2582,18 @@ impl WeeChatApp {
         }
     }
 
+    fn remember_buffer_read_marker(&mut self, id: &str) {
+        let marker = self.buffer_by_id(id).and_then(|buffer| {
+            buffer
+                .messages
+                .back()
+                .map(|line| (buffer.full_name.clone(), SavedReadMarker::from_line(line)))
+        });
+        if let Some((full_name, marker)) = marker {
+            self.read_markers.insert(full_name, marker);
+        }
+    }
+
     pub(crate) fn select_buffer(&mut self, id: String) {
         if self
             .buffer_by_id(&id)
@@ -2421,6 +2606,7 @@ impl WeeChatApp {
                 self.reply_target = None;
                 self.mention_completion = None;
                 self.selected_mentions.clear();
+                self.remember_buffer_read_marker(&prev_id);
                 if let Some((client, raw_id)) = self.client_for_buffer(&prev_id) {
                     client.mark_read(&raw_id);
                 }
@@ -2445,6 +2631,7 @@ impl WeeChatApp {
                 client.mark_read(&raw_id);
             }
         }
+        self.remember_buffer_read_marker(&id);
     }
 
     pub(crate) fn open_thread(&mut self, buffer_id: String) {
@@ -2466,6 +2653,7 @@ impl WeeChatApp {
             buffer.activity = BufferActivity::None;
             buffer.unread_count = 0;
         }
+        self.remember_buffer_read_marker(&buffer_id);
         if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
             if needs_lines {
                 client.fetch_lines(&raw_id, INITIAL_LINES);
@@ -2645,6 +2833,7 @@ impl eframe::App for WeeChatApp {
             show_hidden_buffers: self.show_hidden_buffers,
             buffer_order: self.buffer_order.clone(),
             cleared_buffer_ids: self.cleared_buffer_ids.clone(),
+            read_markers: self.read_markers.clone(),
             save_password: false,
             font_name: self.font_name.clone(),
             font_path: self.font_path.clone(),
@@ -2711,12 +2900,20 @@ impl eframe::App for WeeChatApp {
                             let handle = ctx.load_texture(&url, color_img, egui::TextureOptions::default());
                             self.image_cache.insert(url, ImageState::Loaded(handle));
                         }
-                        Err(_) => { self.image_cache.insert(url, ImageState::Failed); }
+                        Err(_) => {
+                            self.image_full_size.remove(&url);
+                            self.image_cache.insert(url, ImageState::Failed);
+                        }
                     }
                 }
-                Err(_) => { self.image_cache.insert(url, ImageState::Failed); }
+                Err(_) => {
+                    self.image_full_size.remove(&url);
+                    self.image_cache.insert(url, ImageState::Failed);
+                }
             }
             cap_map(&mut self.image_cache, IMAGE_CACHE_MAX);
+            self.image_full_size
+                .retain(|key| self.image_cache.contains_key(key));
         }
 
         while let Ok((url, result)) = self.preview_rx.try_recv() {

@@ -23,6 +23,24 @@ enum ClientCommand {
     Disconnect,
 }
 
+// WeeChat keeps hotlist activity and its read marker as separate buffer
+// properties. The Relay API has no POST /buffers/{id}/read resource, so both
+// supported mutations must go through the buffer's input command endpoint.
+const MARK_READ_COMMANDS: [&str; 2] = [
+    "/buffer set unread",
+    "/buffer set hotlist -1",
+];
+
+fn mark_read_input_bodies(buffer_id: &str) -> Option<[serde_json::Value; 2]> {
+    let id = buffer_id.parse::<i64>().ok()?;
+    Some(MARK_READ_COMMANDS.map(|command| {
+        serde_json::json!({
+            "buffer_id": id,
+            "command": command,
+        })
+    }))
+}
+
 // ── Config (cheaply cloneable, passed into the reconnect loop) ────────────────
 
 #[derive(Clone)]
@@ -326,23 +344,14 @@ impl BackendClient for WeeChatClient {
     }
 
     fn mark_read(&self, buffer_id: &str) {
-        // REST endpoint (WeeChat 4.3+): sets the persistent last_read_line_ufr marker.
-        self.send_api(
-            &format!("POST /api/buffers/{}/read", buffer_id),
-            None,
-            None,
-        );
-        // Belt-and-suspenders for older relay versions: the input command clears the
-        // in-memory hotlist entry immediately and also updates last_read_line_ufr.
-        if let Ok(id) = buffer_id.parse::<i64>() {
-            self.send_api(
-                "POST /api/input",
-                None,
-                Some(serde_json::json!({
-                    "buffer_id": id,
-                    "command": "/buffer set hotlist -1"
-                })),
-            );
+        if let Some(bodies) = mark_read_input_bodies(buffer_id) {
+            for body in bodies {
+                self.send_api(
+                    "POST /api/input",
+                    None,
+                    Some(body),
+                );
+            }
         }
     }
 
@@ -372,5 +381,28 @@ impl BackendClient for WeeChatClient {
             None,
             Some(serde_json::json!({"colors": "ansi", "input": false})),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_read_input_bodies;
+
+    #[test]
+    fn mark_read_advances_persistent_unread_marker_before_clearing_hotlist() {
+        assert_eq!(
+            mark_read_input_bodies("42"),
+            Some([
+                serde_json::json!({
+                    "buffer_id": 42,
+                    "command": "/buffer set unread",
+                }),
+                serde_json::json!({
+                    "buffer_id": 42,
+                    "command": "/buffer set hotlist -1",
+                }),
+            ])
+        );
+        assert_eq!(mark_read_input_bodies("not-a-buffer-id"), None);
     }
 }

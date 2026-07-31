@@ -2,7 +2,8 @@ use crate::relay::backend::BackendEvent;
 use crate::relay::models::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{
-    history_snapshot_is_exhausted, WeeChatApp, LOAD_MORE_LINES, MAX_STORED_LINES,
+    history_snapshot_is_exhausted, SavedReadMarker, WeeChatApp, LOAD_MORE_LINES,
+    MAX_STORED_LINES,
 };
 use chrono::{Utc, DateTime, Local};
 use serde_json::Value;
@@ -839,6 +840,7 @@ impl WeeChatApp {
                 if let Some(raw_id) = raw_id {
                     let full_id = format!("{}/{}", conn_prefix, raw_id);
                     let full_full_name = format!("{}/{}", conn_prefix, raw_full_name);
+                    let saved_read_marker = self.read_markers.get(&full_full_name);
 
                     let mut topic = String::new();
                     let mut modes = String::new();
@@ -873,6 +875,8 @@ impl WeeChatApp {
                     let muted = self.muted_buffer_names.contains(&full_full_name);
                     if relay_last_read_id.is_some() {
                         last_read_id = relay_last_read_id.clone();
+                    } else if let Some(marker) = saved_read_marker {
+                        last_read_id = Some(marker.line_id.clone());
                     }
 
                     // Use raw_full_name (without prefix) for metadata extraction
@@ -1123,7 +1127,10 @@ impl WeeChatApp {
         let mut log_entry: Option<String> = None;
         let is_selected = self.selected_buffer_id.as_deref() == Some(&full_buffer_id);
         let mut history_exhausted = false;
+        let mut marker_to_save = None;
         if let Some(idx) = self.buffer_idx_of(&full_buffer_id) {
+            let full_name = self.buffers[idx].full_name.clone();
+            let saved_read_marker = self.read_markers.get(&full_name).cloned();
             let buffer = &mut self.buffers[idx];
             let mut deque: std::collections::VecDeque<Line> = lines.into();
             if deque.len() > MAX_STORED_LINES {
@@ -1143,14 +1150,30 @@ impl WeeChatApp {
             ));
             buffer.messages = deque;
             if is_selected {
+                if let Some(marker) = &saved_read_marker {
+                    let visit_marker_missing = buffer
+                        .visit_start_marker_id
+                        .as_ref()
+                        .is_none_or(|id| !buffer.messages.iter().any(|line| line.id == *id));
+                    if visit_marker_missing {
+                        buffer.visit_start_marker_id =
+                            marker.restore_visit_line_id(&buffer.messages);
+                    }
+                }
                 if let Some(last) = buffer.messages.back() {
                     buffer.last_read_id = Some(last.id.clone());
+                    marker_to_save = Some((full_name, SavedReadMarker::from_line(last)));
                 }
+            } else if let Some(marker) = saved_read_marker {
+                buffer.last_read_id = marker.restore_line_id(&buffer.messages);
             } else if buffer.last_read_id.is_none() {
                 if let Some(last) = buffer.messages.back() {
                     buffer.last_read_id = Some(last.id.clone());
                 }
             }
+        }
+        if let Some((full_name, marker)) = marker_to_save {
+            self.read_markers.insert(full_name, marker);
         }
         if is_load_more {
             self.loading_more_buffer_id = None;
@@ -1390,6 +1413,10 @@ impl WeeChatApp {
                             if is_selected {
                                 if !is_historical {
                                     buffer.last_read_id = Some(line.id.clone());
+                                    self.read_markers.insert(
+                                        buffer.full_name.clone(),
+                                        SavedReadMarker::from_line(&line),
+                                    );
                                 }
                             } else if displayed && !buffer.muted && !is_notify_none && !is_self_msg {
                                 let activity = if is_highlight || notify_level == 3 {
