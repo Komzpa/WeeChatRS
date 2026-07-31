@@ -403,6 +403,34 @@ fn clipboard_upload_target(
     }
 }
 
+fn paste_shortcut_pressed(events: &[egui::Event]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Paste,
+                pressed: true,
+                ..
+            }
+        ) || matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::V,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.command || modifiers.ctrl
+        )
+    })
+}
+
+fn should_probe_clipboard_image(events: &[egui::Event]) -> bool {
+    paste_shortcut_pressed(events)
+        && !events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Paste(text) if !text.is_empty()))
+}
+
 fn response_primary_clicked(ui: &egui::Ui, response: &egui::Response) -> bool {
     response.clicked()
         || ui.input(|input| {
@@ -1143,6 +1171,28 @@ mod thread_tests {
 
         assert_eq!(current_room_after_upload, "room-b");
         assert_eq!(upload_target, Some("thread".to_owned()));
+    }
+
+    #[test]
+    fn clipboard_image_probe_does_not_compete_with_text_paste() {
+        let mut modifiers = egui::Modifiers::default();
+        modifiers.ctrl = true;
+        modifiers.command = true;
+        let paste_key = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: Some(egui::Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+
+        assert!(paste_shortcut_pressed(&[paste_key.clone()]));
+        assert!(should_probe_clipboard_image(&[paste_key.clone()]));
+        assert!(!should_probe_clipboard_image(&[
+            egui::Event::Paste("hello".to_owned()),
+            paste_key,
+        ]));
+        assert!(!should_probe_clipboard_image(&[]));
     }
 
     #[test]
@@ -2392,17 +2442,25 @@ impl WeeChatApp {
     }
 
     fn start_matrix_clipboard_upload(&mut self, buffer_id: String) -> bool {
-        if !self.is_matrix_buffer(&buffer_id) || self.file_share_uploading {
+        if self.file_share_uploading {
+            self.file_share_error = Some(
+                "Cannot paste while another attachment is being prepared or uploaded".to_owned(),
+            );
+            return false;
+        }
+        if !self.is_matrix_buffer(&buffer_id) {
+            self.file_share_error = Some(
+                "Cannot paste an image here: native clipboard image upload is available in Matrix chats"
+                    .to_owned(),
+            );
             return false;
         }
         self.file_share_uploading = true;
         self.file_share_error = None;
         let tx = self.file_share_tx.clone();
         tokio::spawn(async move {
-            let result = match tokio::task::spawn_blocking(
-                crate::ui::fileshare::clipboard_png,
-            )
-            .await
+            let result = match tokio::task::spawn_blocking(crate::ui::fileshare::clipboard_png)
+                .await
             {
                 Ok(Ok(Some(bytes))) if bytes.len() <= MATRIX_UPLOAD_MAX_BYTES => {
                     Ok(PreparedFileShare::MatrixAttachment {
@@ -2416,7 +2474,9 @@ impl WeeChatApp {
                     "Matrix clipboard images may not exceed {} MiB",
                     MATRIX_UPLOAD_MAX_BYTES / 1024 / 1024,
                 )),
-                Ok(Ok(None)) => Err(String::new()),
+                Ok(Ok(None)) => Err(
+                    "Cannot paste: clipboard text was not accepted by the input field".to_owned(),
+                ),
                 Ok(Err(error)) => Err(error),
                 Err(error) => Err(format!("Clipboard worker failed: {error}")),
             };
@@ -3221,6 +3281,16 @@ impl eframe::App for WeeChatApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Capture paste intent before TextEdit consumes the key event. The
+        // event carries the modifiers from key-down even when Ctrl/Cmd was
+        // released again before this frame is rendered.
+        let (paste_shortcut_this_frame, paste_image_this_frame) = ctx.input(|input| {
+            (
+                paste_shortcut_pressed(&input.events),
+                should_probe_clipboard_image(&input.events),
+            )
+        });
+
         if !self.notify_initialized {
             self.notify_initialized = true;
             crate::ui::notify::init();
@@ -4348,6 +4418,19 @@ impl eframe::App for WeeChatApp {
                         });
                     ui.separator();
                     ui.add_space(5.0);
+                    if let Some(err) = self.file_share_error.clone() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("⚠ {err}"))
+                                    .color(Color32::from_rgb(220, 80, 80))
+                                    .small(),
+                            );
+                            if ui.small_button("✕").clicked() {
+                                self.file_share_error = None;
+                            }
+                        });
+                        ui.add_space(3.0);
+                    }
                     ui.horizontal(|ui| {
                         let attach_enabled = !self.file_share_uploading;
                         let attach_label = if self.file_share_uploading {
@@ -4377,18 +4460,22 @@ impl eframe::App for WeeChatApp {
                             &response,
                             &mut self.thread_input_text,
                         );
-                        let paste_image = response.has_focus()
-                            && ctx.input(|input| {
-                                (input.modifiers.command || input.modifiers.ctrl)
-                                    && input.key_pressed(egui::Key::V)
-                            });
-                        if paste_image {
+                        let paste_shortcut = response.has_focus() && paste_shortcut_this_frame;
+                        let paste_image = response.has_focus() && paste_image_this_frame;
+                        if paste_shortcut && !paste_image {
+                            self.file_share_error = None;
+                        } else if paste_image {
                             if let Some(buffer_id) = clipboard_upload_target(
                                 true,
                                 self.open_thread_buffer_id.as_deref(),
                                 current_buffer_id.as_deref(),
                             ) {
                                 self.start_matrix_clipboard_upload(buffer_id);
+                            } else {
+                                self.file_share_error = Some(
+                                    "Cannot paste: this thread is not ready for attachments"
+                                        .to_owned(),
+                                );
                             }
                         }
                         if std::mem::take(&mut self.focus_thread_input) {
@@ -4756,15 +4843,17 @@ impl eframe::App for WeeChatApp {
                         });
                         ui.add_space(4.0);
                     }
-                    // File share error toast (clears on next click anywhere)
-                    if let Some(err) = self.file_share_error.clone() {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("Upload failed: {}", err))
-                                .color(Color32::from_rgb(220, 80, 80)).small());
-                            if ui.small_button("✕").clicked() {
-                                self.file_share_error = None;
-                            }
-                        });
+                    // One visible, dismissible attachment/paste error beside the active composer.
+                    if self.open_thread_buffer_id.is_none() {
+                        if let Some(err) = self.file_share_error.clone() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(format!("⚠ {err}"))
+                                    .color(Color32::from_rgb(220, 80, 80)).small());
+                                if ui.small_button("✕").clicked() {
+                                    self.file_share_error = None;
+                                }
+                            });
+                        }
                     }
                     ui.horizontal(|ui| {
                         let hint = if !selected_buffer_connected {
@@ -4807,18 +4896,21 @@ impl eframe::App for WeeChatApp {
                             let res = ui.add(text_edit);
                             crate::ui::input::input_context_menu(&res, &mut self.input_text);
 
-                            let paste_image = res.has_focus()
-                                && ctx.input(|input| {
-                                    (input.modifiers.command || input.modifiers.ctrl)
-                                        && input.key_pressed(egui::Key::V)
-                                });
-                            if paste_image {
+                            let paste_shortcut = res.has_focus() && paste_shortcut_this_frame;
+                            let paste_image = res.has_focus() && paste_image_this_frame;
+                            if paste_shortcut && !paste_image {
+                                self.file_share_error = None;
+                            } else if paste_image {
                                 if let Some(buffer_id) = clipboard_upload_target(
                                     false,
                                     None,
                                     self.selected_buffer_id.as_deref(),
                                 ) {
                                     self.start_matrix_clipboard_upload(buffer_id);
+                                } else {
+                                    self.file_share_error = Some(
+                                        "Cannot paste: no chat is selected".to_owned(),
+                                    );
                                 }
                             }
 
