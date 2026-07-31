@@ -6,10 +6,12 @@ use crate::ui::theme::AppTheme;
 use crate::ui::keybinds::KeybindsMap;
 use crate::ui::url_safety::is_safe_public_url;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sha2::Digest;
 use egui::{FontId, ScrollArea, Label, Key, Visuals, TextStyle, FontFamily, Color32, text::LayoutJob, Margin, Frame, Rounding, Stroke, Vec2, Modifiers, Rect, Painter};
 use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,91 @@ pub(crate) enum PreviewState {
     Loading,
     Loaded(LinkPreview),
     Failed,
+}
+
+pub(crate) enum PreparedFileShare {
+    MatrixAttachment {
+        buffer_id: String,
+        filename: String,
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    ExternalLink {
+        buffer_id: String,
+        url: String,
+    },
+}
+
+const MATRIX_UPLOAD_MAX_ENCODED_CHUNK: usize = 32 * 1024;
+const MATRIX_UPLOAD_RAW_CHUNK: usize = MATRIX_UPLOAD_MAX_ENCODED_CHUNK / 4 * 3;
+const MATRIX_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
+static MATRIX_UPLOAD_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn matrix_attachment_upload(id: String, filename: &str, mime: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
+    if filename.is_empty() || mime.is_empty() || bytes.is_empty() || bytes.len() > MATRIX_UPLOAD_MAX_BYTES {
+        return Err("Matrix attachment metadata or size is invalid (maximum 10 MiB)".to_owned());
+    }
+    let mut commands = vec![format!(
+        "/matrix-upload begin {id} {} {mime} {} {:x}",
+        URL_SAFE_NO_PAD.encode(filename),
+        bytes.len(),
+        sha2::Sha256::digest(bytes)
+    )];
+    for (sequence, chunk) in bytes.chunks(MATRIX_UPLOAD_RAW_CHUNK).enumerate() {
+        let encoded = URL_SAFE_NO_PAD.encode(chunk);
+        debug_assert!(encoded.len() <= MATRIX_UPLOAD_MAX_ENCODED_CHUNK);
+        commands.push(format!("/matrix-upload chunk {id} {sequence} {encoded}"));
+    }
+    commands.push(format!("/matrix-upload commit {id}"));
+    Ok(commands)
+}
+
+fn next_matrix_upload_id() -> String {
+    let sequence = MATRIX_UPLOAD_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "clip{:x}{sequence:x}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    )
+}
+
+async fn prepare_file_share(
+    buffer_id: String,
+    path: PathBuf,
+    is_matrix: bool,
+    duration: String,
+) -> Result<PreparedFileShare, String> {
+    if !is_matrix {
+        let url = crate::ui::fileshare::upload(path, &duration).await?;
+        return Ok(PreparedFileShare::ExternalLink { buffer_id, url });
+    }
+
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| format!("Cannot inspect file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Matrix attachment must be a regular file".to_owned());
+    }
+    if metadata.len() == 0 || metadata.len() > MATRIX_UPLOAD_MAX_BYTES as u64 {
+        return Err("Matrix attachments must be between 1 byte and 10 MiB".to_owned());
+    }
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "Matrix attachment has no file name".to_owned())?;
+    let mime = crate::ui::fileshare::mime_for(&filename).to_owned();
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|error| format!("Cannot read file: {error}"))?;
+    if bytes.len() != metadata.len() as usize {
+        return Err("Matrix attachment changed while it was being read".to_owned());
+    }
+    Ok(PreparedFileShare::MatrixAttachment {
+        buffer_id,
+        filename,
+        mime,
+        bytes,
+    })
 }
 
 // --- HTML helpers (used in tokio::spawn, so must be free functions) ---
@@ -656,6 +743,70 @@ mod thread_tests {
     }
 
     #[test]
+    fn matrix_clipboard_upload_keeps_chunk_order_and_round_trips_bytes() {
+        let bytes = (0..(MATRIX_UPLOAD_RAW_CHUNK + 17))
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        let commands = matrix_attachment_upload("cliptest".to_owned(), "sample.bin", "application/octet-stream", &bytes).unwrap();
+        assert!(commands[0].starts_with("/matrix-upload begin cliptest "));
+        assert!(commands[0].contains(" application/octet-stream "));
+        assert!(!commands[0].contains("http"));
+        let mut reconstructed = Vec::new();
+        for (sequence, command) in commands[1..commands.len() - 1].iter().enumerate() {
+            let fields = command.split_ascii_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields[0..3], ["/matrix-upload", "chunk", "cliptest"]);
+            assert_eq!(fields[3], sequence.to_string());
+            assert!(fields[4].len() <= MATRIX_UPLOAD_MAX_ENCODED_CHUNK);
+            reconstructed.extend(URL_SAFE_NO_PAD.decode(fields[4]).unwrap());
+        }
+        assert_eq!(reconstructed, bytes);
+        assert_eq!(commands.last().unwrap(), "/matrix-upload commit cliptest");
+    }
+
+    #[test]
+    fn matrix_clipboard_upload_rejects_oversized_payload_before_queuing_chunks() {
+        let bytes = vec![0; MATRIX_UPLOAD_MAX_BYTES + 1];
+        assert!(matrix_attachment_upload("cliptest".to_owned(), "huge.bin", "application/octet-stream", &bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn matrix_file_share_prepares_native_bytes_without_external_url() {
+        let path = std::env::temp_dir().join(format!(
+            "weechatrs-matrix-attachment-{}.pdf",
+            next_matrix_upload_id()
+        ));
+        let bytes = b"%PDF-1.7\nnative Matrix attachment";
+        std::fs::write(&path, bytes).unwrap();
+
+        let prepared = prepare_file_share(
+            "matrix/thread".to_owned(),
+            path.clone(),
+            true,
+            "day".to_owned(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        match prepared {
+            PreparedFileShare::MatrixAttachment {
+                buffer_id,
+                filename,
+                mime,
+                bytes: actual,
+            } => {
+                assert_eq!(buffer_id, "matrix/thread");
+                assert!(filename.ends_with(".pdf"));
+                assert_eq!(mime, "application/pdf");
+                assert_eq!(actual, bytes);
+            }
+            PreparedFileShare::ExternalLink { .. } => {
+                panic!("Matrix file was routed to the external file host")
+            }
+        }
+    }
+
+    #[test]
     fn transient_empty_refresh_keeps_visible_thread_messages() {
         let mut previous = thread_buffer("thread");
         previous
@@ -1141,9 +1292,9 @@ pub struct WeeChatApp {
     pub(crate) sysinfo_tx: mpsc::UnboundedSender<(String, String)>,
     pub(crate) sysinfo_rx: mpsc::UnboundedReceiver<(String, String)>,
 
-    // File share: tokio upload task → main loop; Ok = URL to post, Err = error message
-    pub(crate) file_share_tx: mpsc::UnboundedSender<Result<(String, String), String>>,
-    pub(crate) file_share_rx: mpsc::UnboundedReceiver<Result<(String, String), String>>,
+    // File share: async file preparation/upload → main loop.
+    pub(crate) file_share_tx: mpsc::UnboundedSender<Result<PreparedFileShare, String>>,
+    pub(crate) file_share_rx: mpsc::UnboundedReceiver<Result<PreparedFileShare, String>>,
     pub(crate) file_share_uploading: bool,
     pub(crate) file_share_error: Option<String>,
     pub(crate) file_share_duration: String,
@@ -1171,7 +1322,8 @@ impl WeeChatApp {
         let (preview_tx, preview_rx) = mpsc::unbounded_channel();
         let (np_tx, np_rx) = mpsc::unbounded_channel::<(String, String)>();
         let (sysinfo_tx, sysinfo_rx) = mpsc::unbounded_channel::<(String, String)>();
-        let (file_share_tx, file_share_rx) = mpsc::unbounded_channel::<Result<(String, String), String>>();
+        let (file_share_tx, file_share_rx) =
+            mpsc::unbounded_channel::<Result<PreparedFileShare, String>>();
 
         let settings: AppSettings = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
@@ -1411,6 +1563,88 @@ impl WeeChatApp {
         None
     }
 
+    fn is_matrix_buffer(&self, buffer_id: &str) -> bool {
+        self
+            .buffer_by_id(buffer_id)
+            .is_some_and(|buffer| buffer.plugin == "matrix")
+    }
+
+    fn send_matrix_attachment(
+        &self,
+        buffer_id: &str,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if !self.is_matrix_buffer(buffer_id) {
+            return Err("Attachment target is not a Matrix buffer".to_owned());
+        }
+        let Some((client, raw_id)) = self.client_for_buffer(buffer_id) else {
+            return Err("Matrix buffer has no authenticated relay connection".to_owned());
+        };
+        for command in matrix_attachment_upload(
+            next_matrix_upload_id(),
+            filename,
+            mime,
+            bytes,
+        )? {
+            client.send_message(&raw_id, &command);
+        }
+        Ok(())
+    }
+
+    fn try_matrix_clipboard_upload(&self, buffer_id: &str) -> Result<bool, String> {
+        if !self.is_matrix_buffer(buffer_id) {
+            return Ok(false);
+        }
+        let Some(png) = crate::ui::fileshare::clipboard_png()? else {
+            return Ok(false);
+        };
+        self.send_matrix_attachment(buffer_id, "clipboard.png", "image/png", &png)?;
+        Ok(true)
+    }
+
+    fn start_file_picker(&mut self, buffer_id: String) {
+        if self.file_share_uploading {
+            return;
+        }
+        self.file_share_uploading = true;
+        self.file_share_error = None;
+        let is_matrix = self.is_matrix_buffer(&buffer_id);
+        let duration = self.file_share_duration.clone();
+        let tx = self.file_share_tx.clone();
+        tokio::spawn(async move {
+            let Some(handle) = rfd::AsyncFileDialog::new().pick_file().await else {
+                let _ = tx.send(Err(String::new()));
+                return;
+            };
+            let result = prepare_file_share(
+                buffer_id,
+                handle.path().to_path_buf(),
+                is_matrix,
+                duration,
+            )
+            .await;
+            let _ = tx.send(result);
+        });
+    }
+
+    fn start_file_path(&mut self, buffer_id: String, path: PathBuf) {
+        if self.file_share_uploading {
+            return;
+        }
+        self.file_share_uploading = true;
+        self.file_share_error = None;
+        let is_matrix = self.is_matrix_buffer(&buffer_id);
+        let duration = self.file_share_duration.clone();
+        let tx = self.file_share_tx.clone();
+        tokio::spawn(async move {
+            let result =
+                prepare_file_share(buffer_id, path, is_matrix, duration).await;
+            let _ = tx.send(result);
+        });
+    }
+
     fn backend_type_for_buffer(&self, buffer_id: &str) -> Option<BackendType> {
         self.connections.iter().find_map(|conn| {
             let prefix = format!("{}/", conn.prefix);
@@ -1483,28 +1717,6 @@ impl WeeChatApp {
         } else {
             self.loading_more_buffer_id = None;
         }
-    }
-
-    fn upload_clipboard_image_to(&mut self, buffer_id: String) {
-        if self.file_share_uploading {
-            return;
-        }
-        self.file_share_uploading = true;
-        self.file_share_error = None;
-        let duration = self.file_share_duration.clone();
-        let tx = self.file_share_tx.clone();
-        tokio::spawn(async move {
-            let clipboard = tokio::task::spawn_blocking(crate::ui::fileshare::clipboard_png).await;
-            let result = match clipboard {
-                Ok(Ok(Some(png))) => {
-                    crate::ui::fileshare::upload_bytes("clipboard.png", png, &duration).await
-                }
-                Ok(Ok(None)) => Err(String::new()),
-                Ok(Err(error)) => Err(error),
-                Err(error) => Err(format!("Clipboard task failed: {error}")),
-            };
-            let _ = tx.send(result.map(|url| (buffer_id, url)));
-        });
     }
 
     fn ensure_matrix_media_loading(
@@ -2229,12 +2441,27 @@ impl eframe::App for WeeChatApp {
             }
         }
 
-        // File share drain: on success send URL; on error show toast (empty = silent cancel).
+        // File share drain: Matrix bytes stay in Matrix; IRC receives an external URL.
         while let Ok(result) = self.file_share_rx.try_recv() {
             self.file_share_uploading = false;
             match result {
-                Ok((buf_id, url)) => {
-                    if let Some((client, raw_id)) = self.client_for_buffer(&buf_id) {
+                Ok(PreparedFileShare::MatrixAttachment {
+                    buffer_id,
+                    filename,
+                    mime,
+                    bytes,
+                }) => {
+                    if let Err(error) = self.send_matrix_attachment(
+                        &buffer_id,
+                        &filename,
+                        &mime,
+                        &bytes,
+                    ) {
+                        self.file_share_error = Some(error);
+                    }
+                }
+                Ok(PreparedFileShare::ExternalLink { buffer_id, url }) => {
+                    if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
                         client.send_message(&raw_id, &url);
                     }
                 }
@@ -2249,15 +2476,19 @@ impl eframe::App for WeeChatApp {
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped_files.is_empty() && !self.file_share_uploading {
             if let Some(path) = dropped_files.into_iter().find_map(|f| f.path) {
-                if let Some(buf_id) = self.selected_buffer_id.clone() {
-                    self.file_share_uploading = true;
-                    self.file_share_error = None;
-                    let duration = self.file_share_duration.clone();
-                    let tx = self.file_share_tx.clone();
-                    tokio::spawn(async move {
-                        let result = crate::ui::fileshare::upload(path, &duration).await;
-                        let _ = tx.send(result.map(|url| (buf_id, url)));
+                let over_thread_panel = self.open_thread_buffer_id.is_some()
+                    && ctx.input(|input| {
+                        input.pointer.hover_pos().is_some_and(|position| {
+                            position.x >= ctx.screen_rect().right() - self.thread_panel_width
+                        })
                     });
+                let target = if over_thread_panel {
+                    self.open_thread_buffer_id.clone()
+                } else {
+                    self.selected_buffer_id.clone()
+                };
+                if let Some(buf_id) = target {
+                    self.start_file_path(buf_id, path);
                 }
             }
         }
@@ -3142,11 +3373,29 @@ impl eframe::App for WeeChatApp {
                     ui.separator();
                     ui.add_space(5.0);
                     ui.horizontal(|ui| {
+                        let attach_enabled = !self.file_share_uploading;
+                        let attach_label = if self.file_share_uploading {
+                            egui::RichText::new("⏳").size(16.0).color(Color32::GRAY)
+                        } else {
+                            egui::RichText::new("📎").size(16.0)
+                        };
+                        if ui
+                            .add_enabled(
+                                attach_enabled,
+                                egui::Button::new(attach_label).frame(false),
+                            )
+                            .on_hover_text("Attach a file to this Matrix thread")
+                            .clicked()
+                        {
+                            if let Some(buffer_id) = self.open_thread_buffer_id.clone() {
+                                self.start_file_picker(buffer_id);
+                            }
+                        }
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.thread_input_text)
                                 .hint_text("Reply in thread…")
                                 .margin(Margin::symmetric(8.0, 5.0))
-                                .desired_width(ui.available_width() - 58.0),
+                                .desired_width(ui.available_width() - 86.0),
                         );
                         let paste_image = response.has_focus()
                             && ctx.input(|input| {
@@ -3159,7 +3408,9 @@ impl eframe::App for WeeChatApp {
                                 self.open_thread_buffer_id.as_deref(),
                                 current_buffer_id.as_deref(),
                             ) {
-                                self.upload_clipboard_image_to(buffer_id);
+                                if let Err(error) = self.try_matrix_clipboard_upload(&buffer_id) {
+                                    self.file_share_error = Some(error);
+                                }
                             }
                         }
                         if std::mem::take(&mut self.focus_thread_input) {
@@ -3257,6 +3508,9 @@ impl eframe::App for WeeChatApp {
                 .and_then(|prefix| self.connections.iter().find(|c| c.prefix == prefix))
                 .map(|c| c.client.is_connected())
                 .unwrap_or(false);
+            let selected_buffer_is_matrix = current_buffer_id
+                .as_deref()
+                .is_some_and(|buffer_id| self.is_matrix_buffer(buffer_id));
 
             egui::TopBottomPanel::bottom("input_panel")
                 .frame(Frame::none().fill(surface_color).inner_margin(Margin::symmetric(16.0, 10.0)))
@@ -3304,7 +3558,7 @@ impl eframe::App for WeeChatApp {
                             "Type a message..."
                         };
 
-                        // 📎 file share button
+                        // 📎 Matrix native attachment / IRC file-link button
                         let attach_enabled = selected_buffer_connected && !self.file_share_uploading;
                         let attach_label = if self.file_share_uploading {
                             egui::RichText::new("⏳").size(16.0).color(Color32::GRAY)
@@ -3314,25 +3568,15 @@ impl eframe::App for WeeChatApp {
                         if ui.add_enabled(
                             attach_enabled,
                             egui::Button::new(attach_label).frame(false),
-                        ).on_hover_text("Upload an image or file (Ctrl-V and drag-and-drop also work)").clicked() {
+                        ).on_hover_text(
+                            if selected_buffer_is_matrix {
+                                "Attach a file directly to this Matrix room"
+                            } else {
+                                "Share a file link via files.interdo.me"
+                            },
+                        ).clicked() {
                             if let Some(buf_id) = self.selected_buffer_id.clone() {
-                                self.file_share_uploading = true;
-                                self.file_share_error = None;
-                                let duration = self.file_share_duration.clone();
-                                let tx = self.file_share_tx.clone();
-                                tokio::spawn(async move {
-                                    let handle = rfd::AsyncFileDialog::new().pick_file().await;
-                                    let h = match handle {
-                                        None => {
-                                            // User cancelled — signal uploading=false with no error
-                                            let _ = tx.send(Err(String::new()));
-                                            return;
-                                        }
-                                        Some(h) => h,
-                                    };
-                                    let result = crate::ui::fileshare::upload(h.path().to_path_buf(), &duration).await;
-                                    let _ = tx.send(result.map(|url| (buf_id, url)));
-                                });
+                                self.start_file_picker(buf_id);
                             }
                         }
 
@@ -3356,7 +3600,11 @@ impl eframe::App for WeeChatApp {
                                     None,
                                     self.selected_buffer_id.as_deref(),
                                 ) {
-                                    self.upload_clipboard_image_to(buffer_id);
+                                    if let Err(error) =
+                                        self.try_matrix_clipboard_upload(&buffer_id)
+                                    {
+                                        self.file_share_error = Some(error);
+                                    }
                                 }
                             }
 
