@@ -58,3 +58,8 @@ zbus = { version = "4", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
 winres = "0.1"
+
+[patch.crates-io]
+# Keep standard Ctrl/Cmd letter shortcuts working under non-Latin layouts.
+# Remove this override once the equivalent egui-winit fix is in our eframe pin.
+egui-winit = { path = "vendor/egui-winit" }
