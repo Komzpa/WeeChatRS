@@ -859,6 +859,7 @@ mod thread_tests {
             plugin: "matrix".to_owned(),
             kind: "channel".to_owned(),
             server: "matrix".to_owned(),
+            own_nick: "Darafei Praliaskouski".to_owned(),
             messages: VecDeque::new(),
             nicks: Vec::new(),
             mention_candidates: Vec::new(),
@@ -3206,6 +3207,9 @@ impl eframe::App for WeeChatApp {
         let current_matrix_room_id = current_buf.and_then(|b| b.matrix_room_id.clone());
         let current_buffer_is_matrix =
             current_buf.is_some_and(|buffer| buffer.plugin == "matrix");
+        let current_buffer_mention_aliases = current_buf
+            .map(Buffer::own_mention_aliases)
+            .unwrap_or_default();
         let current_buffer_messages = current_buf.map(|b| b.messages.clone());
         let _current_buffer_last_read_id = current_buf.and_then(|b| b.last_read_id.clone());
         let current_buffer_visit_marker_id = current_buf.and_then(|b| b.visit_start_marker_id.clone());
@@ -4099,8 +4103,13 @@ impl eframe::App for WeeChatApp {
                                         marker_shown = true;
                                     }
 
+                                    let is_own_mention = line.highlight
+                                        || message_mentions_any_alias(
+                                            &line.plain_message,
+                                            &current_buffer_mention_aliases,
+                                        );
                                     let (row_bg, row_stroke) =
-                                        highlight_row_style(line.highlight, accent_color);
+                                        highlight_row_style(is_own_mention, accent_color);
                                     let mut row_hovered_url: Option<String> = None;
                                     let row_resp = Frame::none()
                                         .fill(row_bg)

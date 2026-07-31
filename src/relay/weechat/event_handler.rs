@@ -844,6 +844,12 @@ impl WeeChatApp {
                     let mut modes = String::new();
                     let mut kind = String::new();
                     let mut server = String::new();
+                    let own_nick = obj.get("local_variables")
+                        .and_then(|value| value.as_object())
+                        .and_then(|vars| vars.get("nick"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
 
                     let mut messages = std::collections::VecDeque::new();
                     let mut nicks = Vec::new();
@@ -895,6 +901,7 @@ impl WeeChatApp {
                         plugin,
                         kind,
                         server,
+                        own_nick,
                         messages,
                         nicks,
                         mention_candidates,
@@ -1173,6 +1180,13 @@ impl WeeChatApp {
                     }
                     let plugin = buffer.plugin.clone();
                     Self::extract_metadata(obj, &mut buffer.topic, &mut buffer.modes, &mut buffer.kind, &mut buffer.server, &raw_full_name, &plugin);
+                    if let Some(own_nick) = obj.get("local_variables")
+                        .and_then(|value| value.as_object())
+                        .and_then(|vars| vars.get("nick"))
+                        .and_then(|value| value.as_str())
+                    {
+                        buffer.own_nick = own_nick.to_owned();
+                    }
                     buffer.matrix_room_id = matrix_room_id;
                     buffer.matrix_thread_root = matrix_thread_root;
                     if let Some(encoded) = obj.get("local_variables")

@@ -143,6 +143,7 @@ impl Session {
             plugin: "irc".to_string(),
             kind: kind.to_string(),
             server: self.server_name.clone(),
+            own_nick: self.our_nick.clone(),
             messages: VecDeque::new(),
             nicks: Vec::new(),
             mention_candidates: Vec::new(),
