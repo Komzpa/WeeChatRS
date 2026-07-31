@@ -553,6 +553,8 @@ const THREAD_PANEL_MIN_WIDTH: f32 = 280.0;
 const CHAT_PANEL_MIN_WIDTH: f32 = 360.0;
 const COMPACT_MESSAGE_ROW_WIDTH: f32 = 460.0;
 const PREFIX_MESSAGE_GAP: f32 = 8.0;
+const BUFFERS_MIN_AUTO_WIDTH: f32 = 200.0;
+const BUFFERS_MAX_AUTO_WIDTH: f32 = 380.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RightPanelKind {
@@ -3288,11 +3290,34 @@ impl eframe::App for WeeChatApp {
             });
         }
 
-        if self.buffers_width == 0.0 {
-            let buf_font_id = FontId::new(self.font_size, if self.use_monospace { FontFamily::Monospace } else { FontFamily::Proportional });
-            let char_w = ctx.fonts(|f| f.glyph_width(&buf_font_id, 'W'));
-            self.buffers_width = char_w * 20.0 + 20.0;
-        }
+        let buf_font_id = FontId::new(
+            self.font_size,
+            if self.use_monospace {
+                FontFamily::Monospace
+            } else {
+                FontFamily::Proportional
+            },
+        );
+        let longest_buffer_name = self
+            .buffers
+            .iter()
+            .filter(|buffer| !buffer.hidden || self.show_hidden_buffers)
+            .map(|buffer| {
+                ctx.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(
+                            buffer.name.clone(),
+                            buf_font_id.clone(),
+                            Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                })
+            })
+            .fold(0.0_f32, f32::max);
+        let buffers_auto_width = (longest_buffer_name + 88.0)
+            .clamp(BUFFERS_MIN_AUTO_WIDTH, BUFFERS_MAX_AUTO_WIDTH);
+        self.buffers_width = self.buffers_width.max(buffers_auto_width);
         let responsive_right_kind = if self.open_thread_buffer_id.is_some() {
             RightPanelKind::Thread
         } else if self.show_nicklist
@@ -3328,7 +3353,7 @@ impl eframe::App for WeeChatApp {
             let buffers_resp = egui::SidePanel::left("buffers_panel")
                 .resizable(true)
                 .default_width(self.buffers_width.min(responsive_panels.buffers_max_width))
-                .min_width(80.0)
+                .min_width(buffers_auto_width.min(responsive_panels.buffers_max_width).max(80.0))
                 .max_width(responsive_panels.buffers_max_width)
                 .frame(Frame::none().fill(bg_color).inner_margin(Margin::same(10.0)))
                 .show(ctx, |ui| {
