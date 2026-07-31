@@ -32,6 +32,7 @@ pub struct Buffer {
     pub plugin: String,
     pub kind: String,
     pub server: String,
+    pub own_nick: String,
     pub messages: VecDeque<Line>,
     pub nicks: Vec<Nick>,
     pub mention_candidates: Vec<MentionCandidate>,
@@ -56,6 +57,115 @@ impl Buffer {
         self.plugin == "matrix"
             && self.matrix_room_id.is_some()
             && self.matrix_thread_root.is_some()
+    }
+
+    pub fn own_mention_aliases(&self) -> Vec<String> {
+        if self.own_nick.is_empty() {
+            return Vec::new();
+        }
+
+        let mut aliases = vec![self.own_nick.clone()];
+        if self.plugin == "matrix" {
+            if let Some(first_name) = self.own_nick.split_whitespace().next() {
+                if first_name.chars().count() >= 3 {
+                    aliases.push(first_name.to_owned());
+                }
+            }
+            if let Some(own_member) = self
+                .mention_candidates
+                .iter()
+                .find(|candidate| candidate.display_name == self.own_nick)
+            {
+                aliases.push(own_member.user_id.clone());
+                if let Some(localpart) = own_member
+                    .user_id
+                    .strip_prefix('@')
+                    .and_then(|id| id.split(':').next())
+                {
+                    aliases.push(localpart.to_owned());
+                }
+            }
+        }
+        aliases
+    }
+}
+
+pub fn message_mentions_any_alias(message: &str, aliases: &[String]) -> bool {
+    aliases
+        .iter()
+        .any(|alias| contains_word_case_insensitive(message, alias))
+}
+
+fn contains_word_case_insensitive(text: &str, needle: &str) -> bool {
+    let text = text.to_lowercase();
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+
+    text.match_indices(&needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let left_is_word = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+        let right_is_word = text[end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+        !left_is_word && !right_is_word
+    })
+}
+
+#[cfg(test)]
+mod mention_highlight_tests {
+    use super::*;
+
+    fn matrix_buffer() -> Buffer {
+        Buffer {
+            id: "matrix/room".to_owned(),
+            number: 1,
+            name: "#postgis".to_owned(),
+            full_name: "matrix.matrix.room".to_owned(),
+            plugin: "matrix".to_owned(),
+            kind: "channel".to_owned(),
+            server: "matrix".to_owned(),
+            own_nick: "Darafei Praliaskouski".to_owned(),
+            messages: VecDeque::new(),
+            nicks: Vec::new(),
+            mention_candidates: vec![MentionCandidate {
+                display_name: "Darafei Praliaskouski".to_owned(),
+                user_id: "@komzpa:matrix.org".to_owned(),
+            }],
+            activity: BufferActivity::None,
+            unread_count: 0,
+            last_read_id: None,
+            last_markread_ts: None,
+            topic: String::new(),
+            modes: String::new(),
+            hidden: false,
+            muted: false,
+            has_nicklist: true,
+            matrix_room_id: Some("!room:example.org".to_owned()),
+            matrix_thread_root: None,
+            visit_start_marker_id: None,
+        }
+    }
+
+    #[test]
+    fn matrix_display_name_and_mxid_aliases_highlight_own_mentions() {
+        let buffer = matrix_buffer();
+        let aliases = buffer.own_mention_aliases();
+        assert!(message_mentions_any_alias(
+            "whatever Darafei is using",
+            &aliases
+        ));
+        assert!(message_mentions_any_alias("ping @komzpa:matrix.org", &aliases));
+        assert!(message_mentions_any_alias("ping komzpa", &aliases));
+        assert!(!message_mentions_any_alias(
+            "a komzpapost is not a mention",
+            &aliases
+        ));
     }
 }
 
