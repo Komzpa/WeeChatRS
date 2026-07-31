@@ -496,6 +496,70 @@ impl WeeChatApp {
         })
     }
 
+    fn raw_tag_value(
+        obj: &serde_json::Map<String, Value>,
+        prefix: &str,
+    ) -> Option<String> {
+        match obj.get("tags") {
+            Some(Value::Array(tags)) => tags
+                .iter()
+                .filter_map(Value::as_str)
+                .find_map(|tag| tag.strip_prefix(prefix).map(str::to_owned)),
+            Some(Value::String(tags)) => tags
+                .split(',')
+                .map(str::trim)
+                .find_map(|tag| tag.strip_prefix(prefix).map(str::to_owned)),
+            _ => None,
+        }
+    }
+
+    fn decode_hex_utf8(encoded: &str) -> Option<String> {
+        if encoded.len() % 2 != 0 {
+            return None;
+        }
+
+        let bytes = encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16)?;
+                let low = (pair[1] as char).to_digit(16)?;
+                Some(((high << 4) | low) as u8)
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        String::from_utf8(bytes).ok()
+    }
+
+    fn matrix_reply_from_tags(
+        obj: &serde_json::Map<String, Value>,
+    ) -> Option<crate::relay::models::MatrixReplyContext> {
+        use crate::relay::models::{
+            MatrixReplyContext, MatrixReplyLineKind,
+        };
+
+        let kind = if Self::has_tag(obj, "matrix_reply_header") {
+            MatrixReplyLineKind::Header
+        } else if Self::has_tag(obj, "matrix_reply_quote") {
+            MatrixReplyLineKind::Quote
+        } else {
+            return None;
+        };
+        let sender = Self::raw_tag_value(obj, "matrix_reply_sender_hex_")
+            .and_then(|value| Self::decode_hex_utf8(&value));
+        let event_id = Self::raw_tag_value(obj, "matrix_reply_id_")
+            .filter(|value| {
+                value.starts_with('$')
+                    && !value.chars().any(char::is_whitespace)
+            });
+
+        Some(MatrixReplyContext {
+            event_id,
+            sender,
+            kind,
+        })
+    }
+
     fn parse_id(v: &Value) -> Option<String> {
         v.as_i64().map(|i| i.to_string())
             .or_else(|| v.as_f64().map(|f| (f as i64).to_string()))
@@ -887,6 +951,7 @@ impl WeeChatApp {
                 highlight,
             );
             line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
+            line.matrix_reply = Self::matrix_reply_from_tags(obj);
             Some(line)
         }).collect();
 
@@ -1082,6 +1147,7 @@ impl WeeChatApp {
                         is_highlight,
                     );
                     line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
+                    line.matrix_reply = Self::matrix_reply_from_tags(obj);
 
                     let is_selected = self.selected_buffer_id.as_deref() == Some(&buffer_id);
                     let mut notify_data: Option<(String, String, String)> = None;
@@ -1150,6 +1216,9 @@ impl WeeChatApp {
                             if let Some(event_id) = Self::tag_value(obj, "matrix_id_") {
                                 line.matrix_event_id = Some(event_id);
                             }
+                            if let Some(reply) = Self::matrix_reply_from_tags(obj) {
+                                line.matrix_reply = Some(reply);
+                            }
                         } else if displayed {
                             let prefix = obj.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
                             let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -1163,6 +1232,7 @@ impl WeeChatApp {
                                 false,
                             );
                             line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
+                            line.matrix_reply = Self::matrix_reply_from_tags(obj);
                             buffer.messages.push_back(line);
                             if buffer.messages.len() > MAX_STORED_LINES {
                                 buffer.messages.pop_front();
@@ -1178,6 +1248,8 @@ impl WeeChatApp {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use crate::relay::models::MatrixReplyLineKind;
 
     use super::WeeChatApp;
 
@@ -1197,6 +1269,40 @@ mod tests {
         assert_eq!(
             WeeChatApp::tag_value(string.as_object().unwrap(), "matrix_id_"),
             Some("$older:remote.example".to_owned())
+        );
+    }
+
+    #[test]
+    fn matrix_reply_metadata_is_read_from_weechat_tags() {
+        let object = json!({
+            "tags": [
+                "matrix_reply",
+                "matrix_reply_header",
+                "matrix_reply_sender_hex_416c69636520f09f988a",
+                "matrix_reply_id_$original:remote.example"
+            ]
+        });
+        let reply =
+            WeeChatApp::matrix_reply_from_tags(object.as_object().unwrap())
+                .expect("reply metadata");
+
+        assert!(matches!(reply.kind, MatrixReplyLineKind::Header));
+        assert_eq!(reply.sender.as_deref(), Some("Alice 😊"));
+        assert_eq!(
+            reply.event_id.as_deref(),
+            Some("$original:remote.example")
+        );
+    }
+
+    #[test]
+    fn legacy_matrix_reply_line_stays_plain_text() {
+        let object = json!({
+            "tags": ["matrix_reply", "matrix_id_$reply:remote.example"]
+        });
+
+        assert!(
+            WeeChatApp::matrix_reply_from_tags(object.as_object().unwrap())
+                .is_none()
         );
     }
 
