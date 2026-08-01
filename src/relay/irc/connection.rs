@@ -160,6 +160,7 @@ impl Session {
             matrix_room_id: None,
             matrix_thread_root: None,
             matrix_upload_v1: false,
+            matrix_avatar_mxc: None,
             visit_start_marker_id: None,
         }
     }
