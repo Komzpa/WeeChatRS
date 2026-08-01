@@ -256,7 +256,18 @@ fn quote_weechat_argument(value: &str) -> String {
 }
 
 fn is_matrix_media_status_line(message: &str) -> bool {
-    message.contains("/weechatrs/matrix-media/")
+    // The Matrix plugin reports media-command progress through ordinary buffer
+    // lines. They are useful in WeeChat itself, but GUI-owned preview downloads
+    // are implementation detail and must never become chat history. Transport
+    // failures do not include the destination path, so recognize that variant
+    // separately; keep path-bearing user-selected downloads visible.
+    if message.contains("matrix: Error downloading media ") {
+        return true;
+    }
+
+    let is_gui_cache_path = message.contains("weechatrs/matrix-media/")
+        || message.contains("weechatrs\\matrix-media\\");
+    is_gui_cache_path
         && (message.contains("matrix: Downloading media to")
             || message.contains("matrix: Successfully downloaded media to")
             || message.contains("matrix: Error writing media to")
@@ -659,10 +670,19 @@ mod inline_matrix_image_tests {
             "matrix: Successfully downloaded media to /home/user/downloads/image.png"
         ));
         assert!(is_matrix_media_status_line(
-            "matrix: Error writing media to /home/user/.cache/weechatrs/matrix-media/key: AlreadyExists"
+            "matrix: Error writing media to /home/user/.cache/weechatrs/matrix-media/key: Os {\n    code: 17,\n    kind: AlreadyExists,\n    message: \"Файл існує\",\n}"
         ));
         assert!(!is_matrix_media_status_line(
             "matrix: Error writing media to /home/user/downloads/image.png: AlreadyExists"
+        ));
+        assert!(is_matrix_media_status_line(
+            "matrix: Error downloading media Http(Request { request::Error { kind: Decode, source: hyper::Error(Body, Custom { kind: UnexpectedEof, error: IncompleteBody }) } })"
+        ));
+        assert!(is_matrix_media_status_line(
+            r"matrix: Error creating media directory C:\Users\user\AppData\Local\weechatrs\matrix-media\key: AlreadyExists"
+        ));
+        assert!(!is_matrix_media_status_line(
+            "matrix: an ordinary room message mentioning Error downloading media"
         ));
     }
 
