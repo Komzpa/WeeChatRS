@@ -1316,35 +1316,85 @@ mod thread_tests {
     }
 }
 
-fn highlight_row_style(highlight: bool, accent: Color32) -> (Color32, Stroke) {
-    if highlight {
-        (
-            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 48),
-            Stroke::new(
-                1.0,
-                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 140),
-            ),
+fn message_row_shapes(
+    rect: Rect,
+    attention: bool,
+    hovered: bool,
+    accent: Color32,
+    hover_tint: Color32,
+) -> Vec<egui::Shape> {
+    let mut shapes = Vec::with_capacity(2);
+    let fill = if attention {
+        // egui composites in linear colour space, so even a small sRGBA alpha
+        // is quite visible on a dark timeline. Keep this far below selection.
+        let alpha = if hovered { 3 } else { 1 };
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha)
+    } else if hovered {
+        Color32::from_rgba_unmultiplied(
+            hover_tint.r(),
+            hover_tint.g(),
+            hover_tint.b(),
+            1,
         )
     } else {
-        (Color32::TRANSPARENT, Stroke::NONE)
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        shapes.push(egui::Shape::rect_filled(rect, Rounding::same(5.0), fill));
     }
+    if attention {
+        let bar = Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 3.0, rect.max.y));
+        shapes.push(egui::Shape::rect_filled(
+            bar,
+            Rounding::same(2.0),
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 210),
+        ));
+    }
+    shapes
 }
 
 #[cfg(test)]
-mod highlight_row_tests {
+mod message_row_visual_tests {
     use super::*;
 
     #[test]
-    fn highlighted_rows_get_visible_accent_fill_and_border() {
+    fn attention_is_a_soft_fill_with_a_distinct_accent_bar() {
         let accent = Color32::from_rgb(72, 128, 220);
-        let (fill, stroke) = highlight_row_style(true, accent);
-        assert_eq!(fill, Color32::from_rgba_unmultiplied(72, 128, 220, 48));
-        assert_eq!(stroke.width, 1.0);
-        assert_eq!(stroke.color, Color32::from_rgba_unmultiplied(72, 128, 220, 140));
+        let rect = Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 42.0));
+        let shapes = message_row_shapes(rect, true, false, accent, Color32::WHITE);
+        assert_eq!(shapes.len(), 2, "attention needs a fill and a left bar");
+        match &shapes[0] {
+            egui::Shape::Rect(shape) => {
+                assert_eq!(shape.fill, Color32::from_rgba_unmultiplied(72, 128, 220, 1));
+                assert_eq!(shape.stroke, Stroke::NONE);
+            }
+            shape => panic!("unexpected attention background: {shape:?}"),
+        }
+        match &shapes[1] {
+            egui::Shape::Rect(shape) => assert_eq!(shape.rect.width(), 3.0),
+            shape => panic!("unexpected attention marker: {shape:?}"),
+        }
+    }
 
-        let (fill, stroke) = highlight_row_style(false, accent);
-        assert_eq!(fill, Color32::TRANSPARENT);
-        assert_eq!(stroke, Stroke::NONE);
+    #[test]
+    fn ordinary_rows_only_get_a_subtle_fill_while_hovered() {
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 42.0));
+        assert!(message_row_shapes(
+            rect,
+            false,
+            false,
+            Color32::BLUE,
+            Color32::WHITE,
+        )
+        .is_empty());
+        let shapes = message_row_shapes(rect, false, true, Color32::BLUE, Color32::WHITE);
+        match &shapes[0] {
+            egui::Shape::Rect(shape) => {
+                assert_eq!(shape.fill, Color32::from_rgba_unmultiplied(255, 255, 255, 1));
+                assert_eq!(shape.stroke, Stroke::NONE);
+            }
+            shape => panic!("unexpected hover background: {shape:?}"),
+        }
     }
 }
 
@@ -4340,12 +4390,9 @@ impl eframe::App for WeeChatApp {
                                 });
                             }
                             for (index, block) in thread_messages.iter().enumerate() {
-                                Frame::none()
-                                    .fill(if index == 0 {
-                                        accent_color.linear_multiply(0.08)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
+                                let background_shape =
+                                    ui.painter().add(egui::Shape::Noop);
+                                let block_response = Frame::none()
                                     .rounding(Rounding::same(7.0))
                                     .inner_margin(Margin::symmetric(9.0, 7.0))
                                     .show(ui, |ui| {
@@ -4496,6 +4543,16 @@ impl eframe::App for WeeChatApp {
                                             );
                                         }
                                     });
+                                ui.painter().set(
+                                    background_shape,
+                                    egui::Shape::Vec(message_row_shapes(
+                                        block_response.response.rect,
+                                        index == 0,
+                                        block_response.response.contains_pointer(),
+                                        accent_color,
+                                        text_primary,
+                                    )),
+                                );
                                 ui.add_space(3.0);
                             }
                         });
@@ -5501,13 +5558,12 @@ impl eframe::App for WeeChatApp {
                                             &line.plain_message,
                                             &current_buffer_mention_aliases,
                                         );
-                                    let (row_bg, row_stroke) =
-                                        highlight_row_style(is_own_mention, accent_color);
                                     let mut row_hovered_url: Option<String> = None;
+                                    let background_shape =
+                                        ui.painter().add(egui::Shape::Noop);
                                     let row_resp = Frame::none()
-                                        .fill(row_bg)
-                                        .stroke(row_stroke)
-                                        .rounding(Rounding::same(3.0))
+                                        .rounding(Rounding::same(5.0))
+                                        .inner_margin(Margin::symmetric(4.0, 2.0))
                                         .show(ui, |ui| {
                                     let row_width = ui.available_width();
                                     let compact_row = compact_message_row(row_width);
@@ -5736,6 +5792,16 @@ impl eframe::App for WeeChatApp {
                                     let plain_message = line.plain_message.clone();
                                     let plain_prefix = line.plain_prefix.clone();
                                     let interactable = row_resp.response.interact(egui::Sense::click());
+                                    ui.painter().set(
+                                        background_shape,
+                                        egui::Shape::Vec(message_row_shapes(
+                                            interactable.rect,
+                                            is_own_mention,
+                                            interactable.contains_pointer(),
+                                            accent_color,
+                                            text_primary,
+                                        )),
+                                    );
                                     // While the row is hovered (pointer in Middle layer, popup not
                                     // open), keep the stored URL current.  Once the popup opens the
                                     // pointer moves into the Foreground layer so the row is no longer
@@ -5808,6 +5874,7 @@ impl eframe::App for WeeChatApp {
                                             }
                                         }
                                     });
+                                    ui.add_space(1.0);
                                     previous_matrix_event_id =
                                         line.matrix_event_id.clone();
                                 }
