@@ -661,6 +661,15 @@ fn cap_map<V>(map: &mut HashMap<String, V>, cap: usize) {
 pub const LOAD_MORE_LINES: usize = 300;
 pub const MAX_STORED_LINES: usize = 10_000;
 
+pub(crate) fn matrix_history_snapshot_count() -> usize {
+    // Matrix history accumulates in the WeeChat buffer independently of this
+    // GUI. A fixed raw-line increment can reveal no older chat at all when
+    // status/error lines are dense, making a successful page look like a
+    // no-op. One user request should expose all history WeeChat already
+    // retains; the 10k client cap remains the memory and rendering bound.
+    MAX_STORED_LINES
+}
+
 fn next_history_request_count(current: usize, previous_request: usize) -> Option<usize> {
     let base = current.max(previous_request).max(INITIAL_LINES);
     (base < MAX_STORED_LINES).then(|| (base + LOAD_MORE_LINES).min(MAX_STORED_LINES))
@@ -677,9 +686,14 @@ fn should_auto_request_history(current: usize, attempted: bool, rearmed: bool) -
 #[cfg(test)]
 mod scrollback_tests {
     use super::{
-        history_snapshot_is_exhausted, next_history_request_count, INITIAL_LINES,
-        LOAD_MORE_LINES, MAX_STORED_LINES,
+        history_snapshot_is_exhausted, matrix_history_snapshot_count,
+        next_history_request_count, INITIAL_LINES, LOAD_MORE_LINES, MAX_STORED_LINES,
     };
+
+    #[test]
+    fn one_matrix_page_reveals_all_history_already_retained_by_weechat() {
+        assert_eq!(matrix_history_snapshot_count(), MAX_STORED_LINES);
+    }
 
     #[test]
     fn expanding_weechat_snapshot_requests_one_older_page() {
