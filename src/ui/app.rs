@@ -405,7 +405,8 @@ fn clipboard_upload_target(
 
 fn paste_shortcut_pressed(events: &[egui::Event]) -> bool {
     events.iter().any(|event| {
-        matches!(
+        matches!(event, egui::Event::Paste(_))
+            || matches!(
             event,
             egui::Event::Key {
                 key: egui::Key::Paste,
@@ -1192,6 +1193,10 @@ mod thread_tests {
             egui::Event::Paste("hello".to_owned()),
             paste_key,
         ]));
+        assert!(paste_shortcut_pressed(&[egui::Event::Paste(String::new())]));
+        assert!(should_probe_clipboard_image(&[egui::Event::Paste(
+            String::new(),
+        )]));
         assert!(!should_probe_clipboard_image(&[]));
     }
 
@@ -2441,7 +2446,11 @@ impl WeeChatApp {
         Ok(())
     }
 
-    fn start_matrix_clipboard_upload(&mut self, buffer_id: String) -> bool {
+    fn start_matrix_clipboard_upload(
+        &mut self,
+        buffer_id: String,
+        ctx: &egui::Context,
+    ) -> bool {
         if self.file_share_uploading {
             self.file_share_error = Some(
                 "Cannot paste while another attachment is being prepared or uploaded".to_owned(),
@@ -2458,6 +2467,7 @@ impl WeeChatApp {
         self.file_share_uploading = true;
         self.file_share_error = None;
         let tx = self.file_share_tx.clone();
+        let repaint = ctx.clone();
         tokio::spawn(async move {
             let result = match tokio::task::spawn_blocking(crate::ui::fileshare::clipboard_png)
                 .await
@@ -2481,6 +2491,7 @@ impl WeeChatApp {
                 Err(error) => Err(format!("Clipboard worker failed: {error}")),
             };
             let _ = tx.send(result);
+            repaint.request_repaint();
         });
         true
     }
@@ -2730,6 +2741,59 @@ impl WeeChatApp {
                 }
             }
         }
+    }
+
+    fn render_matrix_avatar(
+        &mut self,
+        ui: &mut egui::Ui,
+        buffer_id: &str,
+        profiles: &[MatrixMemberProfile],
+        nick: &str,
+        size: f32,
+        accent_color: Color32,
+        text_color: Color32,
+    ) -> bool {
+        let Some(profile) = matrix_profile_for_nick(profiles, nick) else {
+            return false;
+        };
+
+        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+        if let Some(avatar_mxc) = profile.avatar_mxc.as_ref() {
+            if ui.is_rect_visible(rect) && !self.image_cache.contains_key(avatar_mxc) {
+                self.ensure_matrix_media_loading(
+                    buffer_id,
+                    &MatrixMedia {
+                        mxc_uri: avatar_mxc.clone(),
+                        name: "member-avatar".to_owned(),
+                        kind: "image".to_owned(),
+                    },
+                );
+            }
+            if let Some(ImageState::Loaded(texture)) = self.image_cache.get(avatar_mxc) {
+                ui.put(
+                    rect,
+                    egui::Image::new((texture.id(), egui::Vec2::splat(size)))
+                        .rounding(size / 2.0),
+                );
+                return true;
+            }
+        }
+
+        ui.painter()
+            .circle_filled(rect.center(), size / 2.0, accent_color.gamma_multiply(0.45));
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            profile
+                .display_name
+                .chars()
+                .find(|character| character.is_alphanumeric())
+                .map(|character| character.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_owned()),
+            FontId::new(size * 0.48, FontFamily::Proportional),
+            text_color,
+        );
+        true
     }
 
     fn render_message_content(
@@ -3290,6 +3354,11 @@ impl eframe::App for WeeChatApp {
                 should_probe_clipboard_image(&input.events),
             )
         });
+        if paste_shortcut_this_frame {
+            log::debug!(
+                "clipboard paste attempt captured: native_image_probe={paste_image_this_frame}"
+            );
+        }
 
         if !self.notify_initialized {
             self.notify_initialized = true;
@@ -3417,6 +3486,7 @@ impl eframe::App for WeeChatApp {
                     }
                 }
                 Err(e) if !e.is_empty() => {
+                    log::debug!("clipboard/file-share preparation failed: {e}");
                     self.file_share_error = Some(e);
                 }
                 Err(_) => {}
@@ -4289,6 +4359,19 @@ impl eframe::App for WeeChatApp {
                                             ui.add_space(3.0);
                                         }
                                         ui.horizontal_wrapped(|ui| {
+                                            if let Some(profiles) =
+                                                current_buffer_member_profiles.as_deref()
+                                            {
+                                                self.render_matrix_avatar(
+                                                    ui,
+                                                    &thread.id,
+                                                    profiles,
+                                                    &block.prefix,
+                                                    24.0,
+                                                    accent_color,
+                                                    Color32::WHITE,
+                                                );
+                                            }
                                             for section in ANSIParser::parse(&block.prefix) {
                                                 let format = section
                                                     .style
@@ -4450,18 +4533,27 @@ impl eframe::App for WeeChatApp {
                                 self.start_file_picker(buffer_id);
                             }
                         }
+                        let input_id = ui.make_persistent_id("thread_composer_input");
+                        let selection_before_click = crate::ui::input::input_selection(
+                            ui.ctx(),
+                            input_id,
+                            &self.thread_input_text,
+                        );
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.thread_input_text)
+                                .id(input_id)
                                 .hint_text("Reply in thread…")
                                 .margin(Margin::symmetric(8.0, 5.0))
                                 .desired_width((ui.available_width() - 86.0).max(40.0)),
                         );
-                        crate::ui::input::input_context_menu(
+                        let context_paste_image = crate::ui::input::input_context_menu(
                             &response,
                             &mut self.thread_input_text,
+                            selection_before_click,
                         );
                         let paste_shortcut = response.has_focus() && paste_shortcut_this_frame;
-                        let paste_image = response.has_focus() && paste_image_this_frame;
+                        let paste_image = context_paste_image
+                            || (response.has_focus() && paste_image_this_frame);
                         if paste_shortcut && !paste_image {
                             self.file_share_error = None;
                         } else if paste_image {
@@ -4470,7 +4562,7 @@ impl eframe::App for WeeChatApp {
                                 self.open_thread_buffer_id.as_deref(),
                                 current_buffer_id.as_deref(),
                             ) {
-                                self.start_matrix_clipboard_upload(buffer_id);
+                                self.start_matrix_clipboard_upload(buffer_id, ctx);
                             } else {
                                 self.file_share_error = Some(
                                     "Cannot paste: this thread is not ready for attachments"
@@ -4547,7 +4639,23 @@ impl eframe::App for WeeChatApp {
                                     } else { text };
                                     let sections = ANSIParser::parse(&input);
                                     let label_res = ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        if current_buffer_is_matrix {
+                                            if let (Some(buffer_id), Some(profiles)) = (
+                                                current_buffer_id.as_deref(),
+                                                current_buffer_member_profiles.as_deref(),
+                                            ) {
+                                                self.render_matrix_avatar(
+                                                    ui,
+                                                    buffer_id,
+                                                    profiles,
+                                                    &nick.name,
+                                                    22.0,
+                                                    accent_color,
+                                                    Color32::WHITE,
+                                                );
+                                            }
+                                        }
+                                        ui.spacing_mut().item_spacing.x = 4.0;
                                         for s in sections {
                                             let mut fmt = s.style.to_format(font_id.clone(), &render_theme);
                                             if nick.away {
@@ -4887,17 +4995,29 @@ impl eframe::App for WeeChatApp {
                         }
 
                         ui.add_enabled_ui(selected_buffer_connected, |ui| {
+                            let input_id = ui.make_persistent_id("room_composer_input");
+                            let selection_before_click = crate::ui::input::input_selection(
+                                ui.ctx(),
+                                input_id,
+                                &self.input_text,
+                            );
                             let text_edit = egui::TextEdit::singleline(&mut self.input_text)
+                                .id(input_id)
                                 .hint_text(hint)
                                 .margin(Margin::symmetric(8.0, 4.0))
                                 .lock_focus(true)
                                 .desired_width((ui.available_width() - 80.0).max(40.0));
 
                             let res = ui.add(text_edit);
-                            crate::ui::input::input_context_menu(&res, &mut self.input_text);
+                            let context_paste_image = crate::ui::input::input_context_menu(
+                                &res,
+                                &mut self.input_text,
+                                selection_before_click,
+                            );
 
                             let paste_shortcut = res.has_focus() && paste_shortcut_this_frame;
-                            let paste_image = res.has_focus() && paste_image_this_frame;
+                            let paste_image = context_paste_image
+                                || (res.has_focus() && paste_image_this_frame);
                             if paste_shortcut && !paste_image {
                                 self.file_share_error = None;
                             } else if paste_image {
@@ -4906,7 +5026,7 @@ impl eframe::App for WeeChatApp {
                                     None,
                                     self.selected_buffer_id.as_deref(),
                                 ) {
-                                    self.start_matrix_clipboard_upload(buffer_id);
+                                    self.start_matrix_clipboard_upload(buffer_id, ctx);
                                 } else {
                                     self.file_share_error = Some(
                                         "Cannot paste: no chat is selected".to_owned(),
@@ -5403,6 +5523,27 @@ impl eframe::App for WeeChatApp {
                                                 }
                                                 ui.label(egui::RichText::new(line.timestamp.with_timezone(&chrono::Local).format("%H:%M:%S").to_string()).font(font_id.clone()).color(text_muted));
                                             });
+                                        }
+                                        if current_buffer_is_matrix {
+                                            if let (Some(buffer_id), Some(profiles)) = (
+                                                current_buffer_id.as_deref(),
+                                                current_buffer_member_profiles.as_deref(),
+                                            ) {
+                                                ui.scope(|ui| {
+                                                    if continues_matrix_event {
+                                                        ui.set_opacity(0.0);
+                                                    }
+                                                    self.render_matrix_avatar(
+                                                        ui,
+                                                        buffer_id,
+                                                        profiles,
+                                                        &line.plain_prefix,
+                                                        24.0,
+                                                        accent_color,
+                                                        Color32::WHITE,
+                                                    );
+                                                });
+                                            }
                                         }
                                         let prefix_sections = &line.parsed_prefix;
 

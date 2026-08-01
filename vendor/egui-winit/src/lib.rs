@@ -746,12 +746,7 @@ impl State {
                     self.egui_input.events.push(egui::Event::Copy);
                     return;
                 } else if is_paste_command(self.egui_input.modifiers, logical_key) {
-                    if let Some(contents) = self.clipboard.get() {
-                        let contents = contents.replace("\r\n", "\n");
-                        if !contents.is_empty() {
-                            self.egui_input.events.push(egui::Event::Paste(contents));
-                        }
-                    }
+                    push_paste_attempt(&mut self.egui_input.events, self.clipboard.get());
                     // Also emit the key event below. Native applications may
                     // own non-text clipboard formats (for example an image)
                     // while TextEdit still needs the normalized Paste event
@@ -1017,7 +1012,7 @@ fn command_shortcut_key(
 
 #[cfg(test)]
 mod weechatrs_shortcut_tests {
-    use super::command_shortcut_key;
+    use super::{command_shortcut_key, push_paste_attempt};
 
     #[test]
     fn command_letters_fall_back_to_physical_keys_on_non_latin_layouts() {
@@ -1049,6 +1044,20 @@ mod weechatrs_shortcut_tests {
             None,
         );
     }
+
+    #[test]
+    fn non_text_clipboard_still_emits_an_observable_paste_attempt() {
+        let mut events = Vec::new();
+        push_paste_attempt(&mut events, None);
+        assert_eq!(events, [egui::Event::Paste(String::new())]);
+    }
+
+    #[test]
+    fn text_clipboard_emits_normalized_paste_contents() {
+        let mut events = Vec::new();
+        push_paste_attempt(&mut events, Some("one\r\ntwo".to_owned()));
+        assert_eq!(events, [egui::Event::Paste("one\ntwo".to_owned())]);
+    }
 }
 
 fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
@@ -1067,6 +1076,15 @@ fn is_paste_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
     keycode == egui::Key::Paste
         || (modifiers.command && keycode == egui::Key::V)
         || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Insert)
+}
+
+/// Preserve the paste gesture even when the platform text reader cannot decode
+/// the current clipboard format. Native applications can then handle images or
+/// show a useful error instead of receiving no event at all.
+fn push_paste_attempt(events: &mut Vec<egui::Event>, contents: Option<String>) {
+    events.push(egui::Event::Paste(
+        contents.unwrap_or_default().replace("\r\n", "\n"),
+    ));
 }
 
 fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::PointerButton> {
