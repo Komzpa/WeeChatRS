@@ -67,6 +67,10 @@ fn sort_lines_chronologically(lines: &mut [Line]) {
     lines.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
 }
 
+fn should_reveal_own_message(is_self_msg: bool, displayed: bool, is_selected: bool) -> bool {
+    is_self_msg && displayed && is_selected
+}
+
 fn buffer_group_key(buffer: &Buffer) -> (String, String) {
     let connection = buffer.id.split('/').next().unwrap_or_default();
     (connection.to_owned(), buffer.server.clone())
@@ -1796,6 +1800,9 @@ impl WeeChatApp {
                             }
                         }
                     }
+                    if should_reveal_own_message(is_self_msg, displayed, is_selected) {
+                        self.force_scroll_to_bottom_buffer_id = Some(buffer_id.clone());
+                    }
                     if let Some((name, p, m)) = notify_data {
                         self.notify_highlight(&buffer_id, &name, &p, &m);
                     }
@@ -1896,7 +1903,8 @@ mod tests {
 
     use super::{
         apply_saved_buffer_order, buffer_groups_are_valid, buffer_metadata_refresh,
-        matrix_history_page_status, sort_lines_chronologically, BufferMetadataRefresh, WeeChatApp,
+        matrix_history_page_status, should_reveal_own_message, sort_lines_chronologically,
+        BufferMetadataRefresh, WeeChatApp,
     };
 
     fn sidebar_buffer(id: &str, number: i32, server: &str, kind: &str) -> Buffer {
@@ -2065,6 +2073,14 @@ mod tests {
             Some((0, true))
         );
         assert_eq!(matrix_history_page_status("ordinary message"), None);
+    }
+
+    #[test]
+    fn only_visible_own_messages_in_the_selected_chat_force_reveal() {
+        assert!(should_reveal_own_message(true, true, true));
+        assert!(!should_reveal_own_message(false, true, true));
+        assert!(!should_reveal_own_message(true, false, true));
+        assert!(!should_reveal_own_message(true, true, false));
     }
 
     #[test]
