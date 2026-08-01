@@ -20,6 +20,20 @@ fn selected_char_range(ctx: &egui::Context, id: egui::Id, text: &str) -> (usize,
     (start.index.min(end), finish.index.min(end))
 }
 
+/// Snapshot a non-empty editor selection before TextEdit processes a secondary
+/// click. egui 0.27 treats any pointer press as a cursor move, so without this
+/// snapshot opening the desktop edit menu destroys the text it is meant to act
+/// on.
+pub(crate) fn input_selection(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &str,
+) -> Option<CCursorRange> {
+    let range = TextEditState::load(ctx, id)?.cursor.char_range()?;
+    let [start, end] = range.sorted();
+    (start.index < end.index && end.index <= text.chars().count()).then_some(range)
+}
+
 fn char_to_byte(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
@@ -132,7 +146,22 @@ fn restore_undo_state(ctx: &egui::Context, id: egui::Id, text: &mut String, redo
 /// Add the conventional desktop edit menu to a chat input. Keeping this in one
 /// helper ensures the room composer and thread composer have identical editing
 /// behavior.
-pub(crate) fn input_context_menu(response: &egui::Response, text: &mut String) {
+pub(crate) fn input_context_menu(
+    response: &egui::Response,
+    text: &mut String,
+    selection_before_click: Option<CCursorRange>,
+) -> bool {
+    let secondary_pressed = response.hovered()
+        && response
+            .ctx
+            .input(|input| input.pointer.secondary_pressed());
+    if secondary_pressed || response.secondary_clicked() {
+        if let Some(selection) = selection_before_click {
+            store_cursor(&response.ctx, response.id, selection);
+        }
+    }
+
+    let mut probe_non_text_clipboard = false;
     response.context_menu(|ui| {
         let ctx = ui.ctx().clone();
         let id = response.id;
@@ -194,20 +223,21 @@ pub(crate) fn input_context_menu(response: &egui::Response, text: &mut String) {
             ui.close_menu();
         }
 
-        let clipboard_text = arboard::Clipboard::new()
-            .and_then(|mut clipboard| clipboard.get_text())
-            .ok()
-            .filter(|contents| !contents.is_empty());
         if ui
-            .add_enabled(
-                clipboard_text.is_some(),
-                egui::Button::new("Paste").shortcut_text("Ctrl+V"),
-            )
+            .add(egui::Button::new("Paste").shortcut_text("Ctrl+V"))
             .clicked()
         {
-            if let Some(clipboard_text) = clipboard_text {
-                let cursor = replace_selection(text, start, end, &clipboard_text);
-                store_cursor(&ctx, id, CCursorRange::one(CCursor::new(cursor)));
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                Ok(clipboard_text) if !clipboard_text.is_empty() => {
+                    let cursor = replace_selection(text, start, end, &clipboard_text);
+                    store_cursor(&ctx, id, CCursorRange::one(CCursor::new(cursor)));
+                }
+                _ => {
+                    // Images, empty clipboards, and unsupported MIME types all
+                    // continue through the shared native probe. It either
+                    // prepares the attachment or produces a detailed error.
+                    probe_non_text_clipboard = true;
+                }
             }
             ui.close_menu();
         }
@@ -235,6 +265,7 @@ pub(crate) fn input_context_menu(response: &egui::Response, text: &mut String) {
             ui.close_menu();
         }
     });
+    probe_non_text_clipboard
 }
 
 fn matrix_reply_command(event_id: &str, message: &str) -> String {
@@ -815,9 +846,12 @@ impl WeeChatApp {
 mod tests {
     use super::{
         apply_native_completion, contains_complete_mention, matching_mentions,
-        matrix_reply_command, mention_query, replace_selection, selected_text,
+        input_context_menu, input_selection, matrix_reply_command, mention_query,
+        replace_selection, selected_text, store_cursor,
     };
     use crate::relay::models::MentionCandidate;
+    use egui::text::{CCursor, CCursorRange};
+    use egui::text_edit::TextEditState;
 
     fn candidate(display_name: &str, user_id: &str) -> MentionCandidate {
         MentionCandidate {
@@ -900,6 +934,85 @@ mod tests {
         let cursor = replace_selection(&mut text, 1, 4, "🌍");
         assert_eq!(text, "a🌍z");
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn secondary_click_keeps_the_existing_editor_selection() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("context-menu-selection-test");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 120.0));
+        let mut text = "copy this text".to_owned();
+        let mut click_position = egui::Pos2::ZERO;
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui.add(egui::TextEdit::singleline(&mut text).id(id));
+                    click_position = response.rect.center();
+                });
+            },
+        );
+
+        let selection = CCursorRange::two(CCursor::new(0), CCursor::new(9));
+        store_cursor(&ctx, id, selection);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(click_position),
+                    egui::Event::PointerButton {
+                        pos: click_position,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let before = input_selection(ctx, id, &text);
+                    let response = ui.add(egui::TextEdit::singleline(&mut text).id(id));
+                    input_context_menu(&response, &mut text, before);
+                });
+            },
+        );
+
+        assert_eq!(
+            TextEditState::load(&ctx, id)
+                .and_then(|state| state.cursor.char_range()),
+            Some(selection),
+        );
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos: click_position,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let before = input_selection(ctx, id, &text);
+                    let response = ui.add(egui::TextEdit::singleline(&mut text).id(id));
+                    input_context_menu(&response, &mut text, before);
+                });
+            },
+        );
+
+        assert_eq!(
+            TextEditState::load(&ctx, id)
+                .and_then(|state| state.cursor.char_range()),
+            Some(selection),
+        );
     }
 
     #[test]
