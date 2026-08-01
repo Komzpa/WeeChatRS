@@ -3,7 +3,8 @@ use crate::relay::models::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{
     history_snapshot_is_exhausted, is_restorable_chat_buffer, preferred_chat_buffer_id,
-    CommandCompletionState, SavedReadMarker, WeeChatApp, LOAD_MORE_LINES, MAX_STORED_LINES,
+    matrix_history_snapshot_count, CommandCompletionState, SavedReadMarker, WeeChatApp,
+    LOAD_MORE_LINES, MAX_STORED_LINES,
 };
 use chrono::{Utc, DateTime, Local};
 use serde_json::Value;
@@ -1582,10 +1583,7 @@ impl WeeChatApp {
                                 self.history_exhausted_buffer_ids.insert(buffer_id.clone());
                             }
                             if added > 0 {
-                                let current_len = self
-                                    .buffer_by_id(&buffer_id)
-                                    .map_or(added, |buffer| buffer.messages.len());
-                                let count = (current_len + LOAD_MORE_LINES).min(MAX_STORED_LINES);
+                                let count = matrix_history_snapshot_count();
                                 self.history_request_counts.insert(buffer_id.clone(), count);
                                 if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
                                     // Matrix rewrites physical WeeChat lines while sorting the
