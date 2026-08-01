@@ -258,7 +258,21 @@ fn quote_weechat_argument(value: &str) -> String {
 fn is_matrix_media_status_line(message: &str) -> bool {
     message.contains("/weechatrs/matrix-media/")
         && (message.contains("matrix: Downloading media to")
-            || message.contains("matrix: Successfully downloaded media to"))
+            || message.contains("matrix: Successfully downloaded media to")
+            || message.contains("matrix: Error writing media to")
+            || message.contains("matrix: Error creating media directory"))
+}
+
+fn begin_matrix_media_load(
+    image_cache: &mut HashMap<String, ImageState>,
+    pending: &mut HashSet<String>,
+    cache_key: &str,
+) -> bool {
+    if image_cache.contains_key(cache_key) || !pending.insert(cache_key.to_owned()) {
+        return false;
+    }
+    image_cache.insert(cache_key.to_owned(), ImageState::Loading);
+    true
 }
 
 async fn wait_for_matrix_media(path: &Path) -> Result<Vec<u8>, String> {
@@ -480,15 +494,16 @@ fn response_primary_clicked(ui: &egui::Ui, response: &egui::Response) -> bool {
 #[cfg(test)]
 mod inline_matrix_image_tests {
     use super::{
-        avatar_thumbnail,
+        avatar_thumbnail, begin_matrix_media_load,
         inline_image_dimensions_allowed,
         inline_image_display_size, inline_image_preview_size, is_matrix_media_status_line,
-        matrix_image_bytes_complete, matrix_media_cache_path, prefix_span_layout,
+        matrix_image_bytes_complete, matrix_media_cache_path, prefix_span_layout, ImageState,
         primary_click_hits_rect,
         quote_weechat_argument,
         update_prefix_column_width,
     };
     use egui::Vec2;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn avatar_thumbnail_center_crops_then_lanczos_prefilters() {
@@ -643,6 +658,31 @@ mod inline_matrix_image_tests {
         assert!(!is_matrix_media_status_line(
             "matrix: Successfully downloaded media to /home/user/downloads/image.png"
         ));
+        assert!(is_matrix_media_status_line(
+            "matrix: Error writing media to /home/user/.cache/weechatrs/matrix-media/key: AlreadyExists"
+        ));
+        assert!(!is_matrix_media_status_line(
+            "matrix: Error writing media to /home/user/downloads/image.png: AlreadyExists"
+        ));
+    }
+
+    #[test]
+    fn matrix_media_request_survives_image_cache_eviction() {
+        let key = "mxc://matrix.org/avatar";
+        let mut image_cache = HashMap::new();
+        let mut pending = HashSet::new();
+
+        assert!(begin_matrix_media_load(&mut image_cache, &mut pending, key));
+        assert!(matches!(image_cache.get(key), Some(ImageState::Loading)));
+
+        // The bounded texture cache may evict a loading placeholder. The
+        // independent request set must still prevent a second relay download
+        // from targeting the same create-new cache path.
+        image_cache.remove(key);
+        assert!(!begin_matrix_media_load(&mut image_cache, &mut pending, key));
+
+        pending.remove(key);
+        assert!(begin_matrix_media_load(&mut image_cache, &mut pending, key));
     }
 }
 
@@ -2231,6 +2271,10 @@ pub struct WeeChatApp {
 
     // Image preview state
     pub(crate) image_cache: HashMap<String, ImageState>,
+    /// Matrix downloads already requested from the relay. This is deliberately
+    /// independent from the bounded texture cache: evicting a Loading texture
+    /// must not enqueue another create-new write to the same cache path.
+    pub(crate) pending_matrix_media: HashSet<String>,
     /// Prefiltered square textures for 22-24 px Matrix sender/nick avatars.
     /// Full-resolution textures stay in `image_cache` for the profile card.
     pub(crate) avatar_texture_cache: HashMap<String, egui::TextureHandle>,
@@ -2980,6 +3024,7 @@ impl WeeChatApp {
             opacity: settings.opacity,
             show_hidden_buffers: settings.show_hidden_buffers,
             image_cache: HashMap::new(),
+            pending_matrix_media: HashSet::new(),
             avatar_texture_cache: HashMap::new(),
             avatar_image_keys: HashSet::new(),
             image_expanded: HashSet::new(),
@@ -3371,11 +3416,13 @@ impl WeeChatApp {
     ) {
         let cache_key = media.mxc_uri.clone();
         self.image_expanded.insert(cache_key.clone());
-        if self.image_cache.contains_key(&cache_key) {
+        if !begin_matrix_media_load(
+            &mut self.image_cache,
+            &mut self.pending_matrix_media,
+            &cache_key,
+        ) {
             return;
         }
-        self.image_cache
-            .insert(cache_key.clone(), ImageState::Loading);
 
         let path = matrix_media_cache_path(&media.mxc_uri);
         let parent_ready = path
@@ -4252,6 +4299,7 @@ impl eframe::App for WeeChatApp {
         }
 
         while let Ok((url, result)) = self.image_rx.try_recv() {
+            self.pending_matrix_media.remove(&url);
             match result {
                 Ok(bytes) => {
                     match validate_inline_image_dimensions(&bytes)
