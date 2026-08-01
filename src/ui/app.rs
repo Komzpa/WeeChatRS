@@ -1095,20 +1095,143 @@ pub(crate) fn preferred_chat_buffer_id(
     buffers: &[Buffer],
     last_chat_buffer_name: Option<&str>,
 ) -> Option<String> {
+    let replaced_room_ids = replaced_matrix_room_ids(buffers);
     last_chat_buffer_name
         .and_then(|name| buffers.iter().find(|buffer| {
-            is_restorable_chat_buffer(buffer) && buffer.full_name == name
+            is_restorable_chat_buffer(buffer)
+                && !buffer
+                    .matrix_room_id
+                    .as_ref()
+                    .is_some_and(|room_id| replaced_room_ids.contains(room_id))
+                && buffer.full_name == name
         }))
-        .or_else(|| buffers.iter().find(|buffer| is_restorable_chat_buffer(buffer)))
+        .or_else(|| buffers.iter().find(|buffer| {
+            is_restorable_chat_buffer(buffer)
+                && !buffer
+                    .matrix_room_id
+                    .as_ref()
+                    .is_some_and(|room_id| replaced_room_ids.contains(room_id))
+        }))
         .map(|buffer| buffer.id.clone())
+}
+
+fn replaced_matrix_room_ids(buffers: &[Buffer]) -> HashSet<String> {
+    let joined_room_ids: HashSet<&str> = buffers
+        .iter()
+        .filter_map(|buffer| buffer.matrix_room_id.as_deref())
+        .collect();
+    buffers
+        .iter()
+        .filter_map(|buffer| {
+            buffer
+                .matrix_replacement_room_id
+                .as_deref()
+                .filter(|replacement| joined_room_ids.contains(replacement))
+                .and(buffer.matrix_room_id.as_deref())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+pub(crate) fn replacement_buffer_id(
+    buffers: &[Buffer],
+    current_buffer_id: &str,
+) -> Option<String> {
+    let current = buffers.iter().find(|buffer| buffer.id == current_buffer_id)?;
+    let replacement_room_id = current.matrix_replacement_room_id.as_deref()?;
+    let connection = current_buffer_id.split_once('/').map(|(prefix, _)| prefix);
+    buffers
+        .iter()
+        .find(|buffer| {
+            !buffer.is_matrix_thread()
+                && buffer.matrix_room_id.as_deref() == Some(replacement_room_id)
+                && connection.is_none_or(|prefix| {
+                    buffer.id.split_once('/').map(|(candidate, _)| candidate) == Some(prefix)
+                })
+        })
+        .map(|buffer| buffer.id.clone())
+}
+
+fn predecessor_buffer_ids(buffers: &[Buffer], current_buffer_id: &str) -> Vec<String> {
+    let connection = current_buffer_id.split_once('/').map(|(prefix, _)| prefix);
+    let mut ids = Vec::new();
+    let mut seen_room_ids = HashSet::new();
+    let mut current = buffers.iter().find(|buffer| buffer.id == current_buffer_id);
+
+    while let Some(predecessor_room_id) =
+        current.and_then(|buffer| buffer.matrix_predecessor_room_id.as_deref())
+    {
+        if !seen_room_ids.insert(predecessor_room_id.to_owned()) {
+            break;
+        }
+        let Some(predecessor) = buffers.iter().find(|buffer| {
+            !buffer.is_matrix_thread()
+                && buffer.matrix_room_id.as_deref() == Some(predecessor_room_id)
+                && connection.is_none_or(|prefix| {
+                    buffer.id.split_once('/').map(|(candidate, _)| candidate) == Some(prefix)
+                })
+        }) else {
+            break;
+        };
+        ids.push(predecessor.id.clone());
+        current = Some(predecessor);
+    }
+    ids
+}
+
+fn upgrade_history_load_buffer_id(
+    buffers: &[Buffer],
+    current_buffer_id: &str,
+    exhausted_buffer_ids: &HashSet<String>,
+) -> Option<String> {
+    std::iter::once(current_buffer_id.to_owned())
+        .chain(predecessor_buffer_ids(buffers, current_buffer_id))
+        .find(|buffer_id| !exhausted_buffer_ids.contains(buffer_id))
+}
+
+fn composed_upgrade_history(
+    buffers: &[Buffer],
+    current_buffer_id: &str,
+) -> (VecDeque<Line>, HashSet<String>) {
+    let Some(current) = buffers.iter().find(|buffer| buffer.id == current_buffer_id) else {
+        return (VecDeque::new(), HashSet::new());
+    };
+    let mut inherited_line_ids = HashSet::new();
+    let mut messages: Vec<Line> = predecessor_buffer_ids(buffers, current_buffer_id)
+        .into_iter()
+        .rev()
+        .filter_map(|buffer_id| buffers.iter().find(|buffer| buffer.id == buffer_id))
+        .flat_map(|buffer| buffer.messages.iter())
+        .map(|line| {
+            inherited_line_ids.insert(line.id.clone());
+            line.clone()
+        })
+        .chain(current.messages.iter().cloned())
+        .collect();
+    messages.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    let mut seen_line_ids = HashSet::new();
+    messages.retain(|line| seen_line_ids.insert(line.id.clone()));
+    if messages.len() > MAX_STORED_LINES {
+        messages.drain(0..messages.len() - MAX_STORED_LINES);
+    }
+    inherited_line_ids.retain(|line_id| messages.iter().any(|line| line.id == *line_id));
+    (messages.into(), inherited_line_ids)
 }
 
 fn buffer_visible_in_sidebar(
     buffer: &Buffer,
     show_hidden_buffers: bool,
     collapsed_servers: &HashSet<String>,
+    replaced_room_ids: &HashSet<String>,
 ) -> bool {
-    if buffer.is_matrix_thread() || (buffer.hidden && !show_hidden_buffers) {
+    if buffer.is_matrix_thread()
+        || ((buffer.hidden
+            || buffer
+                .matrix_room_id
+                .as_ref()
+                .is_some_and(|room_id| replaced_room_ids.contains(room_id)))
+            && !show_hidden_buffers)
+    {
         return false;
     }
     let is_root = buffer.kind == "server" || buffer.kind == "core";
@@ -1560,6 +1683,8 @@ mod thread_tests {
             muted: false,
             has_nicklist: false,
             matrix_room_id: Some("!room:example.org".to_owned()),
+            matrix_predecessor_room_id: None,
+            matrix_replacement_room_id: None,
             matrix_thread_root: Some("$root:example.org".to_owned()),
             matrix_upload_v1: true,
             matrix_avatar_mxc: None,
@@ -2377,9 +2502,10 @@ impl SavedReadMarker {
 #[cfg(test)]
 mod saved_read_marker_tests {
     use super::{
-        buffer_visible_in_sidebar, preferred_chat_buffer_id, visit_marker_location, AppSettings,
-        Buffer, BufferActivity, Line, SavedReadMarker, VisitMarkerLocation,
-        BEFORE_FIRST_LOADED_LINE_ID,
+        buffer_visible_in_sidebar, composed_upgrade_history, preferred_chat_buffer_id,
+        replaced_matrix_room_ids, replacement_buffer_id, upgrade_history_load_buffer_id,
+        visit_marker_location, AppSettings, Buffer, BufferActivity, Line, SavedReadMarker,
+        VisitMarkerLocation, BEFORE_FIRST_LOADED_LINE_ID,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::{HashSet, VecDeque};
@@ -2419,6 +2545,8 @@ mod saved_read_marker_tests {
             muted: false,
             has_nicklist: true,
             matrix_room_id: None,
+            matrix_predecessor_room_id: None,
+            matrix_replacement_room_id: None,
             matrix_thread_root: None,
             matrix_upload_v1: false,
             matrix_avatar_mxc: None,
@@ -2469,6 +2597,78 @@ mod saved_read_marker_tests {
     }
 
     #[test]
+    fn matrix_room_upgrade_is_one_visible_chat_with_read_only_predecessor_history() {
+        let mut predecessor = buffer(
+            "local/old",
+            "local/matrix.matrix.!old:example.org",
+            "channel",
+        );
+        predecessor.matrix_room_id = Some("!old:example.org".to_owned());
+        predecessor.matrix_replacement_room_id = Some("!new:example.org".to_owned());
+        predecessor.messages.push_back(line("old-history", 10));
+        predecessor.messages.push_back(line("late-old-message", 40));
+
+        let mut successor = buffer(
+            "local/new",
+            "local/matrix.matrix.!new:example.org",
+            "channel",
+        );
+        successor.matrix_room_id = Some("!new:example.org".to_owned());
+        successor.matrix_predecessor_room_id = Some("!old:example.org".to_owned());
+        successor.messages.push_back(line("new-history", 20));
+        successor.messages.push_back(line("new-latest", 30));
+
+        let mut thread = buffer(
+            "local/new-thread",
+            "local/matrix.matrix.!new:example.org.thread.root",
+            "channel",
+        );
+        thread.matrix_room_id = Some("!new:example.org".to_owned());
+        thread.matrix_thread_root = Some("$root:example.org".to_owned());
+
+        let buffers = vec![predecessor, thread, successor];
+        let replaced = replaced_matrix_room_ids(&buffers);
+        assert!(replaced.contains("!old:example.org"));
+        assert_eq!(
+            replacement_buffer_id(&buffers, "local/old").as_deref(),
+            Some("local/new"),
+        );
+        assert_eq!(
+            preferred_chat_buffer_id(
+                &buffers,
+                Some("local/matrix.matrix.!old:example.org"),
+            )
+            .as_deref(),
+            Some("local/new"),
+        );
+
+        let (messages, inherited) = composed_upgrade_history(&buffers, "local/new");
+        let ids = messages.iter().map(|line| line.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "old-history",
+                "new-history",
+                "new-latest",
+                "late-old-message",
+            ],
+        );
+        assert!(inherited.contains("old-history"));
+        assert!(inherited.contains("late-old-message"));
+
+        let mut exhausted = HashSet::new();
+        assert_eq!(
+            upgrade_history_load_buffer_id(&buffers, "local/new", &exhausted).as_deref(),
+            Some("local/new"),
+        );
+        exhausted.insert("local/new".to_owned());
+        assert_eq!(
+            upgrade_history_load_buffer_id(&buffers, "local/new", &exhausted).as_deref(),
+            Some("local/old"),
+        );
+    }
+
+    #[test]
     fn last_chat_restore_falls_back_when_the_saved_room_disappeared() {
         let first_visible = buffer(
             "local/other",
@@ -2496,11 +2696,12 @@ mod saved_read_marker_tests {
         thread.matrix_thread_root = Some("$root:example.org".to_owned());
 
         let collapsed = HashSet::from(["matrix".to_owned()]);
-        assert!(buffer_visible_in_sidebar(&root, false, &collapsed));
-        assert!(!buffer_visible_in_sidebar(&child, false, &collapsed));
-        assert!(!buffer_visible_in_sidebar(&hidden, false, &HashSet::new()));
-        assert!(buffer_visible_in_sidebar(&hidden, true, &HashSet::new()));
-        assert!(!buffer_visible_in_sidebar(&thread, true, &HashSet::new()));
+        let replaced = HashSet::new();
+        assert!(buffer_visible_in_sidebar(&root, false, &collapsed, &replaced));
+        assert!(!buffer_visible_in_sidebar(&child, false, &collapsed, &replaced));
+        assert!(!buffer_visible_in_sidebar(&hidden, false, &HashSet::new(), &replaced));
+        assert!(buffer_visible_in_sidebar(&hidden, true, &HashSet::new(), &replaced));
+        assert!(!buffer_visible_in_sidebar(&thread, true, &HashSet::new(), &replaced));
     }
 
     #[test]
@@ -2799,6 +3000,11 @@ impl WeeChatApp {
         buffer_supports_matrix_upload(self.buffer_by_id(buffer_id))
     }
 
+    pub(crate) fn effective_send_buffer_id(&self, buffer_id: &str) -> String {
+        replacement_buffer_id(&self.buffers, buffer_id)
+            .unwrap_or_else(|| buffer_id.to_owned())
+    }
+
     fn send_matrix_attachment(
         &self,
         buffer_id: &str,
@@ -2806,16 +3012,17 @@ impl WeeChatApp {
         mime: &str,
         bytes: &[u8],
     ) -> Result<(), String> {
-        if !self.is_matrix_buffer(buffer_id) {
+        let buffer_id = self.effective_send_buffer_id(buffer_id);
+        if !self.is_matrix_buffer(&buffer_id) {
             return Err("Attachment target is not a Matrix buffer".to_owned());
         }
-        if !self.supports_matrix_upload(buffer_id) {
+        if !self.supports_matrix_upload(&buffer_id) {
             return Err(
                 "Cannot send this attachment: the Matrix backend does not support native uploads. Update or restart the Matrix plugin."
                     .to_owned(),
             );
         }
-        let Some((client, raw_id)) = self.client_for_buffer(buffer_id) else {
+        let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) else {
             return Err("Matrix buffer has no authenticated relay connection".to_owned());
         };
         for command in matrix_attachment_upload(
@@ -2936,7 +3143,7 @@ impl WeeChatApp {
         })
     }
 
-    fn request_older_history(&mut self, buffer_id: &str) {
+    fn request_older_history(&mut self, buffer_id: &str, view_buffer_id: &str) {
         if self.loading_more_buffer_id.is_some()
             || self.history_exhausted_buffer_ids.contains(buffer_id)
         {
@@ -2947,7 +3154,12 @@ impl WeeChatApp {
             return;
         };
         let current_len = buffer.messages.len();
-        let anchor = buffer.messages.front().map(|line| line.id.clone());
+        let (view_anchor, view_len) = if view_buffer_id == buffer_id {
+            (buffer.messages.front().map(|line| line.id.clone()), current_len)
+        } else {
+            let (messages, _) = composed_upgrade_history(&self.buffers, view_buffer_id);
+            (messages.front().map(|line| line.id.clone()), messages.len())
+        };
         let oldest_timestamp = buffer.messages.front().map(|line| {
             line.timestamp
                 .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -2973,9 +3185,9 @@ impl WeeChatApp {
 
         self.loading_more_buffer_id = Some(buffer_id.to_owned());
         self.history_top_armed_buffer_ids.remove(buffer_id);
-        if let Some(anchor) = anchor {
+        if let Some(anchor) = view_anchor {
             self.history_scroll_anchors
-                .insert(buffer_id.to_owned(), (anchor, current_len));
+                .insert(view_buffer_id.to_owned(), (anchor, view_len));
         }
         if let Some(count) = request_count {
             self.history_request_counts
@@ -4188,7 +4400,7 @@ impl eframe::App for WeeChatApp {
         let mut pending_buffer_command = None;
         let mut next_drag_buffer_id: Option<String> = None;
         let mut pending_mute: Option<(String, String, bool)> = None;
-        let mut pending_load_more: Option<String> = None;
+        let mut pending_load_more: Option<(String, String)> = None;
         let mut pending_history_top_rearm: Option<String> = None;
         let mut pending_clear_history_anchor: Option<String> = None;
         let mut pending_reply_target: Option<ReplyTarget> = None;
@@ -4266,6 +4478,7 @@ impl eframe::App for WeeChatApp {
                 FontFamily::Proportional
             },
         );
+        let replaced_matrix_room_ids = replaced_matrix_room_ids(&self.buffers);
         let longest_buffer_name = self
             .buffers
             .iter()
@@ -4274,6 +4487,7 @@ impl eframe::App for WeeChatApp {
                     buffer,
                     self.show_hidden_buffers,
                     &self.collapsed_servers,
+                    &replaced_matrix_room_ids,
                 )
             })
             .map(|buffer| {
@@ -4373,6 +4587,7 @@ impl eframe::App for WeeChatApp {
                                 buffer,
                                 self.show_hidden_buffers,
                                 &self.collapsed_servers,
+                                &replaced_matrix_room_ids,
                             ) {
                                 continue;
                             }
@@ -4413,6 +4628,10 @@ impl eframe::App for WeeChatApp {
                             }
 
                             let is_muted = buffer.muted;
+                            let is_replaced_room = buffer
+                                .matrix_room_id
+                                .as_ref()
+                                .is_some_and(|room_id| replaced_matrix_room_ids.contains(room_id));
                             let (bg, fg) = if is_selected {
                                 (accent_color.linear_multiply(0.2), text_primary)
                             } else if is_muted {
@@ -4472,6 +4691,8 @@ impl eframe::App for WeeChatApp {
                                     format!("• {}", buffer.name)
                                 } else if is_muted {
                                     format!("🔇 {}", buffer.name)
+                                } else if is_replaced_room {
+                                    format!("↪ {} (replaced)", buffer.name)
                                 } else {
                                     buffer.name.clone()
                                 };
@@ -4778,10 +4999,24 @@ impl eframe::App for WeeChatApp {
         let current_matrix_room_id = current_buf.and_then(|b| b.matrix_room_id.clone());
         let current_buffer_is_matrix =
             current_buf.is_some_and(|buffer| buffer.plugin == "matrix");
+        let current_buffer_is_replaced = current_buffer_id
+            .as_deref()
+            .is_some_and(|buffer_id| replacement_buffer_id(&self.buffers, buffer_id).is_some());
         let current_buffer_mention_aliases = current_buf
             .map(Buffer::own_mention_aliases)
             .unwrap_or_default();
-        let current_buffer_messages = current_buf.map(|b| b.messages.clone());
+        let (current_buffer_messages, inherited_history_line_ids) = current_buffer_id
+            .as_deref()
+            .map(|buffer_id| composed_upgrade_history(&self.buffers, buffer_id))
+            .map(|(messages, inherited)| (Some(messages), inherited))
+            .unwrap_or_else(|| (None, HashSet::new()));
+        let current_history_load_buffer_id = current_buffer_id.as_deref().and_then(|buffer_id| {
+            upgrade_history_load_buffer_id(
+                &self.buffers,
+                buffer_id,
+                &self.history_exhausted_buffer_ids,
+            )
+        });
         let _current_buffer_last_read_id = current_buf.and_then(|b| b.last_read_id.clone());
         let current_buffer_visit_marker_id = current_buf.and_then(|b| b.visit_start_marker_id.clone());
         let current_buffer_topic = current_buf.map(|b| b.topic.clone()).unwrap_or_default();
@@ -5995,6 +6230,21 @@ impl eframe::App for WeeChatApp {
                         ui.separator();
                     }
 
+                    if current_buffer_is_replaced {
+                        Frame::none()
+                            .fill(Color32::from_rgb(120, 82, 24).linear_multiply(0.35))
+                            .inner_margin(Margin::symmetric(16.0, 7.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Archived room history — new messages are sent to its replacement",
+                                    )
+                                    .color(Color32::from_rgb(255, 205, 115))
+                                    .strong(),
+                                );
+                            });
+                    }
+
                     if self.show_titlebar && (!current_buffer_topic.is_empty() || !current_buffer_modes.is_empty()) {
                         Frame::none()
                             .fill(surface_color.linear_multiply(0.3))
@@ -6040,16 +6290,22 @@ impl eframe::App for WeeChatApp {
                         ui.set_max_width(msg_area_width);
                         ui.spacing_mut().item_spacing.y = 1.0;
                         Frame::none().inner_margin(Margin::same(16.0)).show(ui, |ui| {
-                            if let (Some(buf_id), Some(_messages)) = (current_buffer_id.as_ref(), current_buffer_messages.as_ref()) {
-                                if !self.history_exhausted_buffer_ids.contains(buf_id) {
+                            if let (Some(view_buffer_id), Some(load_buffer_id), Some(_messages)) = (
+                                current_buffer_id.as_ref(),
+                                current_history_load_buffer_id.as_ref(),
+                                current_buffer_messages.as_ref(),
+                            ) {
                                     ui.add_space(4.0);
                                     ui.horizontal(|ui| {
                                         ui.add_space((ui.available_width() - 180.0).max(0.0) / 2.0);
-                                        if self.loading_more_buffer_id.as_deref() == Some(buf_id.as_str()) {
+                                        if self.loading_more_buffer_id.as_deref() == Some(load_buffer_id.as_str()) {
                                             ui.spinner();
                                             ui.label(egui::RichText::new("Loading…").color(text_muted).small());
                                         } else if ui.button("⬆ Load older messages").clicked() {
-                                            pending_load_more = Some(buf_id.clone());
+                                            pending_load_more = Some((
+                                                load_buffer_id.clone(),
+                                                view_buffer_id.clone(),
+                                            ));
                                         }
                                     });
                                     ui.add_space(8.0);
@@ -6058,7 +6314,6 @@ impl eframe::App for WeeChatApp {
                                         ui.separator();
                                     });
                                     ui.add_space(4.0);
-                                }
                             }
 
                             if let Some(messages) = &current_buffer_messages {
@@ -6088,6 +6343,8 @@ impl eframe::App for WeeChatApp {
                                 for (line_index, line) in messages.iter().enumerate() {
                                     if !self.show_filtered_lines && !line.displayed { continue; }
                                     if is_matrix_media_status_line(&line.plain_message) { continue; }
+                                    let is_inherited_history =
+                                        inherited_history_line_ids.contains(&line.id);
 
                                     if let Some((anchor_id, previous_len)) = self
                                         .history_scroll_anchors
@@ -6477,11 +6734,17 @@ impl eframe::App for WeeChatApp {
                                                 .map(|(buffer_id, _, _)| buffer_id.clone());
                                             if ui
                                                 .add_enabled(
-                                                    event_id.is_some(),
+                                                    event_id.is_some()
+                                                        && !is_inherited_history
+                                                        && !current_buffer_is_replaced,
                                                     egui::Button::new("Reply"),
                                                 )
                                                 .on_disabled_hover_text(
-                                                    "This line has no Matrix event ID",
+                                                    if is_inherited_history || current_buffer_is_replaced {
+                                                        "This message belongs to a replaced Matrix room"
+                                                    } else {
+                                                        "This line has no Matrix event ID"
+                                                    },
                                                 )
                                                 .clicked()
                                             {
@@ -6542,7 +6805,7 @@ impl eframe::App for WeeChatApp {
                             pending_history_top_rearm = Some(buf_id.clone());
                         } else if history_view_at_top
                             && self.loading_more_buffer_id.is_none()
-                            && !self.history_exhausted_buffer_ids.contains(buf_id)
+                            && current_history_load_buffer_id.is_some()
                             && current_buffer_messages.as_ref().is_some_and(|messages| {
                                 should_auto_request_history(
                                     messages.len(),
@@ -6551,7 +6814,9 @@ impl eframe::App for WeeChatApp {
                                 )
                             })
                         {
-                            pending_load_more = Some(buf_id.clone());
+                            pending_load_more = current_history_load_buffer_id
+                                .as_ref()
+                                .map(|load_buffer_id| (load_buffer_id.clone(), buf_id.clone()));
                         }
                     }
                 });
@@ -6567,8 +6832,8 @@ impl eframe::App for WeeChatApp {
         if let Some(buf_id) = pending_clear_history_anchor {
             self.history_scroll_anchors.remove(&buf_id);
         }
-        if let Some(buf_id) = pending_load_more {
-            self.request_older_history(&buf_id);
+        if let Some((load_buffer_id, view_buffer_id)) = pending_load_more {
+            self.request_older_history(&load_buffer_id, &view_buffer_id);
         }
 
         if let Some(reply_target) = pending_reply_target {

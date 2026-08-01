@@ -3,7 +3,7 @@ use crate::relay::models::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{
     history_snapshot_is_exhausted, is_restorable_chat_buffer, preferred_chat_buffer_id,
-    matrix_history_snapshot_count, CommandCompletionState, SavedReadMarker, WeeChatApp,
+    matrix_history_snapshot_count, replacement_buffer_id, CommandCompletionState, SavedReadMarker, WeeChatApp,
     LOAD_MORE_LINES, MAX_STORED_LINES,
 };
 use chrono::{Utc, DateTime, Local};
@@ -348,6 +348,11 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                 }
                 self.rebuild_buffer_idx();
+                if let Some(selected) = self.selected_buffer_id.clone() {
+                    if let Some(replacement) = replacement_buffer_id(&self.buffers, &selected) {
+                        self.select_buffer(replacement);
+                    }
+                }
                 if self.selected_buffer_id.is_none() {
                     if let Some(id) = preferred_chat_buffer_id(
                         &self.buffers,
@@ -957,7 +962,14 @@ impl WeeChatApp {
 
     fn extract_matrix_buffer_metadata(
         obj: &serde_json::Map<String, Value>,
-    ) -> (Option<String>, Option<String>, bool, Option<String>) {
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+        Option<String>,
+    ) {
         let vars = obj.get("local_variables").and_then(|value| value.as_object());
         let room_id = vars
             .and_then(|vars| vars.get("room_id"))
@@ -968,6 +980,16 @@ impl WeeChatApp {
             .and_then(|vars| vars.get("thread_root"))
             .and_then(|value| value.as_str())
             .filter(|value| value.starts_with('$') && !value.chars().any(char::is_whitespace))
+            .map(ToOwned::to_owned);
+        let predecessor_room_id = vars
+            .and_then(|vars| vars.get("matrix_predecessor_room_id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| value.starts_with('!') && !value.chars().any(char::is_whitespace))
+            .map(ToOwned::to_owned);
+        let replacement_room_id = vars
+            .and_then(|vars| vars.get("matrix_replacement_room_id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| value.starts_with('!') && !value.chars().any(char::is_whitespace))
             .map(ToOwned::to_owned);
         let upload_v1 = vars
             .and_then(|vars| vars.get("matrix_upload_v1"))
@@ -980,7 +1002,14 @@ impl WeeChatApp {
                 value.starts_with("mxc://") && !value.chars().any(char::is_whitespace)
             })
             .map(ToOwned::to_owned);
-        (room_id, thread_root, upload_v1, avatar_mxc)
+        (
+            room_id,
+            predecessor_room_id,
+            replacement_room_id,
+            thread_root,
+            upload_v1,
+            avatar_mxc,
+        )
     }
 
     fn extract_matrix_member_profiles(
@@ -1076,6 +1105,8 @@ impl WeeChatApp {
                     let mut visit_start_marker_id = None;
                     let (
                         matrix_room_id,
+                        matrix_predecessor_room_id,
+                        matrix_replacement_room_id,
                         matrix_thread_root,
                         matrix_upload_v1,
                         matrix_avatar_mxc,
@@ -1142,6 +1173,8 @@ impl WeeChatApp {
                         muted,
                         has_nicklist: effective_nicklist,
                         matrix_room_id,
+                        matrix_predecessor_room_id,
+                        matrix_replacement_room_id,
                         matrix_thread_root,
                         matrix_upload_v1,
                         matrix_avatar_mxc,
@@ -1200,6 +1233,12 @@ impl WeeChatApp {
                 });
             }
             self.rebuild_buffer_idx();
+
+            if let Some(selected) = self.selected_buffer_id.clone() {
+                if let Some(replacement) = replacement_buffer_id(&self.buffers, &selected) {
+                    self.select_buffer(replacement);
+                }
+            }
 
             let parent_room_id = self
                 .selected_buffer_id
@@ -1416,6 +1455,8 @@ impl WeeChatApp {
                 let refreshed_plugin = Self::extract_buffer_plugin(obj);
                 let (
                     matrix_room_id,
+                    matrix_predecessor_room_id,
+                    matrix_replacement_room_id,
                     matrix_thread_root,
                     matrix_upload_v1,
                     matrix_avatar_mxc,
@@ -1438,6 +1479,8 @@ impl WeeChatApp {
                         buffer.own_nick = own_nick.to_owned();
                     }
                     buffer.matrix_room_id = matrix_room_id;
+                    buffer.matrix_predecessor_room_id = matrix_predecessor_room_id;
+                    buffer.matrix_replacement_room_id = matrix_replacement_room_id;
                     buffer.matrix_thread_root = matrix_thread_root;
                     buffer.matrix_upload_v1 = matrix_upload_v1;
                     buffer.matrix_avatar_mxc = matrix_avatar_mxc;
@@ -1804,6 +1847,8 @@ mod tests {
             muted: false,
             has_nicklist: kind != "server",
             matrix_room_id: None,
+            matrix_predecessor_room_id: None,
+            matrix_replacement_room_id: None,
             matrix_thread_root: None,
             matrix_upload_v1: false,
             matrix_avatar_mxc: None,
@@ -1974,6 +2019,8 @@ mod tests {
             "local_variables": {
                 "plugin": "matrix",
                 "room_id": "!room:example.org",
+                "matrix_predecessor_room_id": "!old:example.org",
+                "matrix_replacement_room_id": "!new:example.org",
                 "thread_root": "$root:example.org",
                 "matrix_upload_v1": "1",
                 "matrix_avatar_mxc": "mxc://example.org/room-avatar"
@@ -1983,6 +2030,8 @@ mod tests {
             WeeChatApp::extract_matrix_buffer_metadata(object.as_object().unwrap()),
             (
                 Some("!room:example.org".to_owned()),
+                Some("!old:example.org".to_owned()),
+                Some("!new:example.org".to_owned()),
                 Some("$root:example.org".to_owned()),
                 true,
                 Some("mxc://example.org/room-avatar".to_owned()),
@@ -2001,7 +2050,7 @@ mod tests {
         });
         assert_eq!(
             WeeChatApp::extract_matrix_buffer_metadata(malformed.as_object().unwrap()),
-            (None, None, false, None)
+            (None, None, None, None, false, None)
         );
     }
 

@@ -158,6 +158,8 @@ impl Session {
             muted: false,
             has_nicklist: kind == "channel",
             matrix_room_id: None,
+            matrix_predecessor_room_id: None,
+            matrix_replacement_room_id: None,
             matrix_thread_root: None,
             matrix_upload_v1: false,
             matrix_avatar_mxc: None,

@@ -768,10 +768,11 @@ impl WeeChatApp {
         }
 
         if let Some(buffer_id) = self.selected_buffer_id.clone() {
+            let send_buffer_id = self.effective_send_buffer_id(&buffer_id);
             let semantic_matrix_message = !is_command
                 && !sends_reply
                 && !self.selected_mentions.is_empty()
-                && self.buffer_by_id(&buffer_id)
+                && self.buffer_by_id(&send_buffer_id)
                     .map(|buffer| buffer.plugin == "matrix")
                     .unwrap_or(false);
             let command = if semantic_matrix_message {
@@ -788,11 +789,13 @@ impl WeeChatApp {
             } else {
                 msg.clone()
             };
-            if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
+            if let Some((client, raw_id)) = self.client_for_buffer(&send_buffer_id) {
                 let command = self
                     .reply_target
                     .as_ref()
-                    .filter(|reply| reply.buffer_id == buffer_id)
+                    .filter(|reply| {
+                        reply.buffer_id == buffer_id && send_buffer_id == buffer_id
+                    })
                     .map(|reply| matrix_reply_command(&reply.matrix_event_id, &msg))
                     .unwrap_or(command);
                 client.send_message(&raw_id, &command);
