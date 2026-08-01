@@ -12,6 +12,30 @@ use std::sync::OnceLock;
 
 static ANSI_RE: OnceLock<regex::Regex> = OnceLock::new();
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BufferMetadataRefresh {
+    All,
+    One(String),
+}
+
+fn buffer_metadata_refresh(
+    event_name: &str,
+    buffer_id: Option<i64>,
+) -> Option<BufferMetadataRefresh> {
+    match event_name {
+        "buffer_opened" | "buffer_closed" | "buffer_renamed" => {
+            Some(BufferMetadataRefresh::All)
+        }
+        "buffer_localvar_added" | "buffer_localvar_changed" | "buffer_localvar_removed" => {
+            Some(match buffer_id {
+                Some(buffer_id) => BufferMetadataRefresh::One(buffer_id.to_string()),
+                None => BufferMetadataRefresh::All,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn ansi_re() -> &'static regex::Regex {
     ANSI_RE.get_or_init(|| regex::Regex::new(r"\x1B\[[0-9;]*[A-Za-z]").unwrap())
 }
@@ -665,11 +689,18 @@ impl WeeChatApp {
                     }
                     self.log_conn_for(conn_prefix, "WeeChat upgrade complete — re-synced");
                 }
-                "buffer_opened" | "buffer_closed" | "buffer_renamed"
+                event_name @ ("buffer_opened" | "buffer_closed" | "buffer_renamed"
                 | "buffer_localvar_added" | "buffer_localvar_changed"
-                | "buffer_localvar_removed" => {
+                | "buffer_localvar_removed") => {
                     if let Some(conn) = self.connections.iter().find(|c| c.prefix == conn_prefix) {
-                        conn.client.fetch_buffer_list();
+                        match buffer_metadata_refresh(event_name, resp.buffer_id) {
+                            Some(BufferMetadataRefresh::One(buffer_id)) => {
+                                conn.client.refresh_buffer(&buffer_id)
+                            }
+                            Some(BufferMetadataRefresh::All) | None => {
+                                conn.client.fetch_buffer_list()
+                            }
+                        }
                     }
                 }
                 "buffer_hotlist_added" | "buffer_hotlist_updated" => {
@@ -1864,8 +1895,8 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{
-        apply_saved_buffer_order, buffer_groups_are_valid, matrix_history_page_status,
-        sort_lines_chronologically, WeeChatApp,
+        apply_saved_buffer_order, buffer_groups_are_valid, buffer_metadata_refresh,
+        matrix_history_page_status, sort_lines_chronologically, BufferMetadataRefresh, WeeChatApp,
     };
 
     fn sidebar_buffer(id: &str, number: i32, server: &str, kind: &str) -> Buffer {
@@ -1960,6 +1991,37 @@ mod tests {
                 "localhost/libera-room",
             ],
         );
+    }
+
+    #[test]
+    fn localvar_changes_refresh_only_the_affected_buffer() {
+        for event_name in [
+            "buffer_localvar_added",
+            "buffer_localvar_changed",
+            "buffer_localvar_removed",
+        ] {
+            assert_eq!(
+                buffer_metadata_refresh(event_name, Some(1785621966396965)),
+                Some(BufferMetadataRefresh::One(
+                    "1785621966396965".to_owned()
+                )),
+            );
+        }
+    }
+
+    #[test]
+    fn topology_changes_and_unidentified_localvars_refresh_the_buffer_list() {
+        for event_name in ["buffer_opened", "buffer_closed", "buffer_renamed"] {
+            assert_eq!(
+                buffer_metadata_refresh(event_name, Some(42)),
+                Some(BufferMetadataRefresh::All),
+            );
+        }
+        assert_eq!(
+            buffer_metadata_refresh("buffer_localvar_changed", None),
+            Some(BufferMetadataRefresh::All),
+        );
+        assert_eq!(buffer_metadata_refresh("buffer_line_added", Some(42)), None);
     }
 
     fn timeline_line(id: &str, second: i64) -> Line {
