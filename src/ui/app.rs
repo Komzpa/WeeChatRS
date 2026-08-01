@@ -433,6 +433,10 @@ fn clipboard_upload_target(
     }
 }
 
+fn buffer_supports_matrix_upload(buffer: Option<&Buffer>) -> bool {
+    buffer.is_some_and(|buffer| buffer.plugin == "matrix" && buffer.matrix_upload_v1)
+}
+
 fn paste_shortcut_pressed(events: &[egui::Event]) -> bool {
     events.iter().any(|event| {
         matches!(event, egui::Event::Paste(_))
@@ -1307,6 +1311,20 @@ mod thread_tests {
         assert!(matrix_attachment_upload("cliptest".to_owned(), "huge.bin", "application/octet-stream", &bytes).is_err());
     }
 
+    #[test]
+    fn matrix_upload_requires_an_explicit_backend_capability() {
+        let mut buffer = thread_buffer("thread");
+        assert!(buffer_supports_matrix_upload(Some(&buffer)));
+
+        buffer.matrix_upload_v1 = false;
+        assert!(!buffer_supports_matrix_upload(Some(&buffer)));
+
+        buffer.matrix_upload_v1 = true;
+        buffer.plugin = "irc".to_owned();
+        assert!(!buffer_supports_matrix_upload(Some(&buffer)));
+        assert!(!buffer_supports_matrix_upload(None));
+    }
+
     #[tokio::test]
     async fn matrix_file_share_prepares_native_bytes_without_external_url() {
         let path = std::env::temp_dir().join(format!(
@@ -1391,6 +1409,7 @@ mod thread_tests {
             has_nicklist: false,
             matrix_room_id: Some("!room:example.org".to_owned()),
             matrix_thread_root: Some("$root:example.org".to_owned()),
+            matrix_upload_v1: true,
             visit_start_marker_id: None,
         }
     }
@@ -2192,6 +2211,7 @@ mod saved_read_marker_tests {
             has_nicklist: true,
             matrix_room_id: None,
             matrix_thread_root: None,
+            matrix_upload_v1: false,
             visit_start_marker_id: None,
         }
     }
@@ -2565,6 +2585,10 @@ impl WeeChatApp {
             .is_some_and(|buffer| buffer.plugin == "matrix")
     }
 
+    fn supports_matrix_upload(&self, buffer_id: &str) -> bool {
+        buffer_supports_matrix_upload(self.buffer_by_id(buffer_id))
+    }
+
     fn send_matrix_attachment(
         &self,
         buffer_id: &str,
@@ -2574,6 +2598,12 @@ impl WeeChatApp {
     ) -> Result<(), String> {
         if !self.is_matrix_buffer(buffer_id) {
             return Err("Attachment target is not a Matrix buffer".to_owned());
+        }
+        if !self.supports_matrix_upload(buffer_id) {
+            return Err(
+                "Cannot send this attachment: the Matrix backend does not support native uploads. Update or restart the Matrix plugin."
+                    .to_owned(),
+            );
         }
         let Some((client, raw_id)) = self.client_for_buffer(buffer_id) else {
             return Err("Matrix buffer has no authenticated relay connection".to_owned());
@@ -2603,6 +2633,13 @@ impl WeeChatApp {
         if !self.is_matrix_buffer(&buffer_id) {
             self.file_share_error = Some(
                 "Cannot paste an image here: native clipboard image upload is available in Matrix chats"
+                    .to_owned(),
+            );
+            return false;
+        }
+        if !self.supports_matrix_upload(&buffer_id) {
+            self.file_share_error = Some(
+                "Cannot paste this image: the Matrix backend does not support native uploads. Update or restart the Matrix plugin."
                     .to_owned(),
             );
             return false;

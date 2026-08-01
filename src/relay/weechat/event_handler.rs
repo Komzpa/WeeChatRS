@@ -956,7 +956,7 @@ impl WeeChatApp {
 
     fn extract_matrix_buffer_metadata(
         obj: &serde_json::Map<String, Value>,
-    ) -> (Option<String>, Option<String>) {
+    ) -> (Option<String>, Option<String>, bool) {
         let vars = obj.get("local_variables").and_then(|value| value.as_object());
         let room_id = vars
             .and_then(|vars| vars.get("room_id"))
@@ -968,7 +968,11 @@ impl WeeChatApp {
             .and_then(|value| value.as_str())
             .filter(|value| value.starts_with('$') && !value.chars().any(char::is_whitespace))
             .map(ToOwned::to_owned);
-        (room_id, thread_root)
+        let upload_v1 = vars
+            .and_then(|vars| vars.get("matrix_upload_v1"))
+            .and_then(|value| value.as_str())
+            == Some("1");
+        (room_id, thread_root, upload_v1)
     }
 
     fn extract_matrix_member_profiles(
@@ -1062,7 +1066,7 @@ impl WeeChatApp {
                     let mut unread_count = 0u32;
                     let mut last_read_id = None;
                     let mut visit_start_marker_id = None;
-                    let (matrix_room_id, matrix_thread_root) =
+                    let (matrix_room_id, matrix_thread_root, matrix_upload_v1) =
                         Self::extract_matrix_buffer_metadata(obj);
 
                     if let Some(existing) = self.buffer_by_id(&full_id) {
@@ -1126,6 +1130,7 @@ impl WeeChatApp {
                         has_nicklist: effective_nicklist,
                         matrix_room_id,
                         matrix_thread_root,
+                        matrix_upload_v1,
                         visit_start_marker_id,
                         last_markread_ts: None,
                     });
@@ -1395,7 +1400,7 @@ impl WeeChatApp {
         for val in body {
             if let Some(obj) = val.as_object() {
                 let refreshed_plugin = Self::extract_buffer_plugin(obj);
-                let (matrix_room_id, matrix_thread_root) =
+                let (matrix_room_id, matrix_thread_root, matrix_upload_v1) =
                     Self::extract_matrix_buffer_metadata(obj);
                 if let Some(buffer) = self.buffer_by_id_mut(&full_buffer_id) {
                     // Strip prefix from full_name for metadata extraction
@@ -1415,6 +1420,7 @@ impl WeeChatApp {
                     }
                     buffer.matrix_room_id = matrix_room_id;
                     buffer.matrix_thread_root = matrix_thread_root;
+                    buffer.matrix_upload_v1 = matrix_upload_v1;
                     if let Some(encoded) = obj.get("local_variables")
                         .and_then(|value| value.as_object())
                         .and_then(|vars| vars.get("matrix_mentions"))
@@ -1782,6 +1788,7 @@ mod tests {
             has_nicklist: kind != "server",
             matrix_room_id: None,
             matrix_thread_root: None,
+            matrix_upload_v1: false,
             visit_start_marker_id: None,
         }
     }
@@ -1949,14 +1956,16 @@ mod tests {
             "local_variables": {
                 "plugin": "matrix",
                 "room_id": "!room:example.org",
-                "thread_root": "$root:example.org"
+                "thread_root": "$root:example.org",
+                "matrix_upload_v1": "1"
             }
         });
         assert_eq!(
             WeeChatApp::extract_matrix_buffer_metadata(object.as_object().unwrap()),
             (
                 Some("!room:example.org".to_owned()),
-                Some("$root:example.org".to_owned())
+                Some("$root:example.org".to_owned()),
+                true
             )
         );
         assert_eq!(
@@ -1972,7 +1981,7 @@ mod tests {
         });
         assert_eq!(
             WeeChatApp::extract_matrix_buffer_metadata(malformed.as_object().unwrap()),
-            (None, None)
+            (None, None, false)
         );
     }
 
