@@ -1147,6 +1147,55 @@ mod thread_tests {
     }
 
     #[test]
+    fn message_sender_profile_uses_matrix_identity_and_ranked_prefixes() {
+        let profiles = vec![profile("@strk:osgeo.org", "strk 🧭", "strk 🧭")];
+        let card = message_sender_profile_card(
+            "matrix/room",
+            "&strk 🧭",
+            "matrix",
+            true,
+            &profiles,
+            &[],
+        )
+        .expect("ranked Matrix sender should resolve to a room member");
+
+        assert_eq!(card.nick, "strk 🧭");
+        assert_eq!(card.matrix_user_id.as_deref(), Some("@strk:osgeo.org"));
+        assert_eq!(card.matrix.unwrap().display_name, "strk 🧭");
+    }
+
+    #[test]
+    fn message_sender_profile_requires_a_real_irc_nick() {
+        let nicks = vec![Nick {
+            name: "Komzpa".to_owned(),
+            prefix: "@".to_owned(),
+            color_ansi: String::new(),
+            away: false,
+        }];
+        let card = message_sender_profile_card(
+            "irc/room",
+            "@Komzpa",
+            "libera",
+            false,
+            &[],
+            &nicks,
+        )
+        .expect("ranked IRC sender should resolve to the current nicklist");
+
+        assert_eq!(card.nick, "Komzpa");
+        assert_eq!(card.prefix, "@");
+        assert!(message_sender_profile_card(
+            "irc/room",
+            "--",
+            "libera",
+            false,
+            &[],
+            &nicks,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn legacy_localhost_relay_is_migrated_and_autoconnected() {
         let mut settings = AppSettings::default();
         settings.host = "localhost".to_owned();
@@ -2125,6 +2174,40 @@ fn matrix_profile_for_nick(
     matches.next().is_none().then_some(profile)
 }
 
+fn message_sender_profile_card(
+    buffer_id: &str,
+    sender: &str,
+    server: &str,
+    is_matrix: bool,
+    matrix_profiles: &[MatrixMemberProfile],
+    nicks: &[Nick],
+) -> Option<UserProfileCard> {
+    if is_matrix {
+        let matrix = matrix_profile_for_nick(matrix_profiles, sender)?;
+        return Some(UserProfileCard {
+            buffer_id: buffer_id.to_owned(),
+            nick: matrix.nick.clone(),
+            prefix: String::new(),
+            server: server.to_owned(),
+            is_matrix: true,
+            matrix_user_id: Some(matrix.user_id.clone()),
+            matrix: Some(matrix),
+        });
+    }
+
+    let bare_sender = sender.trim_start_matches([' ', '~', '&', '@', '%', '+']);
+    let nick = nicks.iter().find(|nick| nick.name == bare_sender)?;
+    Some(UserProfileCard {
+        buffer_id: buffer_id.to_owned(),
+        nick: nick.name.clone(),
+        prefix: nick.prefix.clone(),
+        server: server.to_owned(),
+        is_matrix: false,
+        matrix_user_id: None,
+        matrix: None,
+    })
+}
+
 fn matrix_user_id_for_nick(candidates: &[MentionCandidate], nick: &str) -> Option<String> {
     let mut matches = candidates
         .iter()
@@ -3052,8 +3135,9 @@ impl WeeChatApp {
         size: f32,
         accent_color: Color32,
         text_color: Color32,
-    ) -> bool {
-        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    ) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
         let profile = matrix_profile_for_nick(profiles, nick);
         if let Some(avatar_mxc) = profile
             .as_ref()
@@ -3082,7 +3166,7 @@ impl WeeChatApp {
                     egui::Image::new((texture.id(), egui::Vec2::splat(size)))
                         .rounding(size / 2.0),
                 );
-                return true;
+                return response;
             }
         }
 
@@ -3102,7 +3186,24 @@ impl WeeChatApp {
             FontId::new(size * 0.48, FontFamily::Proportional),
             text_color,
         );
-        true
+        response
+    }
+
+    fn open_profile_on_author_click(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        rect: Rect,
+        card: Option<UserProfileCard>,
+    ) {
+        let Some(card) = card else { return };
+        let response = ui
+            .interact(rect.expand(2.0), id, egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("View profile");
+        if response_primary_clicked(ui, &response) {
+            self.profile_card = Some(card);
+        }
     }
 
     fn render_message_content(
@@ -4744,10 +4845,11 @@ impl eframe::App for WeeChatApp {
                                             ui.add_space(3.0);
                                         }
                                         ui.horizontal_wrapped(|ui| {
+                                            let mut avatar_rect: Option<Rect> = None;
                                             if let Some(profiles) =
                                                 current_buffer_member_profiles.as_deref()
                                             {
-                                                self.render_matrix_avatar(
+                                                let avatar_response = self.render_matrix_avatar(
                                                     ui,
                                                     &thread.id,
                                                     profiles,
@@ -4756,19 +4858,65 @@ impl eframe::App for WeeChatApp {
                                                     accent_color,
                                                     Color32::WHITE,
                                                 );
+                                                avatar_rect = Some(avatar_response.rect);
                                             }
-                                            for section in ANSIParser::parse(&block.prefix) {
-                                                let format = section
-                                                    .style
-                                                    .to_format(font_id.clone(), &render_theme);
-                                                self.render_text_with_emoji(
+                                            let prefix_response = ui.scope(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 0.0;
+                                                for section in ANSIParser::parse(&block.prefix) {
+                                                    let format = section
+                                                        .style
+                                                        .to_format(font_id.clone(), &render_theme);
+                                                    self.render_text_with_emoji(
+                                                        ui,
+                                                        &section.text,
+                                                        &format,
+                                                        false,
+                                                        true,
+                                                    );
+                                                }
+                                            }).response;
+                                            let author_card = message_sender_profile_card(
+                                                &thread.id,
+                                                &block.prefix,
+                                                current_buffer_server
+                                                    .as_deref()
+                                                    .unwrap_or_default(),
+                                                true,
+                                                current_buffer_member_profiles
+                                                    .as_deref()
+                                                    .unwrap_or_default(),
+                                                current_buffer_nicks
+                                                    .as_deref()
+                                                    .unwrap_or_default(),
+                                            );
+                                            if let (Some(rect), Some(card)) =
+                                                (avatar_rect, author_card.clone())
+                                            {
+                                                self.open_profile_on_author_click(
                                                     ui,
-                                                    &section.text,
-                                                    &format,
-                                                    false,
-                                                    true,
+                                                    ui.make_persistent_id((
+                                                        "thread_author_profile",
+                                                        "avatar",
+                                                        &thread.id,
+                                                        block.matrix_event_id.as_deref(),
+                                                        index,
+                                                    )),
+                                                    rect,
+                                                    Some(card),
                                                 );
                                             }
+                                            self.open_profile_on_author_click(
+                                                ui,
+                                                ui.make_persistent_id((
+                                                    "thread_author_profile",
+                                                    "name",
+                                                    &thread.id,
+                                                    block.matrix_event_id.as_deref(),
+                                                    index,
+                                                )),
+                                                prefix_response.rect,
+                                                author_card,
+                                            );
                                             ui.label(
                                                 egui::RichText::new(
                                                     block.timestamp
@@ -5921,6 +6069,8 @@ impl eframe::App for WeeChatApp {
                                             .with_main_wrap(compact_row),
                                         |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
+                                        let mut avatar_rect: Option<Rect> = None;
+                                        let mut prefix_visible_rect: Option<Rect> = None;
                                         if self.show_timestamps {
                                             ui.scope(|ui| {
                                                 if continues_matrix_event {
@@ -5934,7 +6084,7 @@ impl eframe::App for WeeChatApp {
                                                 current_buffer_id.as_deref(),
                                                 current_buffer_member_profiles.as_deref(),
                                             ) {
-                                                ui.scope(|ui| {
+                                                let avatar_response = ui.scope(|ui| {
                                                     if continues_matrix_event {
                                                         ui.set_opacity(0.0);
                                                     }
@@ -5946,8 +6096,11 @@ impl eframe::App for WeeChatApp {
                                                         24.0,
                                                         accent_color,
                                                         Color32::WHITE,
-                                                    );
-                                                });
+                                                    )
+                                                }).inner;
+                                                if !continues_matrix_event {
+                                                    avatar_rect = Some(avatar_response.rect);
+                                                }
                                             }
                                         }
                                         let prefix_sections = &line.parsed_prefix;
@@ -5990,7 +6143,7 @@ impl eframe::App for WeeChatApp {
                                             *entry
                                         };
 
-                                        ui.allocate_ui_with_layout(
+                                        let prefix_response = ui.allocate_ui_with_layout(
                                             egui::vec2(col_width, ui.text_style_height(&TextStyle::Body)),
                                             // ANSI color boundaries and emoji are separate
                                             // widgets. RTL layout reversed those widgets,
@@ -6009,7 +6162,56 @@ impl eframe::App for WeeChatApp {
                                                     self.render_text_with_emoji(ui, &s.text, &format, false, true);
                                                 }
                                             }
-                                        );
+                                        ).response;
+                                        if !continues_matrix_event {
+                                            prefix_visible_rect = Some(Rect::from_min_max(
+                                                egui::pos2(
+                                                    prefix_response.rect.max.x - measured_w,
+                                                    prefix_response.rect.min.y,
+                                                ),
+                                                prefix_response.rect.max,
+                                            ));
+                                        }
+                                        let author_card = avatar_rect.or(prefix_visible_rect).and_then(|_| {
+                                            message_sender_profile_card(
+                                                current_buffer_id.as_deref()?,
+                                                &line.plain_prefix,
+                                                current_buffer_server.as_deref().unwrap_or_default(),
+                                                current_buffer_is_matrix,
+                                                current_buffer_member_profiles
+                                                    .as_deref()
+                                                    .unwrap_or_default(),
+                                                current_buffer_nicks
+                                                    .as_deref()
+                                                    .unwrap_or_default(),
+                                            )
+                                        });
+                                        if let (Some(rect), Some(card)) =
+                                            (avatar_rect, author_card.clone())
+                                        {
+                                            self.open_profile_on_author_click(
+                                                ui,
+                                                ui.make_persistent_id((
+                                                    "message_author_profile",
+                                                    "avatar",
+                                                    &line.id,
+                                                )),
+                                                rect,
+                                                Some(card),
+                                            );
+                                        }
+                                        if let Some(rect) = prefix_visible_rect {
+                                            self.open_profile_on_author_click(
+                                                ui,
+                                                ui.make_persistent_id((
+                                                    "message_author_profile",
+                                                    "name",
+                                                    &line.id,
+                                                )),
+                                                rect,
+                                                author_card,
+                                            );
+                                        }
                                         if !self.prefix_suffix.is_empty() {
                                             ui.scope(|ui| {
                                                 if continues_matrix_event {
