@@ -159,6 +159,7 @@ impl Session {
             has_nicklist: kind == "channel",
             matrix_room_id: None,
             matrix_thread_root: None,
+            matrix_upload_v1: false,
             visit_start_marker_id: None,
         }
     }
