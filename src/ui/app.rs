@@ -340,6 +340,25 @@ fn inline_image_dimensions_allowed(width: u32, height: u32) -> bool {
         && u64::from(width).saturating_mul(u64::from(height)) <= MAX_INLINE_IMAGE_PIXELS
 }
 
+fn avatar_thumbnail(image: &image::DynamicImage, edge: u32) -> image::RgbaImage {
+    let side = image.width().min(image.height());
+    let left = (image.width() - side) / 2;
+    let top = (image.height() - side) / 2;
+    image
+        .crop_imm(left, top, side, side)
+        .resize_exact(edge, edge, image::imageops::FilterType::Lanczos3)
+        .to_rgba8()
+}
+
+fn update_prefix_column_width(current: f32, measured: f32, cap: f32) -> (f32, bool) {
+    let width = current.max(measured).min(cap);
+    (width, width > current)
+}
+
+fn prefix_span_layout() -> egui::Layout {
+    egui::Layout::left_to_right(egui::Align::Center)
+}
+
 /// Fit an inline preview into the chat column.
 ///
 /// Keep the source dimensions for small images and bound larger images so
@@ -446,12 +465,36 @@ fn response_primary_clicked(ui: &egui::Ui, response: &egui::Response) -> bool {
 #[cfg(test)]
 mod inline_matrix_image_tests {
     use super::{
+        avatar_thumbnail,
         inline_image_dimensions_allowed,
         inline_image_display_size, inline_image_preview_size, is_matrix_media_status_line,
-        matrix_media_cache_path, primary_click_hits_rect,
+        matrix_media_cache_path, prefix_span_layout, primary_click_hits_rect,
         quote_weechat_argument,
+        update_prefix_column_width,
     };
     use egui::Vec2;
+
+    #[test]
+    fn avatar_thumbnail_center_crops_then_lanczos_prefilters() {
+        let mut source = image::RgbaImage::new(4, 2);
+        for y in 0..2 {
+            source.put_pixel(0, y, image::Rgba([255, 0, 0, 255]));
+            source.put_pixel(1, y, image::Rgba([0, 255, 0, 255]));
+            source.put_pixel(2, y, image::Rgba([0, 255, 0, 255]));
+            source.put_pixel(3, y, image::Rgba([0, 0, 255, 255]));
+        }
+        let thumbnail = avatar_thumbnail(&image::DynamicImage::ImageRgba8(source), 64);
+        assert_eq!(thumbnail.dimensions(), (64, 64));
+        assert!(thumbnail.pixels().all(|pixel| *pixel == image::Rgba([0, 255, 0, 255])));
+    }
+
+    #[test]
+    fn prefix_spans_keep_logical_order_and_grow_as_one_column() {
+        assert_eq!(prefix_span_layout().main_dir, egui::Direction::LeftToRight);
+        assert_eq!(update_prefix_column_width(40.0, 72.0, 100.0), (72.0, true));
+        assert_eq!(update_prefix_column_width(72.0, 36.0, 100.0), (72.0, false));
+        assert_eq!(update_prefix_column_width(72.0, 120.0, 90.0), (90.0, true));
+    }
 
     #[test]
     fn portrait_preview_is_capped_by_height() {
@@ -1017,6 +1060,11 @@ mod thread_tests {
             Some("@two:example.org".to_owned())
         );
         assert!(matrix_profile_for_nick(&profiles, "Alex").is_none());
+        let ranked = vec![profile("@strk:osgeo.org", "strk 🧭", "strk 🧭")];
+        assert_eq!(
+            matrix_profile_for_nick(&ranked, "&strk 🧭").map(|profile| profile.user_id),
+            Some("@strk:osgeo.org".to_owned())
+        );
 
         let candidates = vec![
             MentionCandidate {
@@ -1773,6 +1821,10 @@ pub struct WeeChatApp {
 
     // Image preview state
     pub(crate) image_cache: HashMap<String, ImageState>,
+    /// Prefiltered square textures for 22-24 px Matrix sender/nick avatars.
+    /// Full-resolution textures stay in `image_cache` for the profile card.
+    pub(crate) avatar_texture_cache: HashMap<String, egui::TextureHandle>,
+    pub(crate) avatar_image_keys: HashSet<String>,
     pub(crate) image_expanded: HashSet<String>,
     pub(crate) image_full_size: HashSet<String>,
     pub(crate) image_tx: mpsc::UnboundedSender<(String, Result<Vec<u8>, String>)>,
@@ -1954,6 +2006,13 @@ fn matrix_profile_for_nick(
     profiles: &[MatrixMemberProfile],
     nick: &str,
 ) -> Option<MatrixMemberProfile> {
+    if let Some(profile) = profiles.iter().find(|profile| profile.nick == nick) {
+        return Some(profile.clone());
+    }
+    // Timeline prefixes include WeeChat rank markers (`&`, `@`, `+`, ...),
+    // while member-profile nicks do not. Keep exact matching first so a real
+    // display name beginning with one of these characters still wins.
+    let nick = nick.trim_start_matches([' ', '~', '&', '@', '%', '+']);
     if let Some(profile) = profiles.iter().find(|profile| profile.nick == nick) {
         return Some(profile.clone());
     }
@@ -2307,6 +2366,8 @@ impl WeeChatApp {
             opacity: settings.opacity,
             show_hidden_buffers: settings.show_hidden_buffers,
             image_cache: HashMap::new(),
+            avatar_texture_cache: HashMap::new(),
+            avatar_image_keys: HashSet::new(),
             image_expanded: HashSet::new(),
             image_full_size: HashSet::new(),
             image_tx,
@@ -2742,8 +2803,45 @@ impl WeeChatApp {
         });
     }
 
-    fn render_text_with_emoji(&mut self, ui: &mut egui::Ui, text: &str, format: &egui::TextFormat, wrap: bool) {
-        if !self.emoji_rendering {
+    fn text_with_emoji_width(
+        &self,
+        ui: &egui::Ui,
+        text: &str,
+        font_id: &FontId,
+        force_emoji: bool,
+    ) -> f32 {
+        if !self.emoji_rendering && !force_emoji {
+            return ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(text.to_owned(), font_id.clone(), Color32::WHITE)
+                    .size()
+                    .x
+            });
+        }
+
+        ui.fonts(|fonts| {
+            crate::ui::emoji::split_emoji(text)
+                .into_iter()
+                .map(|span| match span {
+                    crate::ui::emoji::TextSpan::Text(text) => fonts
+                        .layout_no_wrap(text, font_id.clone(), Color32::WHITE)
+                        .size()
+                        .x,
+                    crate::ui::emoji::TextSpan::Emoji(_) => font_id.size + 2.0,
+                })
+                .sum()
+        })
+    }
+
+    fn render_text_with_emoji(
+        &mut self,
+        ui: &mut egui::Ui,
+        text: &str,
+        format: &egui::TextFormat,
+        wrap: bool,
+        force_emoji: bool,
+    ) {
+        if !self.emoji_rendering && !force_emoji {
             let mut job = LayoutJob::default();
             job.append(text, 0.0, format.clone());
             ui.add(Label::new(job).wrap(wrap));
@@ -2784,9 +2882,21 @@ impl WeeChatApp {
                             egui::Vec2::splat(emoji_size),
                         )));
                     } else {
-                        let mut job = LayoutJob::default();
-                        job.append(&emoji, 0.0, format.clone());
-                        ui.add(Label::new(job).wrap(wrap));
+                        // Keep the prefix column stable while the Twemoji asset
+                        // is loading. A font-fallback label has a different
+                        // advance on many systems and used to make the message
+                        // separator jump when the texture arrived.
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::Vec2::splat(emoji_size),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            emoji,
+                            format.font_id.clone(),
+                            format.color,
+                        );
                     }
                 }
             }
@@ -2803,12 +2913,13 @@ impl WeeChatApp {
         accent_color: Color32,
         text_color: Color32,
     ) -> bool {
-        let Some(profile) = matrix_profile_for_nick(profiles, nick) else {
-            return false;
-        };
-
         let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
-        if let Some(avatar_mxc) = profile.avatar_mxc.as_ref() {
+        let profile = matrix_profile_for_nick(profiles, nick);
+        if let Some(avatar_mxc) = profile
+            .as_ref()
+            .and_then(|profile| profile.avatar_mxc.as_ref())
+        {
+            self.avatar_image_keys.insert(avatar_mxc.clone());
             if ui.is_rect_visible(rect) && !self.image_cache.contains_key(avatar_mxc) {
                 self.ensure_matrix_media_loading(
                     buffer_id,
@@ -2819,7 +2930,13 @@ impl WeeChatApp {
                     },
                 );
             }
-            if let Some(ImageState::Loaded(texture)) = self.image_cache.get(avatar_mxc) {
+            let texture = self.avatar_texture_cache.get(avatar_mxc).or_else(|| {
+                match self.image_cache.get(avatar_mxc) {
+                    Some(ImageState::Loaded(texture)) => Some(texture),
+                    _ => None,
+                }
+            });
+            if let Some(texture) = texture {
                 ui.put(
                     rect,
                     egui::Image::new((texture.id(), egui::Vec2::splat(size)))
@@ -2835,7 +2952,9 @@ impl WeeChatApp {
             rect.center(),
             egui::Align2::CENTER_CENTER,
             profile
-                .display_name
+                .as_ref()
+                .map(|profile| profile.display_name.as_str())
+                .unwrap_or(nick)
                 .chars()
                 .find(|character| character.is_alphanumeric())
                 .map(|character| character.to_uppercase().to_string())
@@ -2943,7 +3062,7 @@ impl WeeChatApp {
                         }
                     } else {
                         let format = section.style.to_format(font_id.clone(), render_theme);
-                        self.render_text_with_emoji(ui, &section.text, &format, true);
+                        self.render_text_with_emoji(ui, &section.text, &format, true, false);
                     }
                 }
             });
@@ -3454,10 +3573,26 @@ impl eframe::App for WeeChatApp {
                         .and_then(|_| image::load_from_memory(&bytes).map_err(|error| error.to_string()))
                     {
                         Ok(img) => {
+                            let avatar_texture = self.avatar_image_keys.contains(&url).then(|| {
+                                let rgba = avatar_thumbnail(&img, 64);
+                                let size = [rgba.width() as usize, rgba.height() as usize];
+                                let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                                    size,
+                                    rgba.as_raw(),
+                                );
+                                ctx.load_texture(
+                                    format!("{url}#avatar-64"),
+                                    color_img,
+                                    egui::TextureOptions::LINEAR,
+                                )
+                            });
                             let rgba = img.to_rgba8();
                             let size = [rgba.width() as usize, rgba.height() as usize];
                             let color_img = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
                             let handle = ctx.load_texture(&url, color_img, egui::TextureOptions::default());
+                            if let Some(avatar_texture) = avatar_texture {
+                                self.avatar_texture_cache.insert(url.clone(), avatar_texture);
+                            }
                             self.image_cache.insert(url, ImageState::Loaded(handle));
                         }
                         Err(_) => {
@@ -3472,6 +3607,11 @@ impl eframe::App for WeeChatApp {
                 }
             }
             cap_map(&mut self.image_cache, IMAGE_CACHE_MAX);
+            cap_map(&mut self.avatar_texture_cache, IMAGE_CACHE_MAX);
+            self.avatar_image_keys.retain(|key| {
+                self.image_cache.contains_key(key)
+                    || self.avatar_texture_cache.contains_key(key)
+            });
             self.image_full_size
                 .retain(|key| self.image_cache.contains_key(key));
         }
@@ -4428,6 +4568,7 @@ impl eframe::App for WeeChatApp {
                                                     &section.text,
                                                     &format,
                                                     false,
+                                                    true,
                                                 );
                                             }
                                             ui.label(
@@ -4719,7 +4860,7 @@ impl eframe::App for WeeChatApp {
                                                 fmt.color = text_muted;
                                                 fmt.italics = true;
                                             }
-                                            self.render_text_with_emoji(ui, &s.text, &fmt, false);
+                                            self.render_text_with_emoji(ui, &s.text, &fmt, false, true);
                                         }
                                     }).response.interact(egui::Sense::click());
                                     if response_primary_clicked(ui, &label_res) {
@@ -5604,9 +5745,17 @@ impl eframe::App for WeeChatApp {
                                         let prefix_sections = &line.parsed_prefix;
 
                                         // Measure plain-text width for stable column tracking.
-                                        let measured_w = ui.fonts(|f| {
-                                            f.layout_no_wrap(line.plain_prefix.clone(), font_id.clone(), Color32::WHITE).size().x
-                                        });
+                                        let measured_w: f32 = prefix_sections
+                                            .iter()
+                                            .map(|section| {
+                                                self.text_with_emoji_width(
+                                                    ui,
+                                                    &section.text,
+                                                    &font_id,
+                                                    true,
+                                                )
+                                            })
+                                            .sum();
                                         let cap_px = if self.prefix_align_max > 0 {
                                             ui.fonts(|f| {
                                                 f.layout_no_wrap("M".repeat(self.prefix_align_max), font_id.clone(), Color32::WHITE).size().x
@@ -5615,7 +5764,15 @@ impl eframe::App for WeeChatApp {
                                             f32::INFINITY
                                         };
                                         let entry = self.prefix_col_widths.entry(current_buffer_id.clone().unwrap_or_default()).or_insert(0.0);
-                                        *entry = entry.max(measured_w).min(cap_px);
+                                        let (next_col_width, grew) =
+                                            update_prefix_column_width(*entry, measured_w, cap_px);
+                                        *entry = next_col_width;
+                                        if grew {
+                                            // Earlier rows in this immediate-mode frame were
+                                            // laid out with the old maximum. Repaint once so
+                                            // every visible row uses the same final column.
+                                            ui.ctx().request_repaint();
+                                        }
                                         let compact_prefix_cap = (row_width
                                             - if self.show_timestamps { 92.0 } else { 24.0 })
                                             .max(40.0);
@@ -5627,7 +5784,12 @@ impl eframe::App for WeeChatApp {
 
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(col_width, ui.text_style_height(&TextStyle::Body)),
-                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            // ANSI color boundaries and emoji are separate
+                                            // widgets. RTL layout reversed those widgets,
+                                            // turning `&strk 🧭` into `strk 🧭&`.
+                                            // Apply the left padding explicitly and keep the
+                                            // logical prefix order left-to-right.
+                                            prefix_span_layout(),
                                             |ui| {
                                                 if continues_matrix_event {
                                                     ui.set_opacity(0.0);
@@ -5636,7 +5798,7 @@ impl eframe::App for WeeChatApp {
                                                 ui.add_space((col_width - measured_w).max(0.0));
                                                 for s in prefix_sections {
                                                     let format = s.style.to_format(font_id.clone(), &render_theme);
-                                                    self.render_text_with_emoji(ui, &s.text, &format, false);
+                                                    self.render_text_with_emoji(ui, &s.text, &format, false, true);
                                                 }
                                             }
                                         );
