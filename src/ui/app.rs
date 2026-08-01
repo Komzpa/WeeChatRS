@@ -4862,7 +4862,7 @@ impl eframe::App for WeeChatApp {
                             let row_h   = line_h + 8.0; // 4 px top + 4 px bottom padding
 
                             // Chevron width reserved on the right for collapsible server groups.
-                            let chevron_w = if is_root && !is_core { 14.0_f32 } else { 0.0_f32 };
+                            let chevron_w = if is_root && !is_core { 18.0_f32 } else { 0.0_f32 };
 
                             // Allocate exact row space — no sense here so layout is not affected.
                             let (outer_rect, _) = ui.allocate_exact_size(
@@ -5000,26 +5000,46 @@ impl eframe::App for WeeChatApp {
                             let row_id = egui::Id::new("buf_row").with(&buffer.id);
                             let resp   = ui.interact(row_interact_rect, row_id, egui::Sense::click_and_drag());
 
-                            // Chevron collapse toggle — registered after row so it wins the hit-test
-                            // when the pointer is inside the (non-overlapping) chevron rect.
+                            // Disclosure toggle — registered after row so it wins the hit-test
+                            // when the pointer is inside the (non-overlapping) icon rect. Draw the
+                            // triangle ourselves instead of relying on a Unicode chevron glyph:
+                            // user-selected fonts often lack it and egui then renders a tofu box.
                             if is_root && !is_core {
                                 let chevron_rect = egui::Rect::from_min_max(
                                     egui::pos2(outer_rect.max.x - chevron_w, outer_rect.min.y),
                                     outer_rect.max,
                                 );
                                 let is_collapsed = self.collapsed_servers.contains(&buffer.server);
-                                let chevron_char = if is_collapsed { "▶" } else { "▼" };
                                 let chev_id   = egui::Id::new("buf_chev").with(&buffer.id);
-                                let chev_resp = ui.interact(chevron_rect, chev_id, egui::Sense::click());
+                                let chev_resp = ui
+                                    .interact(chevron_rect, chev_id, egui::Sense::click())
+                                    .on_hover_text(if is_collapsed {
+                                        "Expand buffer group"
+                                    } else {
+                                        "Collapse buffer group"
+                                    });
                                 let chev_color = if chev_resp.hovered() { text_primary } else { fg };
-                                ui.painter().with_clip_rect(chevron_rect.intersect(panel_clip))
-                                    .text(
-                                        chevron_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        chevron_char,
-                                        egui::FontId::new(8.0, FontFamily::Proportional),
+                                let center = chevron_rect.center();
+                                let points = if is_collapsed {
+                                    vec![
+                                        egui::pos2(center.x - 2.5, center.y - 4.0),
+                                        egui::pos2(center.x - 2.5, center.y + 4.0),
+                                        egui::pos2(center.x + 3.5, center.y),
+                                    ]
+                                } else {
+                                    vec![
+                                        egui::pos2(center.x - 4.0, center.y - 2.5),
+                                        egui::pos2(center.x + 4.0, center.y - 2.5),
+                                        egui::pos2(center.x, center.y + 3.5),
+                                    ]
+                                };
+                                ui.painter()
+                                    .with_clip_rect(chevron_rect.intersect(panel_clip))
+                                    .add(egui::Shape::convex_polygon(
+                                        points,
                                         chev_color,
-                                    );
+                                        egui::Stroke::NONE,
+                                    ));
                                 if chev_resp.clicked() {
                                     pending_collapse_toggle = Some(buffer.server.clone());
                                 }
