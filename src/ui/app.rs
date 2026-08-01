@@ -1035,6 +1035,40 @@ fn stable_thread_snapshot(current: Option<&Buffer>, previous: Option<&Buffer>) -
     Some(snapshot)
 }
 
+/// WeeChat buffer IDs are process-local. Keep an open Matrix thread attached
+/// to its stable room/root identity when the relay backend recreates buffers.
+fn live_thread_buffer_id(
+    buffers: &[Buffer],
+    current_id: Option<&str>,
+    snapshot: Option<&Buffer>,
+) -> Option<String> {
+    if let Some(current_id) = current_id.filter(|id| {
+        buffers
+            .iter()
+            .any(|buffer| buffer.id == *id && buffer.is_matrix_thread())
+    }) {
+        return Some(current_id.to_owned());
+    }
+
+    let snapshot = snapshot?;
+    let room_id = snapshot.matrix_room_id.as_deref()?;
+    let thread_root = snapshot.matrix_thread_root.as_deref()?;
+    let connection_prefix = snapshot.id.split_once('/').map(|(prefix, _)| prefix);
+
+    buffers
+        .iter()
+        .find(|buffer| {
+            buffer.is_matrix_thread()
+                && buffer.matrix_room_id.as_deref() == Some(room_id)
+                && buffer.matrix_thread_root.as_deref() == Some(thread_root)
+                && connection_prefix.is_none_or(|prefix| {
+                    buffer.id.split_once('/').map(|(candidate, _)| candidate)
+                        == Some(prefix)
+                })
+        })
+        .map(|buffer| buffer.id.clone())
+}
+
 /// Service buffers and Matrix thread buffers are implementation details, not a
 /// useful chat destination to reopen after restart.
 pub(crate) fn is_restorable_chat_buffer(buffer: &Buffer) -> bool {
@@ -1458,6 +1492,33 @@ mod thread_tests {
                 .messages
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn open_thread_remaps_after_backend_recreates_buffer_ids() {
+        let old = thread_buffer("local/1785554655975327");
+        let mut recreated = thread_buffer("local/1785557588310747");
+        recreated.messages.push_back(line(
+            "1",
+            "alice",
+            "restored message",
+            "$event:example.org",
+        ));
+
+        let remapped = live_thread_buffer_id(
+            &[recreated],
+            Some("local/1785554655975327"),
+            Some(&old),
+        );
+        assert_eq!(
+            remapped.as_deref(),
+            Some("local/1785557588310747"),
+        );
+        assert_eq!(
+            clipboard_upload_target(true, remapped.as_deref(), Some("local/room"))
+                .as_deref(),
+            Some("local/1785557588310747"),
         );
     }
 
@@ -4750,6 +4811,15 @@ impl eframe::App for WeeChatApp {
             .is_some_and(|thread| thread.matrix_room_id != current_matrix_room_id);
         if thread_room_changed {
             self.close_thread();
+        }
+        if self.open_thread_buffer_id.is_some() {
+            if let Some(live_id) = live_thread_buffer_id(
+                &self.buffers,
+                self.open_thread_buffer_id.as_deref(),
+                self.open_thread_snapshot.as_ref(),
+            ) {
+                self.open_thread_buffer_id = Some(live_id);
+            }
         }
         if let Some(thread_id) = self.open_thread_buffer_id.as_deref() {
             let current_thread = self
