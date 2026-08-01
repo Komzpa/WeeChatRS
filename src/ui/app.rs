@@ -2240,6 +2240,10 @@ pub struct AppSettings {
     pub buffer_order: Vec<String>,
     #[serde(default)]
     pub cleared_buffer_ids: HashSet<String>,
+    /// Buffers explicitly read by the user, keyed by their stable prefixed full name.
+    /// Relay buffer IDs are process-local and change whenever WeeChat restarts.
+    #[serde(default)]
+    pub cleared_buffer_names: HashSet<String>,
     #[serde(default)]
     pub read_markers: HashMap<String, SavedReadMarker>,
     #[serde(default)]
@@ -2355,6 +2359,7 @@ impl Default for AppSettings {
             show_hidden_buffers: false,
             buffer_order: Vec::new(),
             cleared_buffer_ids: HashSet::new(),
+            cleared_buffer_names: HashSet::new(),
             read_markers: HashMap::new(),
             save_password: false,
             font_name: String::new(),
@@ -2485,8 +2490,13 @@ pub struct WeeChatApp {
     pub(crate) dragging_buffer_id: Option<String>,
     pub(crate) drag_drop_before_id: Option<String>,
 
-    // Buffers the user has explicitly read this session; suppresses stale hotlist entries.
+    // Runtime relay IDs for buffers read during this process. Relay IDs are not persisted
+    // as authoritative state because WeeChat allocates new ones after every restart.
     pub(crate) cleared_buffer_ids: HashSet<String>,
+
+    // Stable full names for buffers the user has explicitly read. These survive a WeeChat
+    // restart and suppress the restored server hotlist until a real new line arrives.
+    pub(crate) cleared_buffer_names: HashSet<String>,
 
     // Last read line per stable connection/buffer name. WeeChat's Relay API does not
     // return the backend read marker, so this is the reload-safe source for the divider.
@@ -2756,6 +2766,22 @@ impl SavedReadMarker {
                 .unwrap_or_else(|| BEFORE_FIRST_LOADED_LINE_ID.to_owned())
         })
     }
+
+    pub(crate) fn advanced_with(&self, candidate: Self) -> Self {
+        if candidate.timestamp_nanos >= self.timestamp_nanos {
+            candidate
+        } else {
+            self.clone()
+        }
+    }
+}
+
+fn restored_cleared_buffer_names(settings: &AppSettings) -> HashSet<String> {
+    let mut names = settings.cleared_buffer_names.clone();
+    // Migration for settings written before stable cleared names existed. A saved marker is
+    // only created after the user visits a buffer, so it is safe to treat it as read state.
+    names.extend(settings.read_markers.keys().cloned());
+    names
 }
 
 #[cfg(test)]
@@ -2824,13 +2850,54 @@ mod saved_read_marker_tests {
                 timestamp_nanos: 1_750_000_000_000_000_000,
             },
         );
+        settings.cleared_buffer_names.insert(
+            "local/matrix.matrix.!room:example.org".to_owned(),
+        );
         settings.last_chat_buffer_name =
             Some("local/matrix.matrix.!room:example.org".to_owned());
 
         let encoded = serde_json::to_string(&settings).unwrap();
         let restored: AppSettings = serde_json::from_str(&encoded).unwrap();
         assert_eq!(restored.read_markers, settings.read_markers);
+        assert_eq!(
+            restored.cleared_buffer_names,
+            settings.cleared_buffer_names
+        );
         assert_eq!(restored.last_chat_buffer_name, settings.last_chat_buffer_name);
+    }
+
+    #[test]
+    fn stable_cleared_names_migrate_from_saved_read_markers() {
+        let mut settings = AppSettings::default();
+        let name = "local/matrix.matrix.!room:example.org".to_owned();
+        settings.read_markers.insert(
+            name.clone(),
+            SavedReadMarker {
+                line_id: "old-id".to_owned(),
+                timestamp_nanos: 200,
+            },
+        );
+
+        assert!(super::restored_cleared_buffer_names(&settings).contains(&name));
+    }
+
+    #[test]
+    fn saved_read_marker_never_moves_backwards() {
+        let current = SavedReadMarker {
+            line_id: "newer".to_owned(),
+            timestamp_nanos: 200,
+        };
+        let older = SavedReadMarker {
+            line_id: "older-snapshot".to_owned(),
+            timestamp_nanos: 100,
+        };
+        let newer = SavedReadMarker {
+            line_id: "newest".to_owned(),
+            timestamp_nanos: 300,
+        };
+
+        assert_eq!(current.advanced_with(older), current);
+        assert_eq!(current.advanced_with(newer.clone()), newer);
     }
 
     #[test]
@@ -3131,6 +3198,7 @@ impl WeeChatApp {
         let available_fonts = crate::ui::fonts::scan_system_fonts();
 
         let adaptive_theme = settings.adaptive_theme;
+        let cleared_buffer_names = restored_cleared_buffer_names(&settings);
         let wallpaper_rx = if adaptive_theme {
             Some(crate::ui::wallpaper::start_wallpaper_thread(cc.egui_ctx.clone()))
         } else {
@@ -3213,7 +3281,10 @@ impl WeeChatApp {
             buffer_order: settings.buffer_order,
             dragging_buffer_id: None,
             drag_drop_before_id: None,
-            cleared_buffer_ids: settings.cleared_buffer_ids,
+            // Legacy persisted relay IDs are deliberately discarded: they may now identify
+            // unrelated buffers in a restarted WeeChat process.
+            cleared_buffer_ids: HashSet::new(),
+            cleared_buffer_names,
             read_markers: settings.read_markers,
             font_name: settings.font_name,
             font_path: settings.font_path.clone(),
@@ -4132,7 +4203,21 @@ impl WeeChatApp {
                 .map(|line| (buffer.full_name.clone(), SavedReadMarker::from_line(line)))
         });
         if let Some((full_name, marker)) = marker {
-            self.read_markers.insert(full_name, marker);
+            self.advance_read_marker(full_name, marker);
+        }
+    }
+
+    pub(crate) fn advance_read_marker(&mut self, full_name: String, marker: SavedReadMarker) {
+        self.read_markers
+            .entry(full_name)
+            .and_modify(|saved| *saved = saved.advanced_with(marker.clone()))
+            .or_insert(marker);
+    }
+
+    pub(crate) fn clear_buffer_activity_persistently(&mut self, id: &str) {
+        self.cleared_buffer_ids.insert(id.to_owned());
+        if let Some(full_name) = self.buffer_by_id(id).map(|buffer| buffer.full_name.clone()) {
+            self.cleared_buffer_names.insert(full_name);
         }
     }
 
@@ -4165,7 +4250,7 @@ impl WeeChatApp {
         }
         self.focus_input = true;
         self.selected_view_since = Some(std::time::Instant::now());
-        self.cleared_buffer_ids.insert(id.clone());
+        self.clear_buffer_activity_persistently(&id);
         if let Some(buffer) = self.buffer_by_id_mut(&id) {
             buffer.activity = BufferActivity::None;
             buffer.unread_count = 0;
@@ -4202,6 +4287,7 @@ impl WeeChatApp {
             buffer.activity = BufferActivity::None;
             buffer.unread_count = 0;
         }
+        self.clear_buffer_activity_persistently(&buffer_id);
         self.remember_buffer_read_marker(&buffer_id);
         if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
             if needs_lines {
@@ -4381,7 +4467,9 @@ impl eframe::App for WeeChatApp {
             opacity: self.opacity,
             show_hidden_buffers: self.show_hidden_buffers,
             buffer_order: self.buffer_order.clone(),
-            cleared_buffer_ids: self.cleared_buffer_ids.clone(),
+            // IDs are runtime-only. Stable names below are the reload-safe source of truth.
+            cleared_buffer_ids: HashSet::new(),
+            cleared_buffer_names: self.cleared_buffer_names.clone(),
             read_markers: self.read_markers.clone(),
             save_password: false,
             font_name: self.font_name.clone(),

@@ -193,7 +193,9 @@ impl WeeChatApp {
                 let pfx = format!("{}/", conn_prefix);
                 self.buffers.retain(|b| !b.id.starts_with(&pfx));
                 self.rebuild_buffer_idx();
-                // Clear suppression set so the fresh hotlist can apply unread counts correctly
+                // Relay IDs are process-local. Drop only the transient ID cache; stable cleared
+                // names must survive reconnect so WeeChat's restored hotlist cannot resurrect
+                // already-read history.
                 self.cleared_buffer_ids.retain(|id| !id.starts_with(&pfx));
                 // Fetch buffer list and sync subscriptions on connected connection
                 let conn_prefix_owned = conn_prefix.to_string();
@@ -375,8 +377,20 @@ impl WeeChatApp {
                 let mut buf_name = String::new();
                 let mut notify_prefix = String::new();
                 let mut notify_message = String::new();
+                let stable_name = self
+                    .buffer_by_id(&full_id)
+                    .map(|buffer| buffer.full_name.clone());
+                let is_newer_than_marker = stable_name.as_ref().is_none_or(|name| {
+                    self.read_markers.get(name).is_none_or(|marker| {
+                        line.timestamp.timestamp_nanos_opt().unwrap_or_default()
+                            > marker.timestamp_nanos
+                    })
+                });
+                let mut marker_to_advance = None;
+                let mut release_suppression = false;
                 if let Some(buf) = self.buffer_by_id_mut(&full_id) {
-                    if !is_selected && !buf.muted && line.displayed {
+                    if !is_selected && !buf.muted && line.displayed && is_newer_than_marker {
+                        release_suppression = true;
                         if line.highlight {
                             buf.activity = crate::relay::models::BufferActivity::Highlight;
                             should_notify = true;
@@ -388,10 +402,23 @@ impl WeeChatApp {
                         }
                         buf.unread_count = buf.unread_count.saturating_add(1);
                     }
+                    if is_selected && line.displayed {
+                        buf.last_read_id = Some(line.id.clone());
+                        marker_to_advance = Some(SavedReadMarker::from_line(&line));
+                    }
                     buf.messages.push_back(line);
                     if buf.messages.len() > MAX_STORED_LINES {
                         buf.messages.pop_front();
                     }
+                }
+                if release_suppression {
+                    self.cleared_buffer_ids.remove(&full_id);
+                    if let Some(name) = &stable_name {
+                        self.cleared_buffer_names.remove(name);
+                    }
+                }
+                if let (Some(name), Some(marker)) = (stable_name, marker_to_advance) {
+                    self.advance_read_marker(name, marker);
                 }
                 if should_notify {
                     self.notify_highlight(&full_id, &buf_name, &notify_prefix, &notify_message);
@@ -646,12 +673,8 @@ impl WeeChatApp {
                     }
                 }
                 "buffer_hotlist_added" | "buffer_hotlist_updated" => {
-                    // New unread activity pushed while connected — remove from cleared set
-                    // so the real unread state is applied rather than being suppressed.
-                    if let Some(raw_id) = resp.buffer_id.map(|i| i.to_string()) {
-                        let full_id = format!("{}/{}", conn_prefix, raw_id);
-                        self.cleared_buffer_ids.remove(&full_id);
-                    }
+                    // A hotlist update is also emitted while WeeChat restores old buffers.
+                    // Keep suppression until the corresponding real new line arrives.
                     self.handle_hotlist(conn_prefix, resp);
                 }
                 "buffer_hotlist_removed" => {
@@ -1316,6 +1339,11 @@ impl WeeChatApp {
                     if self.cleared_buffer_ids.contains(&buffer_id) {
                         continue;
                     }
+                    if self.buffer_by_id(&buffer_id).is_some_and(|buffer| {
+                        self.cleared_buffer_names.contains(&buffer.full_name)
+                    }) {
+                        continue;
+                    }
                     if let Some(buffer) = self.buffer_by_id_mut(&buffer_id) {
                         buffer.activity = match priority {
                             3 => BufferActivity::Highlight,
@@ -1434,7 +1462,7 @@ impl WeeChatApp {
             }
         }
         if let Some((full_name, marker)) = marker_to_save {
-            self.read_markers.insert(full_name, marker);
+            self.advance_read_marker(full_name, marker);
         }
         if is_load_more {
             self.loading_more_buffer_id = None;
@@ -1664,6 +1692,13 @@ impl WeeChatApp {
                     if let Some(idx) = self.buffer_idx_of(&buffer_id) {
                         let buffer = &mut self.buffers[idx];
                         if !buffer.messages.iter().any(|m| m.id == line.id) {
+                            let is_newer_than_saved_marker = self
+                                .read_markers
+                                .get(&buffer.full_name)
+                                .is_none_or(|marker| {
+                                    line.timestamp.timestamp_nanos_opt().unwrap_or_default()
+                                        > marker.timestamp_nanos
+                                });
                             let is_historical = buffer
                                 .messages
                                 .back()
@@ -1685,12 +1720,21 @@ impl WeeChatApp {
                             if is_selected {
                                 if !is_historical {
                                     buffer.last_read_id = Some(line.id.clone());
-                                    self.read_markers.insert(
-                                        buffer.full_name.clone(),
-                                        SavedReadMarker::from_line(&line),
-                                    );
+                                    let full_name = buffer.full_name.clone();
+                                    let marker = SavedReadMarker::from_line(&line);
+                                    self.read_markers
+                                        .entry(full_name)
+                                        .and_modify(|saved| {
+                                            *saved = saved.advanced_with(marker.clone())
+                                        })
+                                        .or_insert(marker);
                                 }
-                            } else if displayed && !buffer.muted && !is_notify_none && !is_self_msg {
+                            } else if displayed
+                                && !buffer.muted
+                                && !is_notify_none
+                                && !is_self_msg
+                                && is_newer_than_saved_marker
+                            {
                                 let activity = if is_highlight || notify_level == 3 {
                                     BufferActivity::Highlight
                                 } else if notify_level == 2 {
@@ -1703,11 +1747,12 @@ impl WeeChatApp {
 
                                 if !is_join_part {
                                     buffer.unread_count = buffer.unread_count.saturating_add(1);
+                                    self.cleared_buffer_ids.remove(&buffer_id);
+                                    self.cleared_buffer_names.remove(&buffer.full_name);
                                 }
 
                                 if activity > buffer.activity {
                                     buffer.activity = activity;
-                                    self.cleared_buffer_ids.remove(&buffer_id);
                                 }
 
                                 if (is_highlight || notify_level == 3) && !buffer.muted {
