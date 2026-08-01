@@ -2533,6 +2533,8 @@ pub struct WeeChatApp {
     pub(crate) history_scroll_anchors: HashMap<String, (String, usize)>,
     /// A top-edge request is armed again only after the user scrolls away.
     pub(crate) history_top_armed_buffer_ids: HashSet<String>,
+    /// One-shot viewport acknowledgement for an own message accepted by the relay.
+    pub(crate) force_scroll_to_bottom_buffer_id: Option<String>,
 
     // Transient search text inside the font-family dropdown.
     pub(crate) font_search: String,
@@ -3300,6 +3302,7 @@ impl WeeChatApp {
             history_exhausted_buffer_ids: HashSet::new(),
             history_scroll_anchors: HashMap::new(),
             history_top_armed_buffer_ids: HashSet::new(),
+            force_scroll_to_bottom_buffer_id: None,
             font_search: String::new(),
             prefix_align_max: settings.prefix_align_max,
             prefix_suffix: settings.prefix_suffix,
@@ -4852,6 +4855,7 @@ impl eframe::App for WeeChatApp {
         let mut pending_load_more: Option<(String, String)> = None;
         let mut pending_history_top_rearm: Option<String> = None;
         let mut pending_clear_history_anchor: Option<String> = None;
+        let mut consumed_force_scroll_to_bottom = false;
         let mut pending_reply_target: Option<ReplyTarget> = None;
         let mut pending_open_thread_buffer_id: Option<String> = None;
 
@@ -7275,6 +7279,13 @@ impl eframe::App for WeeChatApp {
                                         line.matrix_event_id.clone();
                                 }
                             }
+                            if self.force_scroll_to_bottom_buffer_id.as_deref()
+                                == current_buffer_id.as_deref()
+                            {
+                                ui.add_space(0.0);
+                                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                                consumed_force_scroll_to_bottom = true;
+                            }
                         });
 
                     if let Some(buf_id) = current_buffer_id.as_ref() {
@@ -7308,6 +7319,9 @@ impl eframe::App for WeeChatApp {
         }
         if let Some(buf_id) = pending_clear_history_anchor {
             self.history_scroll_anchors.remove(&buf_id);
+        }
+        if consumed_force_scroll_to_bottom {
+            self.force_scroll_to_bottom_buffer_id = None;
         }
         if let Some((load_buffer_id, view_buffer_id)) = pending_load_more {
             self.request_older_history(&load_buffer_id, &view_buffer_id);
