@@ -1013,6 +1013,89 @@ mod responsive_layout_tests {
 struct ThreadReplyContext {
     sender: Option<String>,
     quotes: Vec<String>,
+    has_header: bool,
+}
+
+fn reply_quote_text(line: &Line) -> String {
+    let quote = line
+        .plain_message
+        .strip_prefix("> ")
+        .unwrap_or(&line.plain_message)
+        .trim_start();
+    let own_sender = line.plain_prefix.trim();
+    if !own_sender.is_empty() {
+        if let Some(body) = quote.strip_prefix(own_sender) {
+            if let Some(body) = body.strip_prefix(':') {
+                return body.trim_start().to_owned();
+            }
+        }
+    }
+    quote.to_owned()
+}
+
+fn reply_contexts_by_event(lines: &VecDeque<Line>) -> HashMap<String, ThreadReplyContext> {
+    let mut replies = HashMap::new();
+    for line in lines {
+        let (Some(event_id), Some(reply)) = (&line.matrix_event_id, &line.matrix_reply) else {
+            continue;
+        };
+        let context = replies
+            .entry(event_id.clone())
+            .or_insert_with(|| ThreadReplyContext {
+                sender: reply.sender.clone(),
+                quotes: Vec::new(),
+                has_header: false,
+            });
+        if context.sender.is_none() {
+            context.sender = reply.sender.clone();
+        }
+        match reply.kind {
+            MatrixReplyLineKind::Header => context.has_header = true,
+            MatrixReplyLineKind::Quote => context.quotes.push(reply_quote_text(line)),
+        }
+    }
+    replies
+}
+
+fn render_reply_context_card(
+    ui: &mut egui::Ui,
+    reply: &ThreadReplyContext,
+    card_bg: Color32,
+    accent_color: Color32,
+    text_secondary: Color32,
+) -> egui::Response {
+    let card = Frame::none()
+        .fill(card_bg.linear_multiply(0.72))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin {
+            left: 12.0,
+            right: 10.0,
+            top: 5.0,
+            bottom: 6.0,
+        })
+        .show(ui, |ui| {
+            ui.set_max_width(ui.available_width().min(620.0));
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(
+                egui::RichText::new(reply.sender.as_deref().unwrap_or("unknown sender"))
+                    .strong()
+                    .color(accent_color),
+            );
+            for quote in &reply.quotes {
+                ui.label(
+                    egui::RichText::new(quote)
+                        .color(text_secondary)
+                        .italics(),
+                );
+            }
+        });
+    let rail = egui::Rect::from_min_max(
+        card.response.rect.min,
+        egui::pos2(card.response.rect.min.x + 3.0, card.response.rect.max.y),
+    );
+    ui.painter()
+        .rect_filled(rail, Rounding::same(3.0), accent_color);
+    card.response
 }
 
 #[derive(Clone)]
@@ -1044,23 +1127,20 @@ fn append_thread_line(block: &mut ThreadMessageBlock, line: &Line) {
             block.reply = Some(ThreadReplyContext {
                 sender: reply.sender.clone(),
                 quotes: Vec::new(),
+                has_header: true,
             });
         }
         Some(MatrixReplyLineKind::Quote) => {
-            let quote = line
-                .plain_message
-                .strip_prefix("> ")
-                .unwrap_or(&line.plain_message)
-                .to_owned();
             let reply = line.matrix_reply.as_ref().expect("reply quote");
             block
                 .reply
                 .get_or_insert_with(|| ThreadReplyContext {
                     sender: reply.sender.clone(),
                     quotes: Vec::new(),
+                    has_header: false,
                 })
                 .quotes
-                .push(quote);
+                .push(reply_quote_text(line));
         }
         None => block.content.push(ThreadMessageContent {
             message: line.message.clone(),
@@ -1581,6 +1661,62 @@ mod thread_tests {
         let reply = blocks[0].reply.as_ref().expect("reply context");
         assert_eq!(reply.sender.as_deref(), Some("Alice"));
         assert_eq!(reply.quotes, ["original message"]);
+    }
+
+    #[test]
+    fn combines_room_reply_header_and_quote_without_repeating_current_sender() {
+        let mut header = line(
+            "1",
+            "lbart[m]",
+            "Reply to Regina Obe:",
+            "$reply:example.org",
+        );
+        header.matrix_reply = Some(MatrixReplyContext {
+            event_id: Some("$original:example.org".to_owned()),
+            sender: Some("Regina Obe".to_owned()),
+            kind: MatrixReplyLineKind::Header,
+        });
+        let mut quote = line(
+            "2",
+            "lbart[m]",
+            "> lbart[m]:  oslandia still manages this",
+            "$reply:example.org",
+        );
+        quote.matrix_reply = Some(MatrixReplyContext {
+            event_id: Some("$original:example.org".to_owned()),
+            sender: Some("Regina Obe".to_owned()),
+            kind: MatrixReplyLineKind::Quote,
+        });
+
+        let contexts = reply_contexts_by_event(&VecDeque::from([header, quote]));
+        let context = contexts
+            .get("$reply:example.org")
+            .expect("one combined reply context");
+        assert!(context.has_header);
+        assert_eq!(context.sender.as_deref(), Some("Regina Obe"));
+        assert_eq!(context.quotes, ["oslandia still manages this"]);
+    }
+
+    #[test]
+    fn keeps_orphaned_reply_quote_visible_at_a_history_boundary() {
+        let mut quote = line(
+            "2",
+            "lbart[m]",
+            "> older message at the pagination boundary",
+            "$reply:example.org",
+        );
+        quote.matrix_reply = Some(MatrixReplyContext {
+            event_id: Some("$original:example.org".to_owned()),
+            sender: Some("Regina Obe".to_owned()),
+            kind: MatrixReplyLineKind::Quote,
+        });
+
+        let contexts = reply_contexts_by_event(&VecDeque::from([quote]));
+        let context = contexts
+            .get("$reply:example.org")
+            .expect("orphaned quote context");
+        assert!(!context.has_header);
+        assert_eq!(context.quotes, ["older message at the pagination boundary"]);
     }
 
     #[test]
@@ -5493,82 +5629,15 @@ impl eframe::App for WeeChatApp {
                                             );
                                         });
                                         if let Some(reply) = &block.reply {
-                                            ui.add_space(4.0);
-                                            let reply_card = Frame::none()
-                                                .fill(card_bg)
-                                                .rounding(Rounding::same(6.0))
-                                                .stroke(Stroke::new(
-                                                    1.0,
-                                                    border_color,
-                                                ))
-                                                .inner_margin(Margin {
-                                                    left: 13.0,
-                                                    right: 10.0,
-                                                    top: 7.0,
-                                                    bottom: 7.0,
-                                                })
-                                                .show(ui, |ui| {
-                                                    ui.horizontal_wrapped(|ui| {
-                                                        ui.label(
-                                                            egui::RichText::new(
-                                                                "↩ Reply to",
-                                                            )
-                                                            .small()
-                                                            .color(text_muted),
-                                                        );
-                                                        ui.label(
-                                                            egui::RichText::new(
-                                                                reply
-                                                                    .sender
-                                                                    .as_deref()
-                                                                    .unwrap_or(
-                                                                        "unknown sender",
-                                                                    ),
-                                                            )
-                                                            .strong()
-                                                            .color(
-                                                                accent_color,
-                                                            ),
-                                                        );
-                                                    });
-                                                    for quote in &reply.quotes {
-                                                        ui.label(
-                                                            egui::RichText::new(
-                                                                quote,
-                                                            )
-                                                            .color(
-                                                                text_secondary,
-                                                            )
-                                                            .italics(),
-                                                        );
-                                                    }
-                                                });
-                                            let bar =
-                                                egui::Rect::from_min_max(
-                                                    reply_card
-                                                        .response
-                                                        .rect
-                                                        .min,
-                                                    egui::pos2(
-                                                        reply_card
-                                                                .response
-                                                                .rect
-                                                                .min
-                                                                .x
-                                                            + 3.0,
-                                                        reply_card
-                                                            .response
-                                                            .rect
-                                                            .max
-                                                            .y,
-                                                    ),
-                                                );
-                                            ui.painter().rect_filled(
-                                                bar,
-                                                Rounding::same(3.0),
+                                            ui.add_space(2.0);
+                                            render_reply_context_card(
+                                                ui,
+                                                reply,
+                                                card_bg,
                                                 accent_color,
+                                                text_secondary,
                                             );
-                                            ui.add_space(4.0);
+                                            ui.add_space(2.0);
                                         }
                                         for content in &block.content {
                                             if content.message.is_empty() && content.media.is_none() {
@@ -6615,6 +6684,7 @@ impl eframe::App for WeeChatApp {
                                             .map(|line| line.id.as_str())
                                     })
                                     .collect();
+                                let reply_contexts = reply_contexts_by_event(messages);
                                 let mut previous_matrix_event_id: Option<String> = None;
                                 for (line_index, line) in messages.iter().enumerate() {
                                     if !self.show_filtered_lines && !line.displayed { continue; }
@@ -6633,7 +6703,27 @@ impl eframe::App for WeeChatApp {
                                     }
 
                                     if let Some(q) = &search_query {
-                                        if !line.plain_prefix_lower.contains(q) && !line.plain_message_lower.contains(q) { continue; }
+                                        let reply_context_matches = line
+                                            .matrix_event_id
+                                            .as_ref()
+                                            .and_then(|event_id| reply_contexts.get(event_id))
+                                            .is_some_and(|reply| {
+                                                reply
+                                                    .sender
+                                                    .as_deref()
+                                                    .is_some_and(|sender| {
+                                                        sender.to_lowercase().contains(q)
+                                                    })
+                                                    || reply.quotes.iter().any(|quote| {
+                                                        quote.to_lowercase().contains(q)
+                                                    })
+                                            });
+                                        if !line.plain_prefix_lower.contains(q)
+                                            && !line.plain_message_lower.contains(q)
+                                            && !reply_context_matches
+                                        {
+                                            continue;
+                                        }
                                     }
                                     let local_timestamp =
                                         line.timestamp.with_timezone(&chrono::Local);
@@ -6702,6 +6792,23 @@ impl eframe::App for WeeChatApp {
                                         }
                                         ui.add_space(8.0);
                                         marker_shown = true;
+                                    }
+
+                                    // Reply quotes are rendered together with their header as one
+                                    // compact context card. Keep an orphaned quote visible when a
+                                    // history page starts after its header.
+                                    if line.matrix_reply.as_ref().is_some_and(|reply| {
+                                        matches!(reply.kind, MatrixReplyLineKind::Quote)
+                                            && line
+                                                .matrix_event_id
+                                                .as_ref()
+                                                .and_then(|event_id| {
+                                                    reply_contexts.get(event_id)
+                                                })
+                                                .is_some_and(|context| context.has_header)
+                                    }) {
+                                        previous_matrix_event_id = line.matrix_event_id.clone();
+                                        continue;
                                     }
 
                                     let is_own_mention = line.highlight
@@ -6889,70 +6996,39 @@ impl eframe::App for WeeChatApp {
                                             ui.set_min_width(msg_col_width);
                                             ui.set_max_width(msg_col_width);
                                             let message_previews = if let Some(reply) = &line.matrix_reply {
-                                                let reply_card = Frame::none()
-                                                    .fill(card_bg)
-                                                    .rounding(Rounding::same(6.0))
-                                                    .stroke(Stroke::new(1.0, border_color))
-                                                    .inner_margin(Margin {
-                                                        left: 14.0,
-                                                        right: 12.0,
-                                                        top: 7.0,
-                                                        bottom: 7.0,
-                                                    })
-                                                    .show(ui, |ui| {
-                                                        ui.set_max_width(
-                                                            ui.available_width().min(620.0),
-                                                        );
-                                                        match reply.kind {
-                                                            MatrixReplyLineKind::Header => {
-                                                                ui.horizontal_wrapped(|ui| {
-                                                                    ui.label(
-                                                                        egui::RichText::new("↩ Reply to")
-                                                                            .small()
-                                                                            .color(text_muted),
-                                                                    );
-                                                                    ui.label(
-                                                                        egui::RichText::new(
-                                                                            reply.sender.as_deref().unwrap_or(
-                                                                                "unknown sender",
-                                                                            ),
-                                                                        )
-                                                                        .strong()
-                                                                        .color(accent_color),
-                                                                    );
-                                                                });
-                                                            }
-                                                            MatrixReplyLineKind::Quote => {
-                                                                let quote = line
-                                                                    .plain_message
-                                                                    .strip_prefix("> ")
-                                                                    .unwrap_or(&line.plain_message);
-                                                                ui.label(
-                                                                    egui::RichText::new(quote)
-                                                                        .color(text_secondary)
-                                                                        .italics(),
-                                                                );
-                                                            }
-                                                        }
-                                                    });
-                                                let bar = egui::Rect::from_min_max(
-                                                    reply_card.response.rect.min,
-                                                    egui::pos2(
-                                                        reply_card.response.rect.min.x + 3.0,
-                                                        reply_card.response.rect.max.y,
+                                                let fallback_reply = ThreadReplyContext {
+                                                    sender: reply.sender.clone(),
+                                                    quotes: if matches!(
+                                                        reply.kind,
+                                                        MatrixReplyLineKind::Quote
+                                                    ) {
+                                                        vec![reply_quote_text(line)]
+                                                    } else {
+                                                        Vec::new()
+                                                    },
+                                                    has_header: matches!(
+                                                        reply.kind,
+                                                        MatrixReplyLineKind::Header
                                                     ),
-                                                );
-                                                ui.painter().rect_filled(
-                                                    bar,
-                                                    Rounding::same(3.0),
+                                                };
+                                                let reply_context = line
+                                                    .matrix_event_id
+                                                    .as_ref()
+                                                    .and_then(|event_id| {
+                                                        reply_contexts.get(event_id)
+                                                    })
+                                                    .unwrap_or(&fallback_reply);
+                                                let reply_response = render_reply_context_card(
+                                                    ui,
+                                                    reply_context,
+                                                    card_bg,
                                                     accent_color,
+                                                    text_secondary,
                                                 );
                                                 if let Some(event_id) =
                                                     reply.event_id.as_deref()
                                                 {
-                                                    reply_card
-                                                        .response
-                                                        .clone()
+                                                    reply_response
                                                         .on_hover_text(format!(
                                                             "Reply target: {event_id}"
                                                         ));
