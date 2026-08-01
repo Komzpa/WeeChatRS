@@ -279,16 +279,22 @@ async fn wait_for_matrix_media(path: &Path) -> Result<Vec<u8>, String> {
             if size > 0 && previous_size == Some(size) {
                 stable_samples += 1;
                 if stable_samples >= 10 {
-                    #[cfg(unix)]
-                    tokio::fs::set_permissions(
-                        path,
-                        std::fs::Permissions::from_mode(0o600),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    return tokio::fs::read(path)
+                    let bytes = tokio::fs::read(path)
                         .await
-                        .map_err(|error| error.to_string());
+                        .map_err(|error| error.to_string())?;
+                    if matrix_image_bytes_complete(&bytes) {
+                        #[cfg(unix)]
+                        tokio::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        return Ok(bytes);
+                    }
+                    // A download may pause without being finished. Keep
+                    // waiting instead of caching a transient decode failure.
+                    stable_samples = 0;
                 }
             } else {
                 stable_samples = 0;
@@ -338,6 +344,11 @@ fn inline_image_dimensions_allowed(width: u32, height: u32) -> bool {
     width <= MAX_INLINE_IMAGE_DIMENSION
         && height <= MAX_INLINE_IMAGE_DIMENSION
         && u64::from(width).saturating_mul(u64::from(height)) <= MAX_INLINE_IMAGE_PIXELS
+}
+
+fn matrix_image_bytes_complete(bytes: &[u8]) -> bool {
+    validate_inline_image_dimensions(bytes).is_ok()
+        && image::load_from_memory(bytes).is_ok()
 }
 
 fn avatar_thumbnail(image: &image::DynamicImage, edge: u32) -> image::RgbaImage {
@@ -468,7 +479,8 @@ mod inline_matrix_image_tests {
         avatar_thumbnail,
         inline_image_dimensions_allowed,
         inline_image_display_size, inline_image_preview_size, is_matrix_media_status_line,
-        matrix_media_cache_path, prefix_span_layout, primary_click_hits_rect,
+        matrix_image_bytes_complete, matrix_media_cache_path, prefix_span_layout,
+        primary_click_hits_rect,
         quote_weechat_argument,
         update_prefix_column_width,
     };
@@ -512,6 +524,26 @@ mod inline_matrix_image_tests {
         assert!(inline_image_dimensions_allowed(4096, 4096));
         assert!(!inline_image_dimensions_allowed(8193, 1));
         assert!(!inline_image_dimensions_allowed(6000, 6000));
+    }
+
+    #[test]
+    fn stalled_partial_matrix_image_is_not_accepted_as_complete() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([12, 34, 56, 255]),
+        ));
+        let mut complete = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut complete),
+                image::ImageFormat::Png,
+            )
+            .expect("encode fixture");
+        let partial = &complete[..complete.len() / 2];
+
+        assert!(matrix_image_bytes_complete(&complete));
+        assert!(!matrix_image_bytes_complete(partial));
     }
 
     #[test]
