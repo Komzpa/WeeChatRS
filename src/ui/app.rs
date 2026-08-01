@@ -2935,6 +2935,25 @@ impl WeeChatApp {
         }
     }
 
+    fn render_profile_identity(
+        &mut self,
+        ui: &mut egui::Ui,
+        text: &str,
+        font_id: FontId,
+        color: Color32,
+    ) {
+        let width = self.text_with_emoji_width(ui, text, &font_id, true);
+        let format = egui::TextFormat::simple(font_id.clone(), color);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, font_id.size + 2.0),
+            prefix_span_layout(),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                self.render_text_with_emoji(ui, text, &format, false, true);
+            },
+        );
+    }
+
     fn render_matrix_avatar(
         &mut self,
         ui: &mut egui::Ui,
@@ -5012,11 +5031,11 @@ impl eframe::App for WeeChatApp {
                             }
                         }
                         ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(display_name)
-                                .size(22.0)
-                                .strong()
-                                .color(text_primary),
+                        self.render_profile_identity(
+                            ui,
+                            display_name,
+                            FontId::new(22.0, FontFamily::Proportional),
+                            text_primary,
                         );
                     });
 
@@ -5048,7 +5067,12 @@ impl eframe::App for WeeChatApp {
                                     ui.end_row();
                                 }
                                 ui.label(egui::RichText::new("Room nick").color(text_muted));
-                                ui.label(&profile.nick);
+                                self.render_profile_identity(
+                                    ui,
+                                    &profile.nick,
+                                    FontId::new(self.font_size, FontFamily::Monospace),
+                                    text_primary,
+                                );
                                 ui.end_row();
                             });
                         ui.add_space(10.0);
@@ -5083,7 +5107,12 @@ impl eframe::App for WeeChatApp {
                             .spacing([12.0, 5.0])
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new("Nick").color(text_muted));
-                                ui.label(format!("{}{}", card.prefix, card.nick));
+                                self.render_profile_identity(
+                                    ui,
+                                    &format!("{}{}", card.prefix, card.nick),
+                                    FontId::new(self.font_size, FontFamily::Monospace),
+                                    text_primary,
+                                );
                                 ui.end_row();
                                 ui.label(egui::RichText::new("Network").color(text_muted));
                                 ui.label(&card.server);
