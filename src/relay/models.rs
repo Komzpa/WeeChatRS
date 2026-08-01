@@ -49,6 +49,7 @@ pub struct Buffer {
     pub matrix_room_id: Option<String>,
     pub matrix_thread_root: Option<String>,
     pub matrix_upload_v1: bool,
+    pub matrix_avatar_mxc: Option<String>,
     /// Snapshot of last_read_id taken when the buffer was first entered this session.
     /// Used to anchor the unread divider while the user views the buffer.
     pub visit_start_marker_id: Option<String>,
@@ -152,6 +153,7 @@ mod mention_highlight_tests {
             matrix_room_id: Some("!room:example.org".to_owned()),
             matrix_thread_root: None,
             matrix_upload_v1: true,
+            matrix_avatar_mxc: None,
             visit_start_marker_id: None,
         }
     }

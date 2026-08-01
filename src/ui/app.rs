@@ -1067,6 +1067,34 @@ fn buffer_visible_in_sidebar(
     is_root || !collapsed_servers.contains(&buffer.server)
 }
 
+fn buffer_has_sidebar_avatar(buffer: &Buffer) -> bool {
+    buffer.plugin == "matrix" && matches!(buffer.kind.as_str(), "channel" | "private")
+}
+
+fn sidebar_avatar_initial(name: &str) -> String {
+    name.chars()
+        .find(|character| character.is_alphanumeric())
+        .map(|character| character.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_owned())
+}
+
+fn sidebar_avatar_fallback_color(key: &str) -> Color32 {
+    const COLORS: [Color32; 8] = [
+        Color32::from_rgb(83, 121, 189),
+        Color32::from_rgb(111, 83, 189),
+        Color32::from_rgb(176, 81, 143),
+        Color32::from_rgb(189, 91, 83),
+        Color32::from_rgb(184, 128, 61),
+        Color32::from_rgb(91, 151, 79),
+        Color32::from_rgb(60, 151, 145),
+        Color32::from_rgb(67, 130, 174),
+    ];
+    let hash = key.bytes().fold(0usize, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as usize)
+    });
+    COLORS[hash % COLORS.len()]
+}
+
 #[cfg(test)]
 mod thread_tests {
     use super::*;
@@ -1410,8 +1438,31 @@ mod thread_tests {
             matrix_room_id: Some("!room:example.org".to_owned()),
             matrix_thread_root: Some("$root:example.org".to_owned()),
             matrix_upload_v1: true,
+            matrix_avatar_mxc: None,
             visit_start_marker_id: None,
         }
+    }
+
+    #[test]
+    fn sidebar_avatars_apply_only_to_matrix_chat_rows() {
+        let mut matrix_room = thread_buffer("matrix-room");
+        matrix_room.kind = "channel".to_owned();
+        matrix_room.matrix_thread_root = None;
+        assert!(buffer_has_sidebar_avatar(&matrix_room));
+
+        matrix_room.kind = "server".to_owned();
+        assert!(!buffer_has_sidebar_avatar(&matrix_room));
+
+        matrix_room.kind = "channel".to_owned();
+        matrix_room.plugin = "irc".to_owned();
+        assert!(!buffer_has_sidebar_avatar(&matrix_room));
+    }
+
+    #[test]
+    fn sidebar_avatar_fallback_ignores_matrix_name_sigils() {
+        assert_eq!(sidebar_avatar_initial("#PostGIS"), "P");
+        assert_eq!(sidebar_avatar_initial("+OSGeo Open Space"), "O");
+        assert_eq!(sidebar_avatar_initial("!!!"), "?");
     }
 }
 
@@ -2212,6 +2263,7 @@ mod saved_read_marker_tests {
             matrix_room_id: None,
             matrix_thread_root: None,
             matrix_upload_v1: false,
+            matrix_avatar_mxc: None,
             visit_start_marker_id: None,
         }
     }
@@ -4049,7 +4101,8 @@ impl eframe::App for WeeChatApp {
                 )
             })
             .map(|buffer| {
-                ctx.fonts(|fonts| {
+                let avatar_width = if buffer_has_sidebar_avatar(buffer) { 26.0 } else { 0.0 };
+                avatar_width + ctx.fonts(|fonts| {
                     fonts
                         .layout_no_wrap(
                             buffer.name.clone(),
@@ -4096,6 +4149,7 @@ impl eframe::App for WeeChatApp {
         );
 
         if responsive_panels.show_buffers {
+            let mut pending_sidebar_avatar_loads = Vec::new();
             let buffers_resp = egui::SidePanel::left("buffers_panel")
                 .resizable(true)
                 .default_width(self.buffers_width.min(responsive_panels.buffers_max_width))
@@ -4150,6 +4204,7 @@ impl eframe::App for WeeChatApp {
                             let is_core  = buffer.kind == "core";
                             let is_root  = buffer.kind == "server" || is_core;
                             let is_child = buffer.kind == "channel" || buffer.kind == "private";
+                            let show_avatar = buffer_has_sidebar_avatar(buffer);
                             let in_dragged_group = dragged_group_ids.contains(&buffer.id);
 
                             // Connection header — shown when ≥2 connections are active, but
@@ -4282,6 +4337,48 @@ impl eframe::App for WeeChatApp {
                                 // selectable(false) prevents Label from grabbing clicks
                                 // that belong to the row interact registered below.
                                 row_ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    if show_avatar {
+                                        let avatar_size = 20.0;
+                                        let (avatar_rect, _) = ui.allocate_exact_size(
+                                            egui::Vec2::splat(avatar_size),
+                                            egui::Sense::hover(),
+                                        );
+                                        let texture = buffer.matrix_avatar_mxc.as_deref().and_then(|key| {
+                                            self.avatar_texture_cache.get(key).or_else(|| match self.image_cache.get(key) {
+                                                Some(ImageState::Loaded(texture)) => Some(texture),
+                                                _ => None,
+                                            })
+                                        });
+                                        if let Some(texture) = texture {
+                                            ui.put(
+                                                avatar_rect,
+                                                egui::Image::new((texture.id(), egui::Vec2::splat(avatar_size)))
+                                                    .rounding(avatar_size / 2.0),
+                                            );
+                                        } else {
+                                            let fallback = sidebar_avatar_fallback_color(
+                                                buffer.matrix_room_id.as_deref().unwrap_or(&buffer.full_name),
+                                            );
+                                            ui.painter().circle_filled(
+                                                avatar_rect.center(),
+                                                avatar_size / 2.0,
+                                                if is_muted { fallback.gamma_multiply(0.55) } else { fallback },
+                                            );
+                                            ui.painter().text(
+                                                avatar_rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                sidebar_avatar_initial(&buffer.name),
+                                                FontId::new(avatar_size * 0.48, FontFamily::Proportional),
+                                                Color32::WHITE,
+                                            );
+                                        }
+                                        if let Some(avatar_mxc) = &buffer.matrix_avatar_mxc {
+                                            if !self.image_cache.contains_key(avatar_mxc) {
+                                                pending_sidebar_avatar_loads.push((buffer.id.clone(), avatar_mxc.clone()));
+                                            }
+                                        }
+                                        ui.add_space(6.0);
+                                    }
                                     ui.add(Label::new(label).truncate(true).selectable(false));
                                 });
                             }
@@ -4435,6 +4532,19 @@ impl eframe::App for WeeChatApp {
                         self.drag_drop_before_id = None;
                     }
                 });
+            pending_sidebar_avatar_loads.sort();
+            pending_sidebar_avatar_loads.dedup();
+            for (buffer_id, avatar_mxc) in pending_sidebar_avatar_loads {
+                self.avatar_image_keys.insert(avatar_mxc.clone());
+                self.ensure_matrix_media_loading(
+                    &buffer_id,
+                    &MatrixMedia {
+                        mxc_uri: avatar_mxc,
+                        name: "room-avatar".to_owned(),
+                        kind: "image".to_owned(),
+                    },
+                );
+            }
             let w = buffers_resp.response.rect.width();
             if w >= 80.0
                 && (!responsive_panels.buffers_constrained
