@@ -1152,6 +1152,18 @@ pub(crate) fn replacement_buffer_id(
         .map(|buffer| buffer.id.clone())
 }
 
+fn canonical_chat_buffer_id(buffers: &[Buffer], buffer_id: String) -> String {
+    let mut current = buffer_id;
+    let mut seen = HashSet::new();
+    while seen.insert(current.clone()) {
+        let Some(replacement) = replacement_buffer_id(buffers, &current) else {
+            break;
+        };
+        current = replacement;
+    }
+    current
+}
+
 fn predecessor_buffer_ids(buffers: &[Buffer], current_buffer_id: &str) -> Vec<String> {
     let connection = current_buffer_id.split_once('/').map(|(prefix, _)| prefix);
     let mut ids = Vec::new();
@@ -1196,21 +1208,65 @@ fn composed_upgrade_history(
     let Some(current) = buffers.iter().find(|buffer| buffer.id == current_buffer_id) else {
         return (VecDeque::new(), HashSet::new());
     };
-    let mut inherited_line_ids = HashSet::new();
-    let mut messages: Vec<Line> = predecessor_buffer_ids(buffers, current_buffer_id)
-        .into_iter()
+    let predecessor_ids = predecessor_buffer_ids(buffers, current_buffer_id);
+    let mut ranked_messages: Vec<(usize, bool, Line)> = predecessor_ids
+        .iter()
         .rev()
-        .filter_map(|buffer_id| buffers.iter().find(|buffer| buffer.id == buffer_id))
-        .flat_map(|buffer| buffer.messages.iter())
-        .map(|line| {
-            inherited_line_ids.insert(line.id.clone());
-            line.clone()
+        .filter_map(|buffer_id| buffers.iter().find(|buffer| buffer.id == *buffer_id))
+        .enumerate()
+        .flat_map(|(rank, buffer)| {
+            buffer.messages.iter().map(move |line| {
+                let mut line = line.clone();
+                // Relay line ids are only unique inside one physical WeeChat
+                // buffer. Keep inherited rows distinct from equally-numbered
+                // successor rows while retaining Matrix ids for actions.
+                line.id = format!("upgrade-history:{}:{}", buffer.id, line.id);
+                (rank, true, line)
+            })
         })
-        .chain(current.messages.iter().cloned())
+        .chain(
+            current
+                .messages
+                .iter()
+                .cloned()
+                .map(|line| (predecessor_ids.len(), false, line)),
+        )
         .collect();
-    messages.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
-    let mut seen_line_ids = HashSet::new();
-    messages.retain(|line| seen_line_ids.insert(line.id.clone()));
+
+    // An event may be represented by several physical lines (reply header,
+    // quote and body), so dedupe whole event sources rather than individual
+    // lines. Prefer the newest room in the upgrade chain when the same Matrix
+    // event exists on both sides of an upgrade.
+    let mut preferred_event_rank: HashMap<String, usize> = HashMap::new();
+    for (rank, _, line) in &ranked_messages {
+        if let Some(event_id) = &line.matrix_event_id {
+            preferred_event_rank
+                .entry(event_id.clone())
+                .and_modify(|preferred| *preferred = (*preferred).max(*rank))
+                .or_insert(*rank);
+        }
+    }
+    ranked_messages.retain(|(rank, _, line)| {
+        line.matrix_event_id.as_ref().is_none_or(|event_id| {
+            preferred_event_rank.get(event_id) == Some(rank)
+        })
+    });
+    ranked_messages.sort_by(|left, right| {
+        left.2
+            .timestamp
+            .cmp(&right.2.timestamp)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut inherited_line_ids = HashSet::new();
+    let mut messages: Vec<Line> = ranked_messages
+        .into_iter()
+        .map(|(_, inherited, line)| {
+            if inherited {
+                inherited_line_ids.insert(line.id.clone());
+            }
+            line
+        })
+        .collect();
     if messages.len() > MAX_STORED_LINES {
         messages.drain(0..messages.len() - MAX_STORED_LINES);
     }
@@ -1224,13 +1280,16 @@ fn buffer_visible_in_sidebar(
     collapsed_servers: &HashSet<String>,
     replaced_room_ids: &HashSet<String>,
 ) -> bool {
+    let is_replaced_matrix_room = buffer
+        .matrix_room_id
+        .as_ref()
+        .is_some_and(|room_id| replaced_room_ids.contains(room_id));
+    // A tombstoned Matrix room is history for its successor, not another
+    // current chat.  The generic "show hidden buffers" switch must never put
+    // it back among live rooms; its lines are composed into the successor.
     if buffer.is_matrix_thread()
-        || ((buffer.hidden
-            || buffer
-                .matrix_room_id
-                .as_ref()
-                .is_some_and(|room_id| replaced_room_ids.contains(room_id)))
-            && !show_hidden_buffers)
+        || is_replaced_matrix_room
+        || (buffer.hidden && !show_hidden_buffers)
     {
         return false;
     }
@@ -2502,10 +2561,11 @@ impl SavedReadMarker {
 #[cfg(test)]
 mod saved_read_marker_tests {
     use super::{
-        buffer_visible_in_sidebar, composed_upgrade_history, preferred_chat_buffer_id,
-        replaced_matrix_room_ids, replacement_buffer_id, upgrade_history_load_buffer_id,
-        visit_marker_location, AppSettings, Buffer, BufferActivity, Line, SavedReadMarker,
-        VisitMarkerLocation, BEFORE_FIRST_LOADED_LINE_ID,
+        buffer_visible_in_sidebar, canonical_chat_buffer_id, composed_upgrade_history,
+        preferred_chat_buffer_id, replaced_matrix_room_ids, replacement_buffer_id,
+        upgrade_history_load_buffer_id, visit_marker_location, AppSettings, Buffer,
+        BufferActivity, Line, SavedReadMarker, VisitMarkerLocation,
+        BEFORE_FIRST_LOADED_LINE_ID,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::{HashSet, VecDeque};
@@ -2647,14 +2707,18 @@ mod saved_read_marker_tests {
         assert_eq!(
             ids,
             vec![
-                "old-history",
+                "upgrade-history:local/old:old-history",
                 "new-history",
                 "new-latest",
-                "late-old-message",
+                "upgrade-history:local/old:late-old-message",
             ],
         );
-        assert!(inherited.contains("old-history"));
-        assert!(inherited.contains("late-old-message"));
+        assert!(inherited.contains("upgrade-history:local/old:old-history"));
+        assert!(inherited.contains("upgrade-history:local/old:late-old-message"));
+        assert_eq!(
+            canonical_chat_buffer_id(&buffers, "local/old".to_owned()),
+            "local/new",
+        );
 
         let mut exhausted = HashSet::new();
         assert_eq!(
@@ -2702,6 +2766,93 @@ mod saved_read_marker_tests {
         assert!(!buffer_visible_in_sidebar(&hidden, false, &HashSet::new(), &replaced));
         assert!(buffer_visible_in_sidebar(&hidden, true, &HashSet::new(), &replaced));
         assert!(!buffer_visible_in_sidebar(&thread, true, &HashSet::new(), &replaced));
+
+        let mut predecessor = buffer("local/old", "#postgis", "channel");
+        predecessor.matrix_room_id = Some("!old:example.org".to_owned());
+        let replaced = HashSet::from(["!old:example.org".to_owned()]);
+        assert!(!buffer_visible_in_sidebar(
+            &predecessor,
+            false,
+            &HashSet::new(),
+            &replaced,
+        ));
+        assert!(!buffer_visible_in_sidebar(
+            &predecessor,
+            true,
+            &HashSet::new(),
+            &replaced,
+        ));
+    }
+
+    #[test]
+    fn upgrade_history_keeps_equal_buffer_local_line_ids_distinct() {
+        let mut predecessor = buffer("local/old", "old", "channel");
+        predecessor.matrix_room_id = Some("!old:example.org".to_owned());
+        predecessor.matrix_replacement_room_id = Some("!new:example.org".to_owned());
+        predecessor.messages.push_back(line("7", 10));
+
+        let mut successor = buffer("local/new", "new", "channel");
+        successor.matrix_room_id = Some("!new:example.org".to_owned());
+        successor.matrix_predecessor_room_id = Some("!old:example.org".to_owned());
+        successor.messages.push_back(line("7", 20));
+
+        let (messages, inherited) =
+            composed_upgrade_history(&[predecessor, successor], "local/new");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, "upgrade-history:local/old:7");
+        assert_eq!(messages[1].id, "7");
+        assert!(inherited.contains("upgrade-history:local/old:7"));
+        assert!(!inherited.contains("7"));
+    }
+
+    #[test]
+    fn matrix_room_selection_follows_the_complete_upgrade_chain() {
+        let mut old = buffer("local/old", "old", "channel");
+        old.matrix_room_id = Some("!old:example.org".to_owned());
+        old.matrix_replacement_room_id = Some("!mid:example.org".to_owned());
+
+        let mut mid = buffer("local/mid", "mid", "channel");
+        mid.matrix_room_id = Some("!mid:example.org".to_owned());
+        mid.matrix_predecessor_room_id = Some("!old:example.org".to_owned());
+        mid.matrix_replacement_room_id = Some("!new:example.org".to_owned());
+
+        let mut new = buffer("local/new", "new", "channel");
+        new.matrix_room_id = Some("!new:example.org".to_owned());
+        new.matrix_predecessor_room_id = Some("!mid:example.org".to_owned());
+
+        assert_eq!(
+            canonical_chat_buffer_id(&[old, mid, new], "local/old".to_owned()),
+            "local/new",
+        );
+    }
+
+    #[test]
+    fn upgrade_history_prefers_all_successor_lines_for_an_overlapping_event() {
+        let mut predecessor = buffer("local/old", "old", "channel");
+        predecessor.matrix_room_id = Some("!old:example.org".to_owned());
+        predecessor.matrix_replacement_room_id = Some("!new:example.org".to_owned());
+        let mut old_header = line("old-header", 10);
+        old_header.matrix_event_id = Some("$same:example.org".to_owned());
+        let mut old_body = line("old-body", 10);
+        old_body.matrix_event_id = Some("$same:example.org".to_owned());
+        predecessor.messages.extend([old_header, old_body]);
+
+        let mut successor = buffer("local/new", "new", "channel");
+        successor.matrix_room_id = Some("!new:example.org".to_owned());
+        successor.matrix_predecessor_room_id = Some("!old:example.org".to_owned());
+        let mut new_header = line("new-header", 10);
+        new_header.matrix_event_id = Some("$same:example.org".to_owned());
+        let mut new_body = line("new-body", 10);
+        new_body.matrix_event_id = Some("$same:example.org".to_owned());
+        successor.messages.extend([new_header, new_body]);
+
+        let (messages, inherited) =
+            composed_upgrade_history(&[predecessor, successor], "local/new");
+        assert_eq!(
+            messages.iter().map(|line| line.id.as_str()).collect::<Vec<_>>(),
+            vec!["new-header", "new-body"],
+        );
+        assert!(inherited.is_empty());
     }
 
     #[test]
@@ -2774,9 +2925,9 @@ impl WeeChatApp {
             profiles.push(legacy_profile);
         }
 
-        if !settings.font_path.is_empty() {
-            crate::ui::fonts::apply(&cc.egui_ctx, &settings.font_path);
-        }
+        // Apply even when no custom face is selected: `fonts::apply` also
+        // installs the Unicode fallback used by federated display names.
+        crate::ui::fonts::apply(&cc.egui_ctx, &settings.font_path);
         let available_fonts = crate::ui::fonts::scan_system_fonts();
 
         let adaptive_theme = settings.adaptive_theme;
@@ -3398,9 +3549,14 @@ impl WeeChatApp {
         &mut self,
         ui: &mut egui::Ui,
         text: &str,
-        font_id: FontId,
+        mut font_id: FontId,
         color: Color32,
     ) {
+        // Profile identities come from federated user input and routinely use
+        // IPA, combining marks, and scripts outside egui's bundled fonts.
+        // Render their text spans with the broad system face explicitly;
+        // actual emoji are still replaced by Twemoji below.
+        font_id.family = egui::FontFamily::Name("unicode_fallback".into());
         let width = self.text_with_emoji_width(ui, text, &font_id, true);
         let format = egui::TextFormat::simple(font_id.clone(), color);
         ui.allocate_ui_with_layout(
@@ -3778,6 +3934,7 @@ impl WeeChatApp {
     }
 
     pub(crate) fn select_buffer(&mut self, id: String) {
+        let id = canonical_chat_buffer_id(&self.buffers, id);
         if self
             .buffer_by_id(&id)
             .is_some_and(|buffer| buffer.is_matrix_thread())
@@ -5990,22 +6147,51 @@ impl eframe::App for WeeChatApp {
                                                 for (index, candidate) in
                                                     state.matches.iter().enumerate()
                                                 {
-                                                    let label =
-                                                        if candidate.display_name
-                                                            == candidate.user_id
-                                                        {
-                                                            candidate.display_name.clone()
-                                                        } else {
-                                                            format!(
-                                                                "{}  {}",
-                                                                candidate.display_name,
-                                                                candidate.user_id,
-                                                            )
-                                                        };
-                                                    if ui.selectable_label(
-                                                        index == state.index,
-                                                        label,
-                                                    ).clicked() {
+                                                    let selected = index == state.index;
+                                                    let row_height =
+                                                        (self.font_size + 10.0).max(28.0);
+                                                    let (rect, response) = ui.allocate_exact_size(
+                                                        egui::vec2(ui.available_width(), row_height),
+                                                        egui::Sense::click(),
+                                                    );
+                                                    let visuals = ui
+                                                        .style()
+                                                        .interact_selectable(&response, selected);
+                                                    ui.painter().rect(
+                                                        rect,
+                                                        visuals.rounding,
+                                                        visuals.bg_fill,
+                                                        visuals.bg_stroke,
+                                                    );
+
+                                                    let mut row_ui = ui.child_ui(
+                                                        rect.shrink2(egui::vec2(6.0, 3.0)),
+                                                        egui::Layout::left_to_right(
+                                                            egui::Align::Center,
+                                                        ),
+                                                    );
+                                                    row_ui.set_clip_rect(rect.shrink(3.0));
+                                                    self.render_profile_identity(
+                                                        &mut row_ui,
+                                                        &candidate.display_name,
+                                                        FontId::proportional(self.font_size),
+                                                        visuals.text_color(),
+                                                    );
+                                                    if candidate.display_name
+                                                        != candidate.user_id
+                                                    {
+                                                        row_ui.add_space(8.0);
+                                                        self.render_profile_identity(
+                                                            &mut row_ui,
+                                                            &candidate.user_id,
+                                                            FontId::proportional(
+                                                                self.font_size * 0.88,
+                                                            ),
+                                                            text_muted,
+                                                        );
+                                                    }
+
+                                                    if response.clicked() {
                                                         clicked_mention = Some(index);
                                                     }
                                                 }
@@ -6318,6 +6504,8 @@ impl eframe::App for WeeChatApp {
 
                             if let Some(messages) = &current_buffer_messages {
                                 let mut marker_shown = false;
+                                let mut previous_visible_date: Option<String> = None;
+                                let mut archived_years_shown = HashSet::new();
                                 let visit_marker_state = current_buffer_visit_marker_id
                                     .as_deref()
                                     .map(|marker_id| visit_marker_location(messages, marker_id))
@@ -6358,6 +6546,43 @@ impl eframe::App for WeeChatApp {
 
                                     if let Some(q) = &search_query {
                                         if !line.plain_prefix_lower.contains(q) && !line.plain_message_lower.contains(q) { continue; }
+                                    }
+                                    let local_timestamp =
+                                        line.timestamp.with_timezone(&chrono::Local);
+                                    let local_date = local_timestamp.format("%Y-%m-%d").to_string();
+                                    let local_year = local_timestamp.format("%Y").to_string();
+                                    if is_inherited_history
+                                        && archived_years_shown.insert(local_year.clone())
+                                    {
+                                        ui.add_space(12.0);
+                                        ui.horizontal(|ui| {
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    " ARCHIVED HISTORY · {local_year} "
+                                                ))
+                                                .color(accent_color)
+                                                .strong()
+                                                .size(11.0),
+                                            );
+                                            ui.separator();
+                                        });
+                                        ui.add_space(6.0);
+                                    }
+                                    if previous_visible_date.as_deref() != Some(&local_date) {
+                                        ui.horizontal(|ui| {
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    local_timestamp.format(" %A, %e %B %Y ").to_string(),
+                                                )
+                                                .color(text_muted)
+                                                .size(10.0),
+                                            );
+                                            ui.separator();
+                                        });
+                                        ui.add_space(4.0);
+                                        previous_visible_date = Some(local_date);
                                     }
                                     let continues_matrix_event = line.matrix_event_id.is_some()
                                         && previous_matrix_event_id
