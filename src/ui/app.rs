@@ -52,7 +52,31 @@ pub(crate) enum PreparedFileShare {
 const MATRIX_UPLOAD_MAX_ENCODED_CHUNK: usize = 32 * 1024;
 const MATRIX_UPLOAD_RAW_CHUNK: usize = MATRIX_UPLOAD_MAX_ENCODED_CHUNK / 4 * 3;
 const MATRIX_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
+const MATRIX_UPLOAD_CONFIRMATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(90);
 static MATRIX_UPLOAD_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn matrix_redact_command(event_id: &str) -> Result<String, String> {
+    if !event_id.starts_with('$')
+        || event_id.len() < 2
+        || event_id.chars().any(char::is_whitespace)
+    {
+        return Err("This line has no valid Matrix event ID".to_owned());
+    }
+    Ok(format!("/redact {event_id}"))
+}
+
+fn matrix_attachment_echo_matches(
+    target_buffer_id: Option<&str>,
+    expected_filename: Option<&str>,
+    buffer_id: &str,
+    media: Option<&MatrixMedia>,
+    is_self_msg: bool,
+) -> bool {
+    is_self_msg
+        && target_buffer_id == Some(buffer_id)
+        && media.is_some_and(|media| expected_filename == Some(media.name.as_str()))
+}
 
 fn matrix_attachment_upload(id: String, filename: &str, mime: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
     if filename.is_empty() || mime.is_empty() || bytes.is_empty() || bytes.len() > MATRIX_UPLOAD_MAX_BYTES {
@@ -2025,6 +2049,46 @@ mod thread_tests {
         assert!(!buffer_supports_matrix_upload(None));
     }
 
+    #[test]
+    fn matrix_upload_stays_pending_until_exact_own_media_echo() {
+        let media = MatrixMedia {
+            mxc_uri: "mxc://example.org/upload".to_owned(),
+            name: "clipboard.png".to_owned(),
+            kind: "image".to_owned(),
+        };
+        assert!(matrix_attachment_echo_matches(
+            Some("matrix/thread"),
+            Some("clipboard.png"),
+            "matrix/thread",
+            Some(&media),
+            true,
+        ));
+        assert!(!matrix_attachment_echo_matches(
+            Some("matrix/thread"),
+            Some("clipboard.png"),
+            "matrix/room",
+            Some(&media),
+            true,
+        ));
+        assert!(!matrix_attachment_echo_matches(
+            Some("matrix/thread"),
+            Some("clipboard.png"),
+            "matrix/thread",
+            Some(&media),
+            false,
+        ));
+    }
+
+    #[test]
+    fn delete_message_uses_only_an_exact_matrix_event_id() {
+        assert_eq!(
+            matrix_redact_command("$event:example.org").unwrap(),
+            "/redact $event:example.org",
+        );
+        assert!(matrix_redact_command("latest").is_err());
+        assert!(matrix_redact_command("$event:example.org reason").is_err());
+    }
+
     #[tokio::test]
     async fn matrix_file_share_prepares_native_bytes_without_external_url() {
         let path = std::env::temp_dir().join(format!(
@@ -2772,8 +2836,14 @@ pub struct WeeChatApp {
     pub(crate) file_share_tx: mpsc::UnboundedSender<Result<PreparedFileShare, String>>,
     pub(crate) file_share_rx: mpsc::UnboundedReceiver<Result<PreparedFileShare, String>>,
     pub(crate) file_share_uploading: bool,
+    pub(crate) file_share_status: Option<String>,
+    pub(crate) file_share_target_buffer_id: Option<String>,
+    pub(crate) file_share_expected_filename: Option<String>,
+    pub(crate) file_share_started_at: Option<std::time::Instant>,
     pub(crate) file_share_error: Option<String>,
     pub(crate) file_share_duration: String,
+    pub(crate) pending_redaction: Option<RedactionTarget>,
+    pub(crate) pending_redaction_error: Option<String>,
 }
 
 pub(crate) struct CompletionState {
@@ -2804,6 +2874,14 @@ pub(crate) struct CommandCompletionRequest {
 
 #[derive(Clone)]
 pub(crate) struct ReplyTarget {
+    pub(crate) buffer_id: String,
+    pub(crate) matrix_event_id: String,
+    pub(crate) sender: String,
+    pub(crate) message: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct RedactionTarget {
     pub(crate) buffer_id: String,
     pub(crate) matrix_event_id: String,
     pub(crate) sender: String,
@@ -3665,8 +3743,14 @@ impl WeeChatApp {
             file_share_tx,
             file_share_rx,
             file_share_uploading: false,
+            file_share_status: None,
+            file_share_target_buffer_id: None,
+            file_share_expected_filename: None,
+            file_share_started_at: None,
             file_share_error: None,
             file_share_duration: settings.file_share_duration,
+            pending_redaction: None,
+            pending_redaction_error: None,
             keybinds: settings.keybinds,
             editing_keybind: None,
             collapsed_servers: settings.collapsed_servers,
@@ -3776,6 +3860,60 @@ impl WeeChatApp {
         buffer_supports_matrix_upload(self.buffer_by_id(buffer_id))
     }
 
+    fn send_matrix_redaction(
+        &self,
+        buffer_id: &str,
+        event_id: &str,
+    ) -> Result<(), String> {
+        if !self.is_matrix_buffer(buffer_id) {
+            return Err("Deletion is available only for Matrix messages".to_owned());
+        }
+        let command = matrix_redact_command(event_id)?;
+        let Some((client, raw_id)) = self.client_for_buffer(buffer_id) else {
+            return Err("Matrix buffer has no authenticated relay connection".to_owned());
+        };
+        client.send_message(&raw_id, &command);
+        Ok(())
+    }
+
+    fn begin_file_share_feedback(&mut self, buffer_id: String, status: &str) {
+        self.file_share_uploading = true;
+        self.file_share_target_buffer_id = Some(buffer_id);
+        self.file_share_expected_filename = None;
+        self.file_share_started_at = Some(std::time::Instant::now());
+        self.file_share_status = Some(status.to_owned());
+        self.file_share_error = None;
+    }
+
+    fn finish_file_share_feedback(&mut self, status: Option<String>) {
+        self.file_share_uploading = false;
+        self.file_share_started_at = None;
+        self.file_share_expected_filename = None;
+        self.file_share_status = status;
+    }
+
+    pub(crate) fn acknowledge_matrix_attachment(
+        &mut self,
+        buffer_id: &str,
+        media: Option<&MatrixMedia>,
+        is_self_msg: bool,
+    ) {
+        if matrix_attachment_echo_matches(
+            self.file_share_target_buffer_id.as_deref(),
+            self.file_share_expected_filename.as_deref(),
+            buffer_id,
+            media,
+            is_self_msg,
+        ) {
+            let filename = self
+                .file_share_expected_filename
+                .clone()
+                .unwrap_or_else(|| "attachment".to_owned());
+            self.file_share_error = None;
+            self.finish_file_share_feedback(Some(format!("✓ Sent {filename}")));
+        }
+    }
+
     pub(crate) fn effective_send_buffer_id(&self, buffer_id: &str) -> String {
         replacement_buffer_id(&self.buffers, buffer_id)
             .unwrap_or_else(|| buffer_id.to_owned())
@@ -3837,8 +3975,7 @@ impl WeeChatApp {
             );
             return false;
         }
-        self.file_share_uploading = true;
-        self.file_share_error = None;
+        self.begin_file_share_feedback(buffer_id.clone(), "Reading clipboard image…");
         let tx = self.file_share_tx.clone();
         let repaint = ctx.clone();
         tokio::spawn(async move {
@@ -3871,10 +4008,12 @@ impl WeeChatApp {
 
     fn start_file_picker(&mut self, buffer_id: String) {
         if self.file_share_uploading {
+            self.file_share_error = Some(
+                "Another attachment is still being prepared or uploaded".to_owned(),
+            );
             return;
         }
-        self.file_share_uploading = true;
-        self.file_share_error = None;
+        self.begin_file_share_feedback(buffer_id.clone(), "Choose an attachment…");
         let is_matrix = self.is_matrix_buffer(&buffer_id);
         let duration = self.file_share_duration.clone();
         let tx = self.file_share_tx.clone();
@@ -3896,10 +4035,12 @@ impl WeeChatApp {
 
     fn start_file_path(&mut self, buffer_id: String, path: PathBuf) {
         if self.file_share_uploading {
+            self.file_share_error = Some(
+                "Another attachment is still being prepared or uploaded".to_owned(),
+            );
             return;
         }
-        self.file_share_uploading = true;
-        self.file_share_error = None;
+        self.begin_file_share_feedback(buffer_id.clone(), "Preparing attachment…");
         let is_matrix = self.is_matrix_buffer(&buffer_id);
         let duration = self.file_share_duration.clone();
         let tx = self.file_share_tx.clone();
@@ -4983,7 +5124,6 @@ impl eframe::App for WeeChatApp {
 
         // File share drain: Matrix bytes stay in Matrix; IRC receives an external URL.
         while let Ok(result) = self.file_share_rx.try_recv() {
-            self.file_share_uploading = false;
             match result {
                 Ok(PreparedFileShare::MatrixAttachment {
                     buffer_id,
@@ -4991,26 +5131,55 @@ impl eframe::App for WeeChatApp {
                     mime,
                     bytes,
                 }) => {
+                    self.file_share_target_buffer_id = Some(buffer_id.clone());
+                    self.file_share_expected_filename = Some(filename.clone());
+                    self.file_share_started_at = Some(std::time::Instant::now());
+                    self.file_share_status = Some(format!(
+                        "Uploading {filename}… do not paste it again"
+                    ));
                     if let Err(error) = self.send_matrix_attachment(
                         &buffer_id,
                         &filename,
                         &mime,
                         &bytes,
                     ) {
+                        self.finish_file_share_feedback(None);
                         self.file_share_error = Some(error);
                     }
                 }
                 Ok(PreparedFileShare::ExternalLink { buffer_id, url }) => {
                     if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
                         client.send_message(&raw_id, &url);
+                        self.finish_file_share_feedback(Some("✓ File link sent".to_owned()));
+                    } else {
+                        self.finish_file_share_feedback(None);
+                        self.file_share_error = Some(
+                            "File link target has no relay connection".to_owned(),
+                        );
                     }
                 }
                 Err(e) if !e.is_empty() => {
+                    self.finish_file_share_feedback(None);
                     log::debug!("clipboard/file-share preparation failed: {e}");
                     self.file_share_error = Some(e);
                 }
-                Err(_) => {}
+                Err(_) => {
+                    self.finish_file_share_feedback(None);
+                    self.file_share_target_buffer_id = None;
+                }
             }
+        }
+
+        if self.file_share_uploading
+            && self.file_share_started_at.is_some_and(|started| {
+                started.elapsed() >= MATRIX_UPLOAD_CONFIRMATION_TIMEOUT
+            })
+        {
+            self.finish_file_share_feedback(None);
+            self.file_share_error = Some(
+                "No Matrix upload confirmation arrived. Check the chat before trying again."
+                    .to_owned(),
+            );
         }
 
         // Drag-and-drop file upload
@@ -6115,33 +6284,87 @@ impl eframe::App for WeeChatApp {
                                             );
                                         }
                                     });
+                                let thread_interactable = block_response
+                                    .response
+                                    .interact(egui::Sense::click());
                                 ui.painter().set(
                                     background_shape,
                                     egui::Shape::Vec(message_row_shapes(
-                                        block_response.response.rect,
+                                        thread_interactable.rect,
                                         index == 0,
-                                        block_response.response.contains_pointer(),
+                                        thread_interactable.contains_pointer(),
                                         accent_color,
                                         text_primary,
                                     )),
                                 );
+                                thread_interactable.context_menu(|ui| {
+                                    ui.set_min_width(170.0);
+                                    let delete_enabled = block.matrix_event_id.is_some();
+                                    if ui
+                                        .add_enabled(
+                                            delete_enabled,
+                                            egui::Button::new("Delete message…"),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "This line has no Matrix event ID",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.pending_redaction_error = None;
+                                        self.pending_redaction = block.matrix_event_id.as_ref().map(
+                                            |matrix_event_id| RedactionTarget {
+                                                buffer_id: thread.id.clone(),
+                                                matrix_event_id: matrix_event_id.clone(),
+                                                sender: block.prefix.clone(),
+                                                message: block.content.iter().find_map(|content| {
+                                                    content.media.as_ref().map(|media| media.name.clone())
+                                                }).or_else(|| {
+                                                    block.content.iter()
+                                                        .map(|content| content.message.as_str())
+                                                        .find(|message| !message.is_empty())
+                                                        .map(ToOwned::to_owned)
+                                                }).unwrap_or_else(|| "attachment".to_owned()),
+                                            },
+                                        );
+                                        ui.close_menu();
+                                    }
+                                });
                                 ui.add_space(3.0);
                             }
                         });
                     ui.separator();
                     ui.add_space(5.0);
-                    if let Some(err) = self.file_share_error.clone() {
+                    let thread_owns_file_share = self.file_share_target_buffer_id.as_deref()
+                        == self.open_thread_buffer_id.as_deref();
+                    if thread_owns_file_share {
+                        if let Some(status) = self.file_share_status.clone() {
+                            ui.horizontal_wrapped(|ui| {
+                                if self.file_share_uploading {
+                                    ui.spinner();
+                                }
+                                ui.label(
+                                    egui::RichText::new(status)
+                                        .color(accent_color)
+                                        .small(),
+                                );
+                            });
+                            ui.add_space(3.0);
+                        }
+                    }
+                    if thread_owns_file_share {
+                        if let Some(err) = self.file_share_error.clone() {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("⚠ {err}"))
                                     .color(Color32::from_rgb(220, 80, 80))
                                     .small(),
                             );
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("x").clicked() {
                                 self.file_share_error = None;
                             }
                         });
                         ui.add_space(3.0);
+                        }
                     }
                     ui.horizontal(|ui| {
                         let attach_enabled = !self.file_share_uploading;
@@ -6746,19 +6969,39 @@ impl eframe::App for WeeChatApp {
                                     .color(text_secondary)
                                     .italics(),
                             );
-                            if ui.small_button("✕").on_hover_text("Cancel reply").clicked() {
+                            if ui.small_button("x").on_hover_text("Cancel reply").clicked() {
                                 self.reply_target = None;
                             }
                         });
                         ui.add_space(4.0);
                     }
-                    // One visible, dismissible attachment/paste error beside the active composer.
-                    if self.open_thread_buffer_id.is_none() {
+                    // Attachment state belongs beside the composer that owns its immutable target.
+                    let room_owns_file_share = self.file_share_target_buffer_id.is_none()
+                        || self.file_share_target_buffer_id.as_deref()
+                            == self.selected_buffer_id.as_deref();
+                    if room_owns_file_share {
+                        if let Some(status) = self.file_share_status.clone() {
+                            ui.horizontal_wrapped(|ui| {
+                                if self.file_share_uploading {
+                                    ui.spinner();
+                                }
+                                ui.label(
+                                    egui::RichText::new(status)
+                                        .color(accent_color)
+                                        .small(),
+                                );
+                                if !self.file_share_uploading
+                                    && ui.small_button("x").clicked()
+                                {
+                                    self.file_share_status = None;
+                                }
+                            });
+                        }
                         if let Some(err) = self.file_share_error.clone() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(format!("⚠ {err}"))
                                     .color(Color32::from_rgb(220, 80, 80)).small());
-                                if ui.small_button("✕").clicked() {
+                                if ui.small_button("x").clicked() {
                                     self.file_share_error = None;
                                 }
                             });
@@ -7748,6 +7991,7 @@ impl eframe::App for WeeChatApp {
                                     }
                                     let menu_url = self.ctx_menu_hovered_url.clone();
                                     interactable.context_menu(|ui| {
+                                        ui.set_min_width(170.0);
                                         if current_buffer_is_matrix {
                                             let event_id = line.matrix_event_id.clone();
                                             let thread_buffer_id = event_id
@@ -7772,7 +8016,7 @@ impl eframe::App for WeeChatApp {
                                                 )
                                                 .clicked()
                                             {
-                                                pending_reply_target = event_id.map(
+                                                pending_reply_target = event_id.clone().map(
                                                     |matrix_event_id| ReplyTarget {
                                                         buffer_id: current_buffer_id
                                                             .clone()
@@ -7792,6 +8036,56 @@ impl eframe::App for WeeChatApp {
                                                         Some(thread_buffer_id.clone());
                                                     ui.close_menu();
                                                 }
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    event_id.is_some()
+                                                        && !is_inherited_history
+                                                        && !current_buffer_is_replaced,
+                                                    egui::Button::new("Delete message…"),
+                                                )
+                                                .on_disabled_hover_text(
+                                                    if is_inherited_history
+                                                        || current_buffer_is_replaced
+                                                    {
+                                                        "This message belongs to a replaced Matrix room"
+                                                    } else {
+                                                        "This line has no Matrix event ID"
+                                                    },
+                                                )
+                                                .clicked()
+                                            {
+                                                self.pending_redaction_error = None;
+                                                let delete_preview = event_id
+                                                    .as_ref()
+                                                    .and_then(|matrix_event_id| {
+                                                        current_buffer_messages.as_ref().and_then(
+                                                            |messages| {
+                                                                messages.iter().find_map(|message| {
+                                                                    if message.matrix_event_id.as_ref()
+                                                                        == Some(matrix_event_id)
+                                                                    {
+                                                                        message.matrix_media.as_ref()
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                })
+                                                            },
+                                                        )
+                                                    })
+                                                    .map(|media| media.name.clone())
+                                                    .unwrap_or_else(|| plain_message.clone());
+                                                self.pending_redaction = event_id.map(
+                                                    |matrix_event_id| RedactionTarget {
+                                                        buffer_id: current_buffer_id
+                                                            .clone()
+                                                            .unwrap_or_default(),
+                                                        matrix_event_id,
+                                                        sender: plain_prefix.clone(),
+                                                        message: delete_preview,
+                                                    },
+                                                );
+                                                ui.close_menu();
                                             }
                                             ui.separator();
                                         }
@@ -7868,6 +8162,81 @@ impl eframe::App for WeeChatApp {
         }
         if let Some((load_buffer_id, view_buffer_id)) = pending_load_more {
             self.request_older_history(&load_buffer_id, &view_buffer_id);
+        }
+
+        let mut confirm_redaction = false;
+        let mut cancel_redaction = false;
+        if let Some(target) = self.pending_redaction.clone() {
+            egui::Window::new("Delete Matrix message?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(
+                        "This sends a Matrix redaction. The server may reject it if you do not have permission.",
+                    );
+                    ui.add_space(6.0);
+                    let sender: String = ANSIParser::parse(&target.sender)
+                        .iter()
+                        .map(|section| section.text.as_str())
+                        .collect();
+                    let preview: String = target.message.chars().take(240).collect();
+                    Frame::none()
+                        .fill(surface_color)
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::same(8.0))
+                        .show(ui, |ui| {
+                            if !sender.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(sender)
+                                        .strong()
+                                        .color(accent_color),
+                                );
+                            }
+                            ui.label(preview);
+                        });
+                    if let Some(error) = self.pending_redaction_error.as_deref() {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("⚠ {error}"))
+                                .color(Color32::from_rgb(220, 80, 80)),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel_redaction = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Delete message")
+                                        .color(Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(Color32::from_rgb(180, 45, 45)),
+                            )
+                            .clicked()
+                        {
+                            confirm_redaction = true;
+                        }
+                    });
+                });
+            if cancel_redaction {
+                self.pending_redaction = None;
+                self.pending_redaction_error = None;
+            } else if confirm_redaction {
+                match self.send_matrix_redaction(
+                    &target.buffer_id,
+                    &target.matrix_event_id,
+                ) {
+                    Ok(()) => {
+                        self.pending_redaction = None;
+                        self.pending_redaction_error = None;
+                    }
+                    Err(error) => self.pending_redaction_error = Some(error),
+                }
+            }
         }
 
         if let Some(reply_target) = pending_reply_target {
