@@ -391,6 +391,11 @@ fn update_prefix_column_width(current: f32, measured: f32, cap: f32) -> (f32, bo
     (width, width > current)
 }
 
+fn responsive_prefix_column_cap(row_width: f32, show_timestamps: bool) -> f32 {
+    let fraction = if show_timestamps { 0.40 } else { 0.48 };
+    (row_width * fraction).clamp(72.0, 210.0)
+}
+
 fn prefix_span_layout() -> egui::Layout {
     egui::Layout::left_to_right(egui::Align::Center)
 }
@@ -511,6 +516,7 @@ mod inline_matrix_image_tests {
         matrix_image_bytes_complete, matrix_media_cache_path, prefix_span_layout, ImageState,
         primary_click_hits_rect,
         quote_weechat_argument,
+        responsive_prefix_column_cap,
         update_prefix_column_width,
     };
     use egui::Vec2;
@@ -536,6 +542,9 @@ mod inline_matrix_image_tests {
         assert_eq!(update_prefix_column_width(40.0, 72.0, 100.0), (72.0, true));
         assert_eq!(update_prefix_column_width(72.0, 36.0, 100.0), (72.0, false));
         assert_eq!(update_prefix_column_width(72.0, 120.0, 90.0), (90.0, true));
+        assert_eq!(update_prefix_column_width(120.0, 72.0, 90.0), (90.0, false));
+        assert_eq!(responsive_prefix_column_cap(452.0, true), 180.8);
+        assert_eq!(responsive_prefix_column_cap(452.0, false), 210.0);
     }
 
     #[test]
@@ -1076,11 +1085,16 @@ fn render_reply_context_card(
         .show(ui, |ui| {
             ui.set_max_width(ui.available_width().min(620.0));
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(
-                egui::RichText::new(reply.sender.as_deref().unwrap_or("unknown sender"))
+            let raw_sender = reply.sender.as_deref().unwrap_or("unknown sender");
+            let display_sender = compact_matrix_sender_label(raw_sender);
+            let sender_response = ui.label(
+                egui::RichText::new(&display_sender)
                     .strong()
                     .color(accent_color),
             );
+            if raw_sender != display_sender {
+                sender_response.on_hover_text(raw_sender);
+            }
             for quote in &reply.quotes {
                 ui.label(
                     egui::RichText::new(quote)
@@ -1585,6 +1599,36 @@ mod thread_tests {
             "GrayShade ·dend"
         );
         assert_eq!(compact[0].style, sections[0].style);
+    }
+
+    #[test]
+    fn matrix_irc_bridge_prefix_keeps_nick_and_short_network() {
+        let sections = ANSIParser::parse("\x1b[38;5;178mirc_libera.chat_darkblueb\x1b[0m");
+        let compact = compact_matrix_prefix_sections(
+            "irc_libera.chat_darkblueb",
+            &sections,
+        );
+        assert_eq!(
+            compact
+                .iter()
+                .map(|section| section.text.as_str())
+                .collect::<String>(),
+            "darkblueb ·libera"
+        );
+        assert_eq!(compact[0].style, sections[0].style);
+        assert_eq!(
+            compact_matrix_irc_bridge_prefix("@irc_oftc.chat_someone"),
+            Some(("@someone".to_owned(), "oftc".to_owned()))
+        );
+        assert_eq!(
+            compact_matrix_sender_label("irc_libera.chat_darkblueb"),
+            "darkblueb ·libera"
+        );
+        assert_eq!(
+            compact_matrix_sender_label("GrayShade (@grayshade:dend.ro)"),
+            "GrayShade ·dend"
+        );
+        assert_eq!(compact_matrix_irc_bridge_prefix("ordinary_nick"), None);
     }
 
     #[test]
@@ -2753,10 +2797,59 @@ fn matrix_identity_disambiguator(user_id: &str) -> String {
     }
 }
 
+fn compact_matrix_irc_bridge_prefix(prefix: &str) -> Option<(String, String)> {
+    let rank_len: usize = prefix
+        .chars()
+        .take_while(|ch| matches!(ch, ' ' | '~' | '&' | '@' | '%' | '+'))
+        .map(char::len_utf8)
+        .sum();
+    let (rank, bare_prefix) = prefix.split_at(rank_len);
+    let bridge = bare_prefix.strip_prefix("irc_")?;
+    let (network, nick) = bridge.split_once(".chat_")?;
+    if network.is_empty()
+        || nick.is_empty()
+        || network.chars().any(char::is_whitespace)
+        || nick.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some((format!("{rank}{nick}"), network.to_owned()))
+}
+
+fn compact_matrix_sender_label(sender: &str) -> String {
+    if let Some((display_name, network)) = compact_matrix_irc_bridge_prefix(sender) {
+        return format!("{display_name} ·{network}");
+    }
+    if let Some((display_name, user_id)) = split_disambiguated_matrix_nick(sender) {
+        return format!("{display_name} ·{}", matrix_identity_disambiguator(user_id));
+    }
+    sender.to_owned()
+}
+
 fn compact_matrix_prefix_sections(
     plain_prefix: &str,
     sections: &[ANSISection],
 ) -> Vec<ANSISection> {
+    if let Some((display_name, network)) = compact_matrix_irc_bridge_prefix(plain_prefix) {
+        let style = sections
+            .iter()
+            .find(|section| !section.text.is_empty())
+            .map(|section| section.style)
+            .unwrap_or_default();
+        return vec![
+            ANSISection {
+                text: display_name,
+                style,
+                url: None,
+            },
+            ANSISection {
+                text: format!(" ·{network}"),
+                style: AnsiStyle::default(),
+                url: None,
+            },
+        ];
+    }
+
     let Some((display_name, user_id)) = split_disambiguated_matrix_nick(plain_prefix) else {
         return sections.to_vec();
     };
@@ -6565,8 +6658,9 @@ impl eframe::App for WeeChatApp {
                             preview.push('…');
                         }
                         ui.horizontal_wrapped(|ui| {
+                            let display_sender = compact_matrix_sender_label(&reply.sender);
                             ui.label(
-                                egui::RichText::new(format!("Replying to {}", reply.sender))
+                                egui::RichText::new(format!("Replying to {display_sender}"))
                                     .strong()
                                     .color(accent_color),
                             );
@@ -7319,7 +7413,7 @@ impl eframe::App for WeeChatApp {
                                             .unwrap_or(&line.parsed_prefix);
 
                                         // Measure plain-text width for stable column tracking.
-                                        let measured_w: f32 = prefix_sections
+                                        let measured_text_w: f32 = prefix_sections
                                             .iter()
                                             .map(|section| {
                                                 self.text_with_emoji_width(
@@ -7330,12 +7424,25 @@ impl eframe::App for WeeChatApp {
                                                 )
                                             })
                                             .sum();
-                                        let cap_px = if self.prefix_align_max > 0 {
+                                        // Keep a small right inset: the emoji-aware measuring
+                                        // path and egui's individual span widgets can differ by
+                                        // a couple of pixels at fractional scale factors.
+                                        let measured_w = measured_text_w
+                                            + if prefix_sections.is_empty() { 0.0 } else { 4.0 };
+                                        let configured_cap_px = if self.prefix_align_max > 0 {
                                             ui.fonts(|f| {
                                                 f.layout_no_wrap("M".repeat(self.prefix_align_max), font_id.clone(), Color32::WHITE).size().x
                                             })
                                         } else {
                                             f32::INFINITY
+                                        };
+                                        let cap_px = if compact_row {
+                                            configured_cap_px.min(responsive_prefix_column_cap(
+                                                row_width,
+                                                self.show_timestamps,
+                                            ))
+                                        } else {
+                                            configured_cap_px
                                         };
                                         let entry = self.prefix_col_widths.entry(current_buffer_id.clone().unwrap_or_default()).or_insert(0.0);
                                         let (next_col_width, grew) =
@@ -7347,14 +7454,7 @@ impl eframe::App for WeeChatApp {
                                             // every visible row uses the same final column.
                                             ui.ctx().request_repaint();
                                         }
-                                        let compact_prefix_cap = (row_width
-                                            - if self.show_timestamps { 92.0 } else { 24.0 })
-                                            .max(40.0);
-                                        let col_width = if compact_row {
-                                            (*entry).min(compact_prefix_cap)
-                                        } else {
-                                            *entry
-                                        };
+                                        let col_width = *entry;
 
                                         let prefix_response = ui.allocate_ui_with_layout(
                                             egui::vec2(col_width, ui.text_style_height(&TextStyle::Body)),
@@ -7365,6 +7465,11 @@ impl eframe::App for WeeChatApp {
                                             // logical prefix order left-to-right.
                                             prefix_span_layout(),
                                             |ui| {
+                                                // A long sender must never paint through the
+                                                // separator and over the message column.
+                                                if measured_w > col_width {
+                                                    ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+                                                }
                                                 if continues_matrix_event {
                                                     ui.set_opacity(0.0);
                                                 }
@@ -7377,9 +7482,10 @@ impl eframe::App for WeeChatApp {
                                             }
                                         ).response;
                                         if !continues_matrix_event {
+                                            let visible_prefix_width = measured_w.min(col_width);
                                             prefix_visible_rect = Some(Rect::from_min_max(
                                                 egui::pos2(
-                                                    prefix_response.rect.max.x - measured_w,
+                                                    prefix_response.rect.max.x - visible_prefix_width,
                                                     prefix_response.rect.min.y,
                                                 ),
                                                 prefix_response.rect.max,
