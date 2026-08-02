@@ -531,14 +531,23 @@ fn response_primary_clicked(ui: &egui::Ui, response: &egui::Response) -> bool {
         })
 }
 
+fn open_url_once(output: &mut egui::PlatformOutput, url: &str) {
+    // The row context menu can consume a child widget's normal click, so links
+    // also inspect the raw pointer edge. More than one response can observe the
+    // same edge; the first matching link must remain the target for this frame.
+    if output.open_url.is_none() {
+        output.open_url = Some(egui::OpenUrl::new_tab(url));
+    }
+}
+
 #[cfg(test)]
 mod inline_matrix_image_tests {
     use super::{
         avatar_thumbnail, begin_matrix_media_load,
         inline_image_dimensions_allowed,
         inline_image_display_size, inline_image_preview_size, is_matrix_media_status_line,
-        matrix_image_bytes_complete, matrix_media_cache_path, prefix_span_layout, ImageState,
-        primary_click_hits_rect,
+        matrix_image_bytes_complete, matrix_media_cache_path, open_url_once,
+        prefix_span_layout, ImageState, primary_click_hits_rect,
         quote_weechat_argument,
         responsive_prefix_column_cap,
         update_prefix_column_width,
@@ -675,6 +684,24 @@ mod inline_matrix_image_tests {
             Some(egui::pos2(60.0, 35.0)),
             rect
         ));
+    }
+
+    #[test]
+    fn one_pointer_click_cannot_be_retargeted_by_a_later_link() {
+        let mut output = egui::PlatformOutput::default();
+        open_url_once(
+            &mut output,
+            "https://trac.osgeo.org/postgis/ticket/5796",
+        );
+        open_url_once(
+            &mut output,
+            "https://trac.osgeo.org/postgis/ticket/2362",
+        );
+
+        assert_eq!(
+            output.open_url.as_ref().map(|target| target.url.as_str()),
+            Some("https://trac.osgeo.org/postgis/ticket/5796")
+        );
     }
 
     #[test]
@@ -4483,7 +4510,7 @@ impl WeeChatApp {
                         }
                         if response_primary_clicked(ui, &link) {
                             ui.ctx().output_mut(|output| {
-                                output.open_url = Some(egui::OpenUrl::new_tab(url.clone()));
+                                open_url_once(output, url);
                             });
                         }
                         if self.show_inline_images && Self::is_image_url(url) {
@@ -8091,7 +8118,8 @@ impl eframe::App for WeeChatApp {
                                         }
                                         if let Some(ref url) = menu_url {
                                             if ui.button("Open URL").clicked() {
-                                                ui.ctx().output_mut(|o| o.open_url = Some(egui::OpenUrl::new_tab(url.clone())));
+                                                ui.ctx()
+                                                    .output_mut(|output| open_url_once(output, url));
                                                 ui.close_menu();
                                             }
                                             if ui.button("Copy URL").clicked() {
