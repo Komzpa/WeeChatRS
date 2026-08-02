@@ -1,7 +1,7 @@
 use crate::relay::backend::{BackendClient, BackendEvent};
 use crate::relay::weechat::{WeeChatClient, WeeChatConfig};
 use crate::relay::models::*;
-use crate::ui::ansi::ANSIParser;
+use crate::ui::ansi::{ANSIParser, ANSISection, AnsiStyle};
 use crate::ui::theme::AppTheme;
 use crate::ui::keybinds::KeybindsMap;
 use crate::ui::url_safety::is_safe_public_url;
@@ -1526,25 +1526,24 @@ mod thread_tests {
     }
 
     #[test]
-    fn matrix_nick_clusters_compact_backend_disambiguation_without_losing_identities() {
+    fn matrix_nick_rows_keep_identities_separate_with_short_disambiguation() {
         let clusters = matrix_nick_clusters(&[
             nick("GrayShade (@grayshade:dend.ro)"),
             nick("GrayShade (@irc_libera.chat_grayshade:osgeo.org)"),
             nick("Someone else"),
         ]);
 
-        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters.len(), 3);
         assert_eq!(clusters[0].display_name, "GrayShade");
-        assert_eq!(clusters[0].members.len(), 2);
+        assert_eq!(clusters[0].members.len(), 1);
+        assert_eq!(clusters[0].user_ids, ["@grayshade:dend.ro"]);
+        assert_eq!(clusters[1].display_name, "GrayShade");
         assert_eq!(
-            clusters[0].user_ids,
-            [
-                "@grayshade:dend.ro",
-                "@irc_libera.chat_grayshade:osgeo.org",
-            ]
+            clusters[1].user_ids,
+            ["@irc_libera.chat_grayshade:osgeo.org"]
         );
-        assert_eq!(clusters[1].display_name, "Someone else");
-        assert!(clusters[1].user_ids.is_empty());
+        assert_eq!(clusters[2].display_name, "Someone else");
+        assert!(clusters[2].user_ids.is_empty());
     }
 
     #[test]
@@ -1562,6 +1561,30 @@ mod thread_tests {
             "osgeo.org"
         );
         assert_eq!(matrix_identity_source("@someone:matrix.example:8448"), "matrix.example:8448");
+        assert_eq!(matrix_identity_disambiguator("@grayshade:dend.ro"), "dend");
+        assert_eq!(
+            matrix_identity_disambiguator("@irc_libera.chat_grayshade:osgeo.org"),
+            "osgeo"
+        );
+    }
+
+    #[test]
+    fn matrix_message_prefix_uses_the_same_short_disambiguation() {
+        let sections = ANSIParser::parse(
+            "\x1b[32mGrayShade\x1b[0m (@grayshade:dend.ro)",
+        );
+        let compact = compact_matrix_prefix_sections(
+            "GrayShade (@grayshade:dend.ro)",
+            &sections,
+        );
+        assert_eq!(
+            compact
+                .iter()
+                .map(|section| section.text.as_str())
+                .collect::<String>(),
+            "GrayShade ·dend"
+        );
+        assert_eq!(compact[0].style, sections[0].style);
     }
 
     #[test]
@@ -2719,33 +2742,63 @@ fn matrix_identity_source(user_id: &str) -> String {
     server.to_owned()
 }
 
-fn matrix_nick_clusters(nicks: &[Nick]) -> Vec<MatrixNickCluster> {
-    let mut clusters = Vec::<MatrixNickCluster>::new();
-    let mut disambiguated = HashMap::<String, usize>::new();
-
-    for nick in nicks {
-        if let Some((display_name, user_id)) = split_disambiguated_matrix_nick(&nick.name) {
-            if let Some(index) = disambiguated.get(display_name).copied() {
-                clusters[index].members.push(nick.clone());
-                clusters[index].user_ids.push(user_id.to_owned());
-            } else {
-                let index = clusters.len();
-                disambiguated.insert(display_name.to_owned(), index);
-                clusters.push(MatrixNickCluster {
-                    display_name: display_name.to_owned(),
-                    members: vec![nick.clone()],
-                    user_ids: vec![user_id.to_owned()],
-                });
-            }
-        } else {
-            clusters.push(MatrixNickCluster {
-                display_name: nick.name.clone(),
-                members: vec![nick.clone()],
-                user_ids: Vec::new(),
-            });
-        }
+fn matrix_identity_disambiguator(user_id: &str) -> String {
+    let source = matrix_identity_source(user_id);
+    let host = source.split(':').next().unwrap_or(source.as_str());
+    let labels: Vec<_> = host.split('.').filter(|label| !label.is_empty()).collect();
+    if labels.len() >= 2 {
+        labels[labels.len() - 2].to_owned()
+    } else {
+        host.to_owned()
     }
-    clusters
+}
+
+fn compact_matrix_prefix_sections(
+    plain_prefix: &str,
+    sections: &[ANSISection],
+) -> Vec<ANSISection> {
+    let Some((display_name, user_id)) = split_disambiguated_matrix_nick(plain_prefix) else {
+        return sections.to_vec();
+    };
+
+    let mut compact = Vec::new();
+    let mut remaining = display_name.len();
+    for section in sections {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(section.text.len());
+        compact.push(ANSISection {
+            text: section.text[..take].to_owned(),
+            style: section.style,
+            url: None,
+        });
+        remaining -= take;
+    }
+    compact.push(ANSISection {
+        text: format!(" ·{}", matrix_identity_disambiguator(user_id)),
+        style: AnsiStyle::default(),
+        url: None,
+    });
+    compact
+}
+
+fn matrix_nick_clusters(nicks: &[Nick]) -> Vec<MatrixNickCluster> {
+    nicks
+        .iter()
+        .map(|nick| {
+            let (display_name, user_ids) = split_disambiguated_matrix_nick(&nick.name)
+                .map(|(display_name, user_id)| {
+                    (display_name.to_owned(), vec![user_id.to_owned()])
+                })
+                .unwrap_or_else(|| (nick.name.clone(), Vec::new()));
+            MatrixNickCluster {
+                display_name,
+                members: vec![nick.clone()],
+                user_ids,
+            }
+        })
+        .collect()
 }
 
 fn matrix_profile_for_nick(
@@ -5784,9 +5837,19 @@ impl eframe::App for WeeChatApp {
                                                 );
                                                 avatar_rect = Some(avatar_response.rect);
                                             }
+                                            let author_sections = ANSIParser::parse(&block.prefix);
+                                            let plain_author: String = author_sections
+                                                .iter()
+                                                .map(|section| section.text.as_str())
+                                                .collect();
+                                            let display_author_sections =
+                                                compact_matrix_prefix_sections(
+                                                    &plain_author,
+                                                    &author_sections,
+                                                );
                                             let prefix_response = ui.scope(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                                for section in ANSIParser::parse(&block.prefix) {
+                                                for section in display_author_sections {
                                                     let format = section
                                                         .style
                                                         .to_format(font_id.clone(), &render_theme);
@@ -6089,24 +6152,16 @@ impl eframe::App for WeeChatApp {
                                             }
                                             self.render_text_with_emoji(ui, &s.text, &fmt, false, true);
                                         }
-                                        if cluster.user_ids.len() > 1 {
-                                            egui::Frame::none()
-                                                .fill(accent_color.gamma_multiply(0.16))
-                                                .rounding(4.0)
-                                                .inner_margin(egui::Margin::symmetric(4.0, 1.0))
-                                                .show(ui, |ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "×{}",
-                                                            cluster.user_ids.len()
-                                                        ))
-                                                        .small()
-                                                        .color(accent_color),
-                                                    )
-                                                    .on_hover_text(
-                                                        "Show distinct Matrix identities",
-                                                    );
-                                                });
+                                        if let Some(user_id) = cluster.user_ids.first() {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "·{}",
+                                                    matrix_identity_disambiguator(user_id)
+                                                ))
+                                                .small()
+                                                .color(text_muted),
+                                            )
+                                            .on_hover_text(user_id);
                                         }
                                     }).response;
                                     let label_res = label_res.interact(egui::Sense::click());
@@ -6150,11 +6205,13 @@ impl eframe::App for WeeChatApp {
                                             prefix: nick.prefix.clone(),
                                             server: current_buffer_server.clone().unwrap_or_default(),
                                             is_matrix: current_buffer_is_matrix,
-                                            matrix_user_id: current_buffer_mention_candidates
-                                                .as_deref()
-                                                .and_then(|candidates| {
-                                                    matrix_user_id_for_nick(candidates, &nick.name)
-                                                }),
+                                            matrix_user_id: cluster.user_ids.first().cloned().or_else(|| {
+                                                current_buffer_mention_candidates
+                                                    .as_deref()
+                                                    .and_then(|candidates| {
+                                                        matrix_user_id_for_nick(candidates, &nick.name)
+                                                    })
+                                            }),
                                             matrix,
                                             matrix_identities,
                                         });
@@ -7250,7 +7307,16 @@ impl eframe::App for WeeChatApp {
                                                 }
                                             }
                                         }
-                                        let prefix_sections = &line.parsed_prefix;
+                                        let compact_prefix_sections = current_buffer_is_matrix
+                                            .then(|| {
+                                                compact_matrix_prefix_sections(
+                                                    &line.plain_prefix,
+                                                    &line.parsed_prefix,
+                                                )
+                                            });
+                                        let prefix_sections = compact_prefix_sections
+                                            .as_deref()
+                                            .unwrap_or(&line.parsed_prefix);
 
                                         // Measure plain-text width for stable column tracking.
                                         let measured_w: f32 = prefix_sections
