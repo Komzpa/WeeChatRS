@@ -1516,6 +1516,64 @@ mod thread_tests {
         );
     }
 
+    fn nick(name: &str) -> Nick {
+        Nick {
+            name: name.to_owned(),
+            prefix: String::new(),
+            color_ansi: String::new(),
+            away: false,
+        }
+    }
+
+    #[test]
+    fn matrix_nick_clusters_compact_backend_disambiguation_without_losing_identities() {
+        let clusters = matrix_nick_clusters(&[
+            nick("GrayShade (@grayshade:dend.ro)"),
+            nick("GrayShade (@irc_libera.chat_grayshade:osgeo.org)"),
+            nick("Someone else"),
+        ]);
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].display_name, "GrayShade");
+        assert_eq!(clusters[0].members.len(), 2);
+        assert_eq!(
+            clusters[0].user_ids,
+            [
+                "@grayshade:dend.ro",
+                "@irc_libera.chat_grayshade:osgeo.org",
+            ]
+        );
+        assert_eq!(clusters[1].display_name, "Someone else");
+        assert!(clusters[1].user_ids.is_empty());
+    }
+
+    #[test]
+    fn matrix_nick_clusters_do_not_merge_unproven_same_name_members() {
+        let clusters = matrix_nick_clusters(&[nick("Alex"), nick("Alex")]);
+        assert_eq!(clusters.len(), 2);
+        assert!(clusters.iter().all(|cluster| cluster.members.len() == 1));
+    }
+
+    #[test]
+    fn matrix_identity_sources_keep_native_and_bridge_accounts_distinct() {
+        assert_eq!(matrix_identity_source("@grayshade:dend.ro"), "dend.ro");
+        assert_eq!(
+            matrix_identity_source("@irc_libera.chat_grayshade:osgeo.org"),
+            "osgeo.org"
+        );
+        assert_eq!(matrix_identity_source("@someone:matrix.example:8448"), "matrix.example:8448");
+    }
+
+    #[test]
+    fn decorated_profile_lookup_never_substitutes_another_identity() {
+        let profiles = vec![profile("@other:example.org", "GrayShade", "GrayShade")];
+        assert!(matrix_profile_for_nick(
+            &profiles,
+            "GrayShade (@missing:example.org)"
+        )
+        .is_none());
+    }
+
     #[test]
     fn message_sender_profile_uses_matrix_identity_and_ranked_prefixes() {
         let profiles = vec![profile("@strk:osgeo.org", "strk 🧭", "strk 🧭")];
@@ -2622,6 +2680,72 @@ pub(crate) struct UserProfileCard {
     pub(crate) is_matrix: bool,
     pub(crate) matrix_user_id: Option<String>,
     pub(crate) matrix: Option<MatrixMemberProfile>,
+    pub(crate) matrix_identities: Vec<MatrixProfileIdentity>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MatrixProfileIdentity {
+    pub(crate) user_id: String,
+    pub(crate) profile: Option<MatrixMemberProfile>,
+}
+
+#[derive(Clone)]
+struct MatrixNickCluster {
+    display_name: String,
+    members: Vec<Nick>,
+    user_ids: Vec<String>,
+}
+
+fn split_disambiguated_matrix_nick(nick: &str) -> Option<(&str, &str)> {
+    let nick = nick.strip_suffix(')')?;
+    let (display_name, user_id) = nick.rsplit_once(" (")?;
+    if display_name.is_empty()
+        || !user_id.starts_with('@')
+        || !user_id.contains(':')
+        || user_id.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some((display_name, user_id))
+}
+
+fn matrix_identity_source(user_id: &str) -> String {
+    let Some((_, server)) = user_id
+        .strip_prefix('@')
+        .and_then(|user_id| user_id.split_once(':'))
+    else {
+        return "Matrix".to_owned();
+    };
+    server.to_owned()
+}
+
+fn matrix_nick_clusters(nicks: &[Nick]) -> Vec<MatrixNickCluster> {
+    let mut clusters = Vec::<MatrixNickCluster>::new();
+    let mut disambiguated = HashMap::<String, usize>::new();
+
+    for nick in nicks {
+        if let Some((display_name, user_id)) = split_disambiguated_matrix_nick(&nick.name) {
+            if let Some(index) = disambiguated.get(display_name).copied() {
+                clusters[index].members.push(nick.clone());
+                clusters[index].user_ids.push(user_id.to_owned());
+            } else {
+                let index = clusters.len();
+                disambiguated.insert(display_name.to_owned(), index);
+                clusters.push(MatrixNickCluster {
+                    display_name: display_name.to_owned(),
+                    members: vec![nick.clone()],
+                    user_ids: vec![user_id.to_owned()],
+                });
+            }
+        } else {
+            clusters.push(MatrixNickCluster {
+                display_name: nick.name.clone(),
+                members: vec![nick.clone()],
+                user_ids: Vec::new(),
+            });
+        }
+    }
+    clusters
 }
 
 fn matrix_profile_for_nick(
@@ -2630,6 +2754,12 @@ fn matrix_profile_for_nick(
 ) -> Option<MatrixMemberProfile> {
     if let Some(profile) = profiles.iter().find(|profile| profile.nick == nick) {
         return Some(profile.clone());
+    }
+    if let Some((_, user_id)) = split_disambiguated_matrix_nick(nick) {
+        return profiles
+            .iter()
+            .find(|profile| profile.user_id == user_id)
+            .cloned();
     }
     // Timeline prefixes include WeeChat rank markers (`&`, `@`, `+`, ...),
     // while member-profile nicks do not. Keep exact matching first so a real
@@ -2663,6 +2793,7 @@ fn message_sender_profile_card(
             is_matrix: true,
             matrix_user_id: Some(matrix.user_id.clone()),
             matrix: Some(matrix),
+            matrix_identities: Vec::new(),
         });
     }
 
@@ -2676,6 +2807,7 @@ fn message_sender_profile_card(
         is_matrix: false,
         matrix_user_id: None,
         matrix: None,
+        matrix_identities: Vec::new(),
     })
 }
 
@@ -5894,14 +6026,28 @@ impl eframe::App for WeeChatApp {
                     ui.add_space(8.0);
                     ScrollArea::vertical().show(ui, |ui| {
                             if let Some(nicks) = &current_buffer_nicks {
-                                for nick in nicks {
-                                    let text = format!("{}{}", nick.prefix, nick.name);
+                                let clusters = if current_buffer_is_matrix {
+                                    matrix_nick_clusters(nicks)
+                                } else {
+                                    nicks
+                                        .iter()
+                                        .cloned()
+                                        .map(|nick| MatrixNickCluster {
+                                            display_name: nick.name.clone(),
+                                            members: vec![nick],
+                                            user_ids: Vec::new(),
+                                        })
+                                        .collect()
+                                };
+                                for cluster in clusters {
+                                    let nick = &cluster.members[0];
+                                    let text = format!("{}{}", nick.prefix, cluster.display_name);
                                     let input = if nick.away {
                                         text.clone()
                                     } else if self.colored_nicks {
                                         if render_theme.name == "Default" { format!("{}{}", nick.color_ansi, text) }
                                         else {
-                                            let idx = Self::hash_nick(&nick.name);
+                                            let idx = Self::hash_nick(&cluster.display_name);
                                             let esc = if idx < 8 { format!("\x1B[{}m", 30 + idx) } else { format!("\x1B[{}m", 90 + idx - 8) };
                                             format!("{}{}", esc, text)
                                         }
@@ -5913,11 +6059,21 @@ impl eframe::App for WeeChatApp {
                                                 current_buffer_id.as_deref(),
                                                 current_buffer_member_profiles.as_deref(),
                                             ) {
+                                                let avatar_nick = cluster
+                                                    .members
+                                                    .iter()
+                                                    .find(|member| {
+                                                        matrix_profile_for_nick(profiles, &member.name)
+                                                            .and_then(|profile| profile.avatar_mxc)
+                                                            .is_some()
+                                                    })
+                                                    .map(|member| member.name.as_str())
+                                                    .unwrap_or(cluster.display_name.as_str());
                                                 self.render_matrix_avatar(
                                                     ui,
                                                     buffer_id,
                                                     profiles,
-                                                    &nick.name,
+                                                    avatar_nick,
                                                     22.0,
                                                     accent_color,
                                                     Color32::WHITE,
@@ -5933,11 +6089,64 @@ impl eframe::App for WeeChatApp {
                                             }
                                             self.render_text_with_emoji(ui, &s.text, &fmt, false, true);
                                         }
-                                    }).response.interact(egui::Sense::click());
+                                        if cluster.user_ids.len() > 1 {
+                                            egui::Frame::none()
+                                                .fill(accent_color.gamma_multiply(0.16))
+                                                .rounding(4.0)
+                                                .inner_margin(egui::Margin::symmetric(4.0, 1.0))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "×{}",
+                                                            cluster.user_ids.len()
+                                                        ))
+                                                        .small()
+                                                        .color(accent_color),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Show distinct Matrix identities",
+                                                    );
+                                                });
+                                        }
+                                    }).response;
+                                    let label_res = label_res.interact(egui::Sense::click());
                                     if response_primary_clicked(ui, &label_res) {
+                                        let matrix_identities: Vec<MatrixProfileIdentity> = cluster
+                                            .members
+                                            .iter()
+                                            .zip(&cluster.user_ids)
+                                            .map(|(member, user_id)| MatrixProfileIdentity {
+                                                user_id: user_id.clone(),
+                                                profile: current_buffer_member_profiles
+                                                    .as_deref()
+                                                    .and_then(|profiles| {
+                                                        matrix_profile_for_nick(
+                                                            profiles,
+                                                            &member.name,
+                                                        )
+                                                    }),
+                                            })
+                                            .collect();
+                                        let matrix = matrix_identities
+                                            .iter()
+                                            .filter_map(|identity| identity.profile.as_ref())
+                                            .find(|profile| profile.avatar_mxc.is_some())
+                                            .or_else(|| {
+                                                matrix_identities
+                                                    .iter()
+                                                    .find_map(|identity| identity.profile.as_ref())
+                                            })
+                                            .cloned()
+                                            .or_else(|| {
+                                            current_buffer_member_profiles
+                                                .as_deref()
+                                                .and_then(|profiles| {
+                                                    matrix_profile_for_nick(profiles, &nick.name)
+                                                })
+                                            });
                                         self.profile_card = Some(UserProfileCard {
                                             buffer_id: current_buffer_id.clone().unwrap_or_default(),
-                                            nick: nick.name.clone(),
+                                            nick: cluster.display_name.clone(),
                                             prefix: nick.prefix.clone(),
                                             server: current_buffer_server.clone().unwrap_or_default(),
                                             is_matrix: current_buffer_is_matrix,
@@ -5946,23 +6155,22 @@ impl eframe::App for WeeChatApp {
                                                 .and_then(|candidates| {
                                                     matrix_user_id_for_nick(candidates, &nick.name)
                                                 }),
-                                            matrix: current_buffer_member_profiles
-                                                .as_deref()
-                                                .and_then(|profiles| {
-                                                    matrix_profile_for_nick(profiles, &nick.name)
-                                                }),
+                                            matrix,
+                                            matrix_identities,
                                         });
                                     }
-                                    label_res.context_menu(|ui| {
-                                        if ui.button(format!("Query {}", nick.name)).clicked() {
-                                            self.send_command(&format!("/query {}", nick.name));
-                                            ui.close_menu();
-                                        }
-                                        if ui.button(format!("Whois {}", nick.name)).clicked() {
-                                            self.send_command(&format!("/whois {}", nick.name));
-                                            ui.close_menu();
-                                        }
-                                    });
+                                    if cluster.user_ids.is_empty() {
+                                        label_res.context_menu(|ui| {
+                                            if ui.button(format!("Query {}", nick.name)).clicked() {
+                                                self.send_command(&format!("/query {}", nick.name));
+                                                ui.close_menu();
+                                            }
+                                            if ui.button(format!("Whois {}", nick.name)).clicked() {
+                                                self.send_command(&format!("/whois {}", nick.name));
+                                                ui.close_menu();
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         });
@@ -5998,6 +6206,7 @@ impl eframe::App for WeeChatApp {
 
             let mut open = true;
             let mut mention = false;
+            let mut mention_identity = None;
             let mut query = false;
             let mut whois = false;
             egui::Window::new("Profile")
@@ -6005,7 +6214,8 @@ impl eframe::App for WeeChatApp {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(330.0)
+                .default_width(420.0)
+                .max_width(480.0)
                 .anchor(egui::Align2::RIGHT_CENTER, [-24.0, 0.0])
                 .show(ctx, |ui| {
                     let display_name = card
@@ -6062,7 +6272,69 @@ impl eframe::App for WeeChatApp {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(6.0);
-                    if let Some(profile) = &card.matrix {
+                    if card.matrix_identities.len() > 1 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} distinct identities",
+                                card.matrix_identities.len()
+                            ))
+                            .strong(),
+                        );
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                            for (index, identity) in card.matrix_identities.iter().enumerate() {
+                                if index > 0 {
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+                                }
+                                ui.label(
+                                    egui::RichText::new(matrix_identity_source(&identity.user_id))
+                                        .small()
+                                        .color(accent_color),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new(&identity.user_id).monospace());
+                                    if ui.small_button("Copy").clicked() {
+                                        ui.output_mut(|output| {
+                                            output.copied_text = identity.user_id.clone();
+                                        });
+                                    }
+                                    if ui.small_button("@ Mention").clicked() {
+                                        mention_identity = Some((
+                                            identity
+                                                .profile
+                                                .as_ref()
+                                                .map(|profile| profile.display_name.clone())
+                                                .unwrap_or_else(|| card.nick.clone()),
+                                            identity.user_id.clone(),
+                                        ));
+                                    }
+                                });
+                                if let Some(profile) = &identity.profile {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · {} · power {}",
+                                            profile.role,
+                                            profile.membership,
+                                            profile
+                                                .power_level
+                                                .map(|power| power.to_string())
+                                                .unwrap_or_else(|| "—".to_owned())
+                                        ))
+                                        .small()
+                                        .color(text_muted),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("Profile details not loaded")
+                                            .small()
+                                            .color(text_muted),
+                                    );
+                                }
+                            }
+                        });
+                    } else if let Some(profile) = &card.matrix {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(egui::RichText::new(&profile.user_id).monospace());
                             if ui.small_button("Copy").clicked() {
@@ -6147,6 +6419,28 @@ impl eframe::App for WeeChatApp {
                 });
             if !open {
                 self.profile_card = None;
+            } else if let Some((display_name, user_id)) = mention_identity {
+                let label = if display_name.starts_with('@') {
+                    display_name
+                } else {
+                    format!("@{display_name}")
+                };
+                if !self.input_text.is_empty()
+                    && !self
+                        .input_text
+                        .chars()
+                        .last()
+                        .is_some_and(char::is_whitespace)
+                {
+                    self.input_text.push(' ');
+                }
+                self.input_text.push_str(&label);
+                self.input_text.push(' ');
+                self.selected_mentions.retain(|selected| {
+                    selected.user_id != user_id && selected.label != label
+                });
+                self.selected_mentions.push(SelectedMention { label, user_id });
+                self.focus_input = true;
             } else if mention {
                 if let Some(user_id) = card
                     .matrix
