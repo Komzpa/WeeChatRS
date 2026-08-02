@@ -812,13 +812,13 @@ enum RightPanelKind {
 #[derive(Clone, Copy, Debug)]
 struct ResponsivePanelLayout {
     show_buffers: bool,
+    show_right: bool,
     buffers_max_width: f32,
     buffers_constrained: bool,
     right_width: f32,
     right_min_width: f32,
     right_max_width: f32,
     right_constrained: bool,
-    #[cfg(test)]
     central_width: f32,
 }
 
@@ -830,9 +830,14 @@ fn responsive_panel_layout(
     preferred_right_width: f32,
 ) -> ResponsivePanelLayout {
     let viewport_width = viewport_width.max(1.0);
-    // On a very small viewport the chat still owns a majority of the width.
-    // At normal sizes it gets a stable readable minimum before side panels.
-    let central_floor = CHAT_PANEL_MIN_WIDTH.min(viewport_width * 0.52);
+    // A thread is an explicitly opened second conversation, so on a tiny
+    // viewport it may split the window with the main chat. Passive sidebars
+    // must instead yield before they crush the chat into an unreadable strip.
+    let central_floor = if right_kind == RightPanelKind::Thread {
+        CHAT_PANEL_MIN_WIDTH.min(viewport_width * 0.52)
+    } else {
+        CHAT_PANEL_MIN_WIDTH.min(viewport_width)
+    };
     let (right_fraction, natural_right_min) = match right_kind {
         RightPanelKind::None => (0.0, 0.0),
         RightPanelKind::Thread => (0.48, THREAD_PANEL_MIN_WIDTH),
@@ -888,8 +893,25 @@ fn responsive_panel_layout(
         )
     };
 
+    let central_width = (available_after_buffers - right_width).max(0.0);
+    if right_kind == RightPanelKind::Nicklist
+        && central_width < COMPACT_MESSAGE_ROW_WIDTH
+    {
+        // A fragmented sliver of nicks is not useful. Keep the user's
+        // show_nicklist preference intact and temporarily give its width back
+        // to the chat; the next wider frame recomputes and restores it.
+        return responsive_panel_layout(
+            viewport_width,
+            show_buffers,
+            preferred_buffers_width,
+            RightPanelKind::None,
+            0.0,
+        );
+    }
+
     ResponsivePanelLayout {
         show_buffers: effective_show_buffers,
+        show_right: right_kind != RightPanelKind::None,
         buffers_max_width,
         buffers_constrained: effective_show_buffers
             && preferred_buffers_width > buffers_max_width,
@@ -898,8 +920,7 @@ fn responsive_panel_layout(
         right_max_width,
         right_constrained: right_kind != RightPanelKind::None
             && preferred_right_width > right_max_width,
-        #[cfg(test)]
-        central_width: (available_after_buffers - right_width).max(0.0),
+        central_width,
     }
 }
 
@@ -966,6 +987,57 @@ mod responsive_layout_tests {
         assert!(!compact_message_row(640.0));
         assert!(compact_message_row(459.0));
         assert!(compact_message_row(208.0));
+    }
+
+    #[test]
+    fn nicklist_hides_before_it_forces_the_chat_into_compact_width() {
+        for viewport in [400.0, 490.0] {
+            let layout = responsive_panel_layout(
+                viewport,
+                false,
+                400.0,
+                RightPanelKind::Nicklist,
+                180.0,
+            );
+            assert!(!layout.show_right, "nicklist remained at {viewport}px");
+            assert_eq!(layout.right_width, 0.0);
+            assert_eq!(layout.central_width, viewport);
+        }
+
+        let exact_fit = responsive_panel_layout(
+            640.0,
+            false,
+            400.0,
+            RightPanelKind::Nicklist,
+            180.0,
+        );
+        assert!(exact_fit.show_right);
+        assert_eq!(exact_fit.central_width, COMPACT_MESSAGE_ROW_WIDTH);
+    }
+
+    #[test]
+    fn passive_sidebars_yield_to_chat_on_phone_sized_windows() {
+        let layout = responsive_panel_layout(
+            400.0,
+            true,
+            400.0,
+            RightPanelKind::Nicklist,
+            180.0,
+        );
+        assert!(!layout.show_buffers);
+        assert!(!layout.show_right);
+        assert_eq!(layout.central_width, 400.0);
+
+        let restored = responsive_panel_layout(
+            840.0,
+            true,
+            240.0,
+            RightPanelKind::Nicklist,
+            120.0,
+        );
+        assert!(restored.show_buffers);
+        assert!(restored.show_right);
+        assert!(restored.central_width >= COMPACT_MESSAGE_ROW_WIDTH);
     }
 
     #[test]
@@ -6160,7 +6232,12 @@ impl eframe::App for WeeChatApp {
                 "thread_panel",
                 responsive_panels.right_constrained,
             );
-        } else if self.show_nicklist && current_buf_has_nicklist && any_connected && current_buffer_id.is_some() {
+        } else if responsive_panels.show_right
+            && self.show_nicklist
+            && current_buf_has_nicklist
+            && any_connected
+            && current_buffer_id.is_some()
+        {
             if self.nicklist_width < 80.0 {
                 self.nicklist_width = 180.0;
             }
