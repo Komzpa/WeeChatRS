@@ -1721,6 +1721,11 @@ impl WeeChatApp {
                     line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
                     line.matrix_reply = Self::matrix_reply_from_tags(obj);
                     line.matrix_media = Self::matrix_media_from_tags(obj);
+                    self.acknowledge_matrix_attachment(
+                        &buffer_id,
+                        line.matrix_media.as_ref(),
+                        is_self_msg,
+                    );
 
                     let is_selected = self.selected_buffer_id.as_deref() == Some(&buffer_id);
                     let mut notify_data: Option<(String, String, String)> = None;
