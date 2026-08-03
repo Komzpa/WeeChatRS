@@ -6116,6 +6116,9 @@ impl eframe::App for WeeChatApp {
                 &self.history_exhausted_buffer_ids,
             )
         });
+        let current_history_exhausted = current_buffer_id
+            .as_deref()
+            .is_some_and(|buffer_id| self.history_exhausted_buffer_ids.contains(buffer_id));
         let _current_buffer_last_read_id = current_buf.and_then(|b| b.last_read_id.clone());
         let current_buffer_visit_marker_id = current_buf.and_then(|b| b.visit_start_marker_id.clone());
         let current_buffer_topic = current_buf.map(|b| b.topic.clone()).unwrap_or_default();
@@ -7649,6 +7652,23 @@ impl eframe::App for WeeChatApp {
                                         ui.separator();
                                     });
                                     ui.add_space(4.0);
+                            } else if current_history_exhausted {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space((ui.available_width() - 150.0).max(0.0) / 2.0);
+                                    ui.label(
+                                        egui::RichText::new("No older messages")
+                                            .color(text_muted)
+                                            .small(),
+                                    );
+                                });
+                                ui.add_space(8.0);
+                                ui.scope(|ui| {
+                                    ui.visuals_mut().widgets.noninteractive.bg_stroke =
+                                        egui::Stroke::new(1.0, border_color);
+                                    ui.separator();
+                                });
+                                ui.add_space(4.0);
                             }
 
                             if let Some(messages) = &current_buffer_messages {
