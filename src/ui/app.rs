@@ -1783,6 +1783,72 @@ mod thread_tests {
     }
 
     #[test]
+    fn matrix_profile_query_uses_mxid_not_display_nick() {
+        let profiles = vec![profile("@strk:osgeo.org", "strk 🧭", "strk 🧭")];
+        let card = message_sender_profile_card(
+            "matrix/room",
+            "&strk 🧭",
+            "matrix",
+            true,
+            &profiles,
+            &[],
+        )
+        .expect("ranked Matrix sender should resolve to a room member");
+
+        assert_eq!(
+            matrix_profile_query_target(&card).as_deref(),
+            Some("@strk:osgeo.org")
+        );
+    }
+
+    #[test]
+    fn matrix_profile_query_uses_single_identity_when_profile_is_missing() {
+        let card = UserProfileCard {
+            buffer_id: "matrix/room".to_owned(),
+            nick: "Sandro".to_owned(),
+            prefix: String::new(),
+            server: "matrix".to_owned(),
+            is_matrix: true,
+            matrix_user_id: None,
+            matrix: None,
+            matrix_identities: vec![MatrixProfileIdentity {
+                user_id: "@strk:osgeo.org".to_owned(),
+                profile: None,
+            }],
+        };
+
+        assert_eq!(
+            matrix_profile_query_target(&card).as_deref(),
+            Some("@strk:osgeo.org")
+        );
+    }
+
+    #[test]
+    fn matrix_profile_query_refuses_ambiguous_identities() {
+        let card = UserProfileCard {
+            buffer_id: "matrix/room".to_owned(),
+            nick: "Sandro".to_owned(),
+            prefix: String::new(),
+            server: "matrix".to_owned(),
+            is_matrix: true,
+            matrix_user_id: None,
+            matrix: None,
+            matrix_identities: vec![
+                MatrixProfileIdentity {
+                    user_id: "@strk:osgeo.org".to_owned(),
+                    profile: None,
+                },
+                MatrixProfileIdentity {
+                    user_id: "@strk:matrix.org".to_owned(),
+                    profile: None,
+                },
+            ],
+        };
+
+        assert!(matrix_profile_query_target(&card).is_none());
+    }
+
+    #[test]
     fn message_sender_profile_requires_a_real_irc_nick() {
         let nicks = vec![Nick {
             name: "Komzpa".to_owned(),
@@ -3132,6 +3198,20 @@ fn message_sender_profile_card(
         matrix: None,
         matrix_identities: Vec::new(),
     })
+}
+
+fn matrix_profile_query_target(card: &UserProfileCard) -> Option<String> {
+    if !card.is_matrix {
+        return None;
+    }
+    card.matrix
+        .as_ref()
+        .map(|profile| profile.user_id.clone())
+        .or_else(|| card.matrix_user_id.clone())
+        .or_else(|| {
+            (card.matrix_identities.len() == 1)
+                .then(|| card.matrix_identities[0].user_id.clone())
+        })
 }
 
 fn matrix_user_id_for_nick(candidates: &[MentionCandidate], nick: &str) -> Option<String> {
@@ -6636,18 +6716,25 @@ impl eframe::App for WeeChatApp {
                                             matrix_identities,
                                         });
                                     }
-                                    if cluster.user_ids.is_empty() {
-                                        label_res.context_menu(|ui| {
+                                    label_res.context_menu(|ui| {
+                                        if let Some(user_id) = cluster.user_ids.first() {
+                                            if ui.button("Message").clicked() {
+                                                self.send_command(&format!("/query {}", user_id));
+                                                ui.close_menu();
+                                            }
+                                        } else {
                                             if ui.button(format!("Query {}", nick.name)).clicked() {
                                                 self.send_command(&format!("/query {}", nick.name));
                                                 ui.close_menu();
                                             }
+                                        }
+                                        if cluster.user_ids.is_empty() {
                                             if ui.button(format!("Whois {}", nick.name)).clicked() {
                                                 self.send_command(&format!("/whois {}", nick.name));
                                                 ui.close_menu();
                                             }
-                                        });
-                                    }
+                                        }
+                                    });
                                 }
                             }
                         });
@@ -6684,6 +6771,7 @@ impl eframe::App for WeeChatApp {
             let mut open = true;
             let mut mention = false;
             let mut mention_identity = None;
+            let mut query_user_id = None;
             let mut query = false;
             let mut whois = false;
             egui::Window::new("Profile")
@@ -6787,6 +6875,9 @@ impl eframe::App for WeeChatApp {
                                             identity.user_id.clone(),
                                         ));
                                     }
+                                    if ui.small_button("Message").clicked() {
+                                        query_user_id = Some(identity.user_id.clone());
+                                    }
                                 });
                                 if let Some(profile) = &identity.profile {
                                     ui.label(
@@ -6845,12 +6936,20 @@ impl eframe::App for WeeChatApp {
                                 ui.end_row();
                             });
                         ui.add_space(10.0);
-                        if ui
-                            .button(egui::RichText::new("@ Mention").color(accent_color))
-                            .clicked()
-                        {
-                            mention = true;
-                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(egui::RichText::new("@ Mention").color(accent_color))
+                                .clicked()
+                            {
+                                mention = true;
+                            }
+                            if ui
+                                .button(egui::RichText::new("Message").color(accent_color))
+                                .clicked()
+                            {
+                                query_user_id = matrix_profile_query_target(&card);
+                            }
+                        });
                     } else if card.is_matrix {
                         if let Some(user_id) = &card.matrix_user_id {
                             ui.horizontal_wrapped(|ui| {
@@ -6869,6 +6968,13 @@ impl eframe::App for WeeChatApp {
                                 .clicked()
                         {
                             mention = true;
+                        }
+                        if card.matrix_user_id.is_some()
+                            && ui
+                                .button(egui::RichText::new("Message").color(accent_color))
+                                .clicked()
+                        {
+                            query_user_id = matrix_profile_query_target(&card);
                         }
                     } else {
                         egui::Grid::new("irc_profile_details")
@@ -6955,6 +7061,8 @@ impl eframe::App for WeeChatApp {
                     });
                     self.focus_input = true;
                 }
+            } else if let Some(user_id) = query_user_id {
+                self.send_command(&format!("/query {}", user_id));
             } else if query {
                 self.send_command(&format!("/query {}", card.nick));
             } else if whois {
