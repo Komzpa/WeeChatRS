@@ -329,7 +329,6 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                     self.rebuild_buffer_idx();
                 }
-                self.canonicalize_selected_chat_buffer();
                 // Incremental backends can announce a service buffer first. If a
                 // remembered chat belongs to this connection, wait for that exact
                 // chat instead of replacing the user's restart destination.
@@ -379,7 +378,6 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                 }
                 self.rebuild_buffer_idx();
-                self.canonicalize_selected_chat_buffer();
                 if self.selected_buffer_id.is_none() {
                     if let Some(id) = preferred_chat_buffer_id(
                         &self.buffers,
@@ -1310,8 +1308,6 @@ impl WeeChatApp {
                 });
             }
             self.rebuild_buffer_idx();
-
-            self.canonicalize_selected_chat_buffer();
 
             let parent_room_id = self
                 .selected_buffer_id

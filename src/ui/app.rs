@@ -1458,25 +1458,6 @@ pub(crate) fn replacement_buffer_id(
         .map(|buffer| buffer.id.clone())
 }
 
-fn canonical_chat_buffer_id(buffers: &[Buffer], buffer_id: String) -> String {
-    let mut current = buffer_id;
-    let mut seen = HashSet::new();
-    while seen.insert(current.clone()) {
-        let Some(replacement) = replacement_buffer_id(buffers, &current) else {
-            break;
-        };
-        current = replacement;
-    }
-    current
-}
-
-fn canonical_selected_chat_buffer_id(
-    buffers: &[Buffer],
-    selected_buffer_id: Option<&str>,
-) -> Option<String> {
-    selected_buffer_id.map(|selected| canonical_chat_buffer_id(buffers, selected.to_owned()))
-}
-
 fn predecessor_buffer_ids(buffers: &[Buffer], current_buffer_id: &str) -> Vec<String> {
     let connection = current_buffer_id.split_once('/').map(|(prefix, _)| prefix);
     let mut ids = Vec::new();
@@ -3377,11 +3358,10 @@ fn restored_cleared_buffer_names(settings: &AppSettings) -> HashSet<String> {
 #[cfg(test)]
 mod saved_read_marker_tests {
     use super::{
-        buffer_visible_in_sidebar, canonical_chat_buffer_id, composed_upgrade_history,
-        canonical_selected_chat_buffer_id, preferred_chat_buffer_id, replaced_matrix_room_ids,
-        replacement_buffer_id, upgrade_history_load_buffer_id, visit_marker_location,
-        AppSettings, Buffer, BufferActivity, Line, SavedReadMarker, VisitMarkerLocation,
-        BEFORE_FIRST_LOADED_LINE_ID,
+        buffer_visible_in_sidebar, composed_upgrade_history, preferred_chat_buffer_id,
+        replaced_matrix_room_ids, replacement_buffer_id, upgrade_history_load_buffer_id,
+        visit_marker_location, AppSettings, Buffer, BufferActivity, Line, SavedReadMarker,
+        VisitMarkerLocation, BEFORE_FIRST_LOADED_LINE_ID,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::{HashSet, VecDeque};
@@ -3572,11 +3552,6 @@ mod saved_read_marker_tests {
         );
         assert!(inherited.contains("upgrade-history:local/old:old-history"));
         assert!(inherited.contains("upgrade-history:local/old:late-old-message"));
-        assert_eq!(
-            canonical_chat_buffer_id(&buffers, "local/old".to_owned()),
-            "local/new",
-        );
-
         let mut exhausted = HashSet::new();
         assert_eq!(
             upgrade_history_load_buffer_id(&buffers, "local/new", &exhausted).as_deref(),
@@ -3657,13 +3632,6 @@ mod saved_read_marker_tests {
                 .as_deref(),
             Some("local/new"),
         );
-        assert_eq!(
-            canonical_chat_buffer_id(
-                &[predecessor.clone(), successor],
-                "local/old".to_owned(),
-            ),
-            "local/new",
-        );
         assert!(!buffer_visible_in_sidebar(
             &predecessor,
             true,
@@ -3713,48 +3681,6 @@ mod saved_read_marker_tests {
         assert_eq!(messages[1].id, "7");
         assert!(inherited.contains("upgrade-history:local/old:7"));
         assert!(!inherited.contains("7"));
-    }
-
-    #[test]
-    fn matrix_room_selection_follows_the_complete_upgrade_chain() {
-        let mut old = buffer("local/old", "old", "channel");
-        old.matrix_room_id = Some("!old:example.org".to_owned());
-        old.matrix_replacement_room_id = Some("!mid:example.org".to_owned());
-
-        let mut mid = buffer("local/mid", "mid", "channel");
-        mid.matrix_room_id = Some("!mid:example.org".to_owned());
-        mid.matrix_predecessor_room_id = Some("!old:example.org".to_owned());
-        mid.matrix_replacement_room_id = Some("!new:example.org".to_owned());
-
-        let mut new = buffer("local/new", "new", "channel");
-        new.matrix_room_id = Some("!new:example.org".to_owned());
-        new.matrix_predecessor_room_id = Some("!mid:example.org".to_owned());
-
-        assert_eq!(
-            canonical_chat_buffer_id(&[old, mid, new], "local/old".to_owned()),
-            "local/new",
-        );
-    }
-
-    #[test]
-    fn selected_matrix_room_is_canonicalized_to_latest_successor() {
-        let mut old = buffer("local/old", "old", "channel");
-        old.matrix_room_id = Some("!old:example.org".to_owned());
-        old.matrix_replacement_room_id = Some("!mid:example.org".to_owned());
-
-        let mut mid = buffer("local/mid", "mid", "channel");
-        mid.matrix_room_id = Some("!mid:example.org".to_owned());
-        mid.matrix_predecessor_room_id = Some("!old:example.org".to_owned());
-        mid.matrix_replacement_room_id = Some("!new:example.org".to_owned());
-
-        let mut new = buffer("local/new", "new", "channel");
-        new.matrix_room_id = Some("!new:example.org".to_owned());
-        new.matrix_predecessor_room_id = Some("!mid:example.org".to_owned());
-
-        assert_eq!(
-            canonical_selected_chat_buffer_id(&[old, mid, new], Some("local/old")).as_deref(),
-            Some("local/new"),
-        );
     }
 
     #[test]
@@ -4145,11 +4071,6 @@ impl WeeChatApp {
         }
     }
 
-    pub(crate) fn effective_send_buffer_id(&self, buffer_id: &str) -> String {
-        replacement_buffer_id(&self.buffers, buffer_id)
-            .unwrap_or_else(|| buffer_id.to_owned())
-    }
-
     fn send_matrix_attachment(
         &self,
         buffer_id: &str,
@@ -4157,7 +4078,6 @@ impl WeeChatApp {
         mime: &str,
         bytes: &[u8],
     ) -> Result<(), String> {
-        let buffer_id = self.effective_send_buffer_id(buffer_id);
         if !self.is_matrix_buffer(&buffer_id) {
             return Err("Attachment target is not a Matrix buffer".to_owned());
         }
@@ -4946,21 +4866,7 @@ impl WeeChatApp {
         }
     }
 
-    pub(crate) fn canonicalize_selected_chat_buffer(&mut self) {
-        let Some(selected) = self.selected_buffer_id.as_deref() else {
-            return;
-        };
-        let Some(canonical) = canonical_selected_chat_buffer_id(&self.buffers, Some(selected))
-        else {
-            return;
-        };
-        if canonical != selected {
-            self.select_buffer(canonical);
-        }
-    }
-
     pub(crate) fn select_buffer(&mut self, id: String) {
-        let id = canonical_chat_buffer_id(&self.buffers, id);
         if self
             .buffer_by_id(&id)
             .is_some_and(|buffer| buffer.is_matrix_thread())
@@ -7712,7 +7618,7 @@ impl eframe::App for WeeChatApp {
                             .show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new(
-                                        "Archived room history — new messages are sent to its replacement",
+                                        "Archived room history",
                                     )
                                     .color(Color32::from_rgb(255, 205, 115))
                                     .strong(),
