@@ -1393,21 +1393,35 @@ pub(crate) fn preferred_chat_buffer_id(
 }
 
 fn replaced_matrix_room_ids(buffers: &[Buffer]) -> HashSet<String> {
-    let joined_room_ids: HashSet<&str> = buffers
-        .iter()
-        .filter_map(|buffer| buffer.matrix_room_id.as_deref())
-        .collect();
-    buffers
+    let matrix_room_ids: HashSet<&str> = buffers
         .iter()
         .filter_map(|buffer| {
-            buffer
+            (!buffer.is_matrix_thread())
+                .then_some(buffer.matrix_room_id.as_deref())
+                .flatten()
+        })
+        .collect();
+    let mut replaced = HashSet::new();
+
+    for buffer in buffers.iter().filter(|buffer| !buffer.is_matrix_thread()) {
+        if let Some(predecessor_room_id) = buffer.matrix_predecessor_room_id.as_deref() {
+            if matrix_room_ids.contains(predecessor_room_id) {
+                replaced.insert(predecessor_room_id.to_owned());
+            }
+        }
+
+        if let Some(room_id) = buffer.matrix_room_id.as_deref() {
+            if buffer
                 .matrix_replacement_room_id
                 .as_deref()
-                .filter(|replacement| joined_room_ids.contains(replacement))
-                .and(buffer.matrix_room_id.as_deref())
-                .map(ToOwned::to_owned)
-        })
-        .collect()
+                .is_some_and(|replacement| matrix_room_ids.contains(replacement))
+            {
+                replaced.insert(room_id.to_owned());
+            }
+        }
+    }
+
+    replaced
 }
 
 pub(crate) fn replacement_buffer_id(
@@ -1415,13 +1429,28 @@ pub(crate) fn replacement_buffer_id(
     current_buffer_id: &str,
 ) -> Option<String> {
     let current = buffers.iter().find(|buffer| buffer.id == current_buffer_id)?;
-    let replacement_room_id = current.matrix_replacement_room_id.as_deref()?;
     let connection = current_buffer_id.split_once('/').map(|(prefix, _)| prefix);
+    if let Some(replacement_room_id) = current.matrix_replacement_room_id.as_deref() {
+        if let Some(buffer_id) = buffers
+            .iter()
+            .find(|buffer| {
+                !buffer.is_matrix_thread()
+                    && buffer.matrix_room_id.as_deref() == Some(replacement_room_id)
+                    && connection.is_none_or(|prefix| {
+                        buffer.id.split_once('/').map(|(candidate, _)| candidate) == Some(prefix)
+                    })
+            })
+            .map(|buffer| buffer.id.clone())
+        {
+            return Some(buffer_id);
+        }
+    }
+    let current_room_id = current.matrix_room_id.as_deref()?;
     buffers
         .iter()
         .find(|buffer| {
             !buffer.is_matrix_thread()
-                && buffer.matrix_room_id.as_deref() == Some(replacement_room_id)
+                && buffer.matrix_predecessor_room_id.as_deref() == Some(current_room_id)
                 && connection.is_none_or(|prefix| {
                     buffer.id.split_once('/').map(|(candidate, _)| candidate) == Some(prefix)
                 })
@@ -3580,6 +3609,37 @@ mod saved_read_marker_tests {
             &HashSet::new(),
             &replaced,
         ));
+        assert!(!buffer_visible_in_sidebar(
+            &predecessor,
+            true,
+            &HashSet::new(),
+            &replaced,
+        ));
+    }
+
+    #[test]
+    fn matrix_room_upgrade_hides_predecessor_from_successor_edge_only() {
+        let mut predecessor = buffer("local/old", "#postgis", "channel");
+        predecessor.matrix_room_id = Some("!old:example.org".to_owned());
+
+        let mut successor = buffer("local/new", "#postgis", "channel");
+        successor.matrix_room_id = Some("!new:example.org".to_owned());
+        successor.matrix_predecessor_room_id = Some("!old:example.org".to_owned());
+
+        let replaced = replaced_matrix_room_ids(&[predecessor.clone(), successor.clone()]);
+        assert!(replaced.contains("!old:example.org"));
+        assert_eq!(
+            replacement_buffer_id(&[predecessor.clone(), successor.clone()], "local/old")
+                .as_deref(),
+            Some("local/new"),
+        );
+        assert_eq!(
+            canonical_chat_buffer_id(
+                &[predecessor.clone(), successor],
+                "local/old".to_owned(),
+            ),
+            "local/new",
+        );
         assert!(!buffer_visible_in_sidebar(
             &predecessor,
             true,
