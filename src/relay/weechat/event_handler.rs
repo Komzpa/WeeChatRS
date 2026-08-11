@@ -3,7 +3,7 @@ use crate::relay::models::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{
     history_snapshot_is_exhausted, is_restorable_chat_buffer, preferred_chat_buffer_id,
-    matrix_history_snapshot_count, replacement_buffer_id, CommandCompletionState, SavedReadMarker, WeeChatApp,
+    matrix_history_snapshot_count, CommandCompletionState, SavedReadMarker, WeeChatApp,
     LOAD_MORE_LINES, MAX_STORED_LINES,
 };
 use chrono::{Utc, DateTime, Local};
@@ -329,6 +329,7 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                     self.rebuild_buffer_idx();
                 }
+                self.canonicalize_selected_chat_buffer();
                 // Incremental backends can announce a service buffer first. If a
                 // remembered chat belongs to this connection, wait for that exact
                 // chat instead of replacing the user's restart destination.
@@ -378,11 +379,7 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                 }
                 self.rebuild_buffer_idx();
-                if let Some(selected) = self.selected_buffer_id.clone() {
-                    if let Some(replacement) = replacement_buffer_id(&self.buffers, &selected) {
-                        self.select_buffer(replacement);
-                    }
-                }
+                self.canonicalize_selected_chat_buffer();
                 if self.selected_buffer_id.is_none() {
                     if let Some(id) = preferred_chat_buffer_id(
                         &self.buffers,
@@ -1314,11 +1311,7 @@ impl WeeChatApp {
             }
             self.rebuild_buffer_idx();
 
-            if let Some(selected) = self.selected_buffer_id.clone() {
-                if let Some(replacement) = replacement_buffer_id(&self.buffers, &selected) {
-                    self.select_buffer(replacement);
-                }
-            }
+            self.canonicalize_selected_chat_buffer();
 
             let parent_room_id = self
                 .selected_buffer_id

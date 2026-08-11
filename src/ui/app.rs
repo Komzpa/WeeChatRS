@@ -1470,6 +1470,13 @@ fn canonical_chat_buffer_id(buffers: &[Buffer], buffer_id: String) -> String {
     current
 }
 
+fn canonical_selected_chat_buffer_id(
+    buffers: &[Buffer],
+    selected_buffer_id: Option<&str>,
+) -> Option<String> {
+    selected_buffer_id.map(|selected| canonical_chat_buffer_id(buffers, selected.to_owned()))
+}
+
 fn predecessor_buffer_ids(buffers: &[Buffer], current_buffer_id: &str) -> Vec<String> {
     let connection = current_buffer_id.split_once('/').map(|(prefix, _)| prefix);
     let mut ids = Vec::new();
@@ -3371,9 +3378,9 @@ fn restored_cleared_buffer_names(settings: &AppSettings) -> HashSet<String> {
 mod saved_read_marker_tests {
     use super::{
         buffer_visible_in_sidebar, canonical_chat_buffer_id, composed_upgrade_history,
-        preferred_chat_buffer_id, replaced_matrix_room_ids, replacement_buffer_id,
-        upgrade_history_load_buffer_id, visit_marker_location, AppSettings, Buffer,
-        BufferActivity, Line, SavedReadMarker, VisitMarkerLocation,
+        canonical_selected_chat_buffer_id, preferred_chat_buffer_id, replaced_matrix_room_ids,
+        replacement_buffer_id, upgrade_history_load_buffer_id, visit_marker_location,
+        AppSettings, Buffer, BufferActivity, Line, SavedReadMarker, VisitMarkerLocation,
         BEFORE_FIRST_LOADED_LINE_ID,
     };
     use chrono::{TimeZone, Utc};
@@ -3726,6 +3733,27 @@ mod saved_read_marker_tests {
         assert_eq!(
             canonical_chat_buffer_id(&[old, mid, new], "local/old".to_owned()),
             "local/new",
+        );
+    }
+
+    #[test]
+    fn selected_matrix_room_is_canonicalized_to_latest_successor() {
+        let mut old = buffer("local/old", "old", "channel");
+        old.matrix_room_id = Some("!old:example.org".to_owned());
+        old.matrix_replacement_room_id = Some("!mid:example.org".to_owned());
+
+        let mut mid = buffer("local/mid", "mid", "channel");
+        mid.matrix_room_id = Some("!mid:example.org".to_owned());
+        mid.matrix_predecessor_room_id = Some("!old:example.org".to_owned());
+        mid.matrix_replacement_room_id = Some("!new:example.org".to_owned());
+
+        let mut new = buffer("local/new", "new", "channel");
+        new.matrix_room_id = Some("!new:example.org".to_owned());
+        new.matrix_predecessor_room_id = Some("!mid:example.org".to_owned());
+
+        assert_eq!(
+            canonical_selected_chat_buffer_id(&[old, mid, new], Some("local/old")).as_deref(),
+            Some("local/new"),
         );
     }
 
@@ -4915,6 +4943,19 @@ impl WeeChatApp {
         self.cleared_buffer_ids.insert(id.to_owned());
         if let Some(full_name) = self.buffer_by_id(id).map(|buffer| buffer.full_name.clone()) {
             self.cleared_buffer_names.insert(full_name);
+        }
+    }
+
+    pub(crate) fn canonicalize_selected_chat_buffer(&mut self) {
+        let Some(selected) = self.selected_buffer_id.as_deref() else {
+            return;
+        };
+        let Some(canonical) = canonical_selected_chat_buffer_id(&self.buffers, Some(selected))
+        else {
+            return;
+        };
+        if canonical != selected {
+            self.select_buffer(canonical);
         }
     }
 
