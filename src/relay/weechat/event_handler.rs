@@ -355,6 +355,13 @@ impl WeeChatApp {
                         self.pending_buffer_switch = Some(target);
                     }
                 }
+                if let Some(current_id) = self.selected_buffer_id.clone() {
+                    if let Some(replacement_id) =
+                        replacement_buffer_id(&self.buffers, &current_id)
+                    {
+                        self.select_buffer(replacement_id);
+                    }
+                }
             }
             BackendEvent::BufferClosed { buffer_id } => {
                 let full_id = format!("{}/{}", conn_prefix, buffer_id);
@@ -384,6 +391,12 @@ impl WeeChatApp {
                         self.last_chat_buffer_name.as_deref(),
                     ) {
                         self.select_buffer(id);
+                    }
+                } else if let Some(current_id) = self.selected_buffer_id.clone() {
+                    if let Some(replacement_id) =
+                        replacement_buffer_id(&self.buffers, &current_id)
+                    {
+                        self.select_buffer(replacement_id);
                     }
                 }
             }
