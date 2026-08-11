@@ -1414,7 +1414,7 @@ fn replaced_matrix_room_ids(buffers: &[Buffer]) -> HashSet<String> {
             if buffer
                 .matrix_replacement_room_id
                 .as_deref()
-                .is_some_and(|replacement| !replacement.is_empty())
+                .is_some_and(|replacement| matrix_room_ids.contains(replacement))
             {
                 replaced.insert(room_id.to_owned());
             }
@@ -3666,20 +3666,20 @@ mod saved_read_marker_tests {
     }
 
     #[test]
-    fn matrix_room_upgrade_hides_tombstoned_room_before_successor_is_listed() {
+    fn matrix_room_upgrade_keeps_tombstoned_room_until_successor_is_listed() {
         let mut predecessor = buffer("local/old", "#postgis", "channel");
         predecessor.matrix_room_id = Some("!old:example.org".to_owned());
         predecessor.matrix_replacement_room_id = Some("!new:example.org".to_owned());
 
         let replaced = replaced_matrix_room_ids(&[predecessor.clone()]);
-        assert!(replaced.contains("!old:example.org"));
-        assert!(!buffer_visible_in_sidebar(
+        assert!(!replaced.contains("!old:example.org"));
+        assert!(buffer_visible_in_sidebar(
             &predecessor,
             false,
             &HashSet::new(),
             &replaced,
         ));
-        assert!(!buffer_visible_in_sidebar(
+        assert!(buffer_visible_in_sidebar(
             &predecessor,
             true,
             &HashSet::new(),
