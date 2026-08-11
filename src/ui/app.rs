@@ -1394,7 +1394,7 @@ pub(crate) fn preferred_chat_buffer_id(
 }
 
 fn replaced_matrix_room_ids(buffers: &[Buffer]) -> HashSet<String> {
-    let matrix_room_ids: HashSet<&str> = buffers
+    let matrix_room_ids: Vec<&str> = buffers
         .iter()
         .filter_map(|buffer| {
             (!buffer.is_matrix_thread())
@@ -1406,7 +1406,10 @@ fn replaced_matrix_room_ids(buffers: &[Buffer]) -> HashSet<String> {
 
     for buffer in buffers.iter().filter(|buffer| !buffer.is_matrix_thread()) {
         if let Some(predecessor_room_id) = buffer.matrix_predecessor_room_id.as_deref() {
-            if matrix_room_ids.contains(predecessor_room_id) {
+            if matrix_room_ids
+                .iter()
+                .any(|room_id| matrix_room_id_matches(predecessor_room_id, room_id))
+            {
                 replaced.insert(predecessor_room_id.to_owned());
             }
         }
@@ -1415,7 +1418,11 @@ fn replaced_matrix_room_ids(buffers: &[Buffer]) -> HashSet<String> {
             if buffer
                 .matrix_replacement_room_id
                 .as_deref()
-                .is_some_and(|replacement| matrix_room_ids.contains(replacement))
+                .is_some_and(|replacement| {
+                    matrix_room_ids
+                        .iter()
+                        .any(|room_id| matrix_room_id_matches(replacement, room_id))
+                })
             {
                 replaced.insert(room_id.to_owned());
             }
@@ -1423,6 +1430,13 @@ fn replaced_matrix_room_ids(buffers: &[Buffer]) -> HashSet<String> {
     }
 
     replaced
+}
+
+fn matrix_room_id_matches(expected: &str, candidate: &str) -> bool {
+    expected == candidate
+        || candidate
+            .strip_prefix(expected)
+            .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 pub(crate) fn replacement_buffer_id(
@@ -1468,7 +1482,9 @@ pub(crate) fn replacement_buffer_id(
             .iter()
             .find(|buffer| {
                 !buffer.is_matrix_thread()
-                    && buffer.matrix_room_id.as_deref() == Some(replacement_room_id)
+                    && buffer.matrix_room_id.as_deref().is_some_and(|room_id| {
+                        matrix_room_id_matches(replacement_room_id, room_id)
+                    })
                     && connection.is_none_or(|prefix| {
                         buffer.id.split_once('/').map(|(candidate, _)| candidate) == Some(prefix)
                     })
@@ -3688,6 +3704,36 @@ mod saved_read_marker_tests {
         assert!(!buffer_visible_in_sidebar(
             &predecessor,
             true,
+            &HashSet::new(),
+            &replaced,
+        ));
+    }
+
+    #[test]
+    fn matrix_room_upgrade_handles_legacy_replacement_without_server_name() {
+        let mut predecessor = buffer("local/old", "#weechat-matrix", "channel");
+        predecessor.matrix_room_id =
+            Some("!twcBhHVdZlQWuuxBhN:termina.org.uk".to_owned());
+        predecessor.matrix_replacement_room_id =
+            Some("!FG5QpOI_8bKulTsRaAaDgVxcRTwg0ZoIRlWHThl69NI".to_owned());
+
+        let mut successor = buffer("local/new", "#weechat-matrix", "channel");
+        successor.matrix_room_id =
+            Some("!FG5QpOI_8bKulTsRaAaDgVxcRTwg0ZoIRlWHThl69NI".to_owned());
+        successor.matrix_predecessor_room_id =
+            Some("!twcBhHVdZlQWuuxBhN:termina.org.uk".to_owned());
+
+        let buffers = [predecessor.clone(), successor.clone()];
+        let replaced = replaced_matrix_room_ids(&buffers);
+
+        assert!(replaced.contains("!twcBhHVdZlQWuuxBhN:termina.org.uk"));
+        assert_eq!(
+            replacement_buffer_id(&buffers, "local/old").as_deref(),
+            Some("local/new"),
+        );
+        assert!(!buffer_visible_in_sidebar(
+            &predecessor,
+            false,
             &HashSet::new(),
             &replaced,
         ));
