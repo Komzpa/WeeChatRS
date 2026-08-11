@@ -1089,6 +1089,23 @@ impl WeeChatApp {
         Some(profiles)
     }
 
+    fn matrix_alias_display_name(obj: &serde_json::Map<String, Value>) -> Option<String> {
+        let alias = obj
+            .get("local_variables")?
+            .as_object()?
+            .get("alias")?
+            .as_str()?;
+        let (localpart, server) = alias.split_once(':')?;
+        if localpart.starts_with('#')
+            && server.contains('.')
+            && !alias.chars().any(char::is_whitespace)
+        {
+            Some(localpart.to_owned())
+        } else {
+            None
+        }
+    }
+
     fn extract_buffer_plugin(obj: &serde_json::Map<String, Value>) -> String {
         obj.get("plugin")
             .and_then(|value| value.as_str())
@@ -1127,11 +1144,16 @@ impl WeeChatApp {
                 let raw_id = obj.get("id").and_then(|v| Self::parse_id(v));
 
                 let number = obj.get("number").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let name = obj.get("short_name").and_then(|v| v.as_str())
+                let mut name = obj.get("short_name").and_then(|v| v.as_str())
                     .or_else(|| obj.get("name").and_then(|v| v.as_str()))
                     .unwrap_or("unknown").to_string();
                 let raw_full_name = obj.get("name").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
                 let plugin = Self::extract_buffer_plugin(obj);
+                if plugin == "matrix" {
+                    if let Some(alias_name) = Self::matrix_alias_display_name(obj) {
+                        name = alias_name;
+                    }
+                }
                 let hidden = obj.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
                 let has_nicklist = obj.get("nicklist").and_then(|v| v.as_bool()).unwrap_or(true);
                 let relay_last_read_id = obj.get("last_read_line_id").and_then(|v| Self::parse_id(v))
@@ -2179,6 +2201,29 @@ mod tests {
         assert_eq!(
             WeeChatApp::extract_matrix_buffer_metadata(malformed.as_object().unwrap()),
             (None, None, None, None, false, None)
+        );
+    }
+
+    #[test]
+    fn matrix_sidebar_name_prefers_canonical_alias() {
+        let object = serde_json::json!({
+            "local_variables": {
+                "alias": "#woodpecker:matrix.org"
+            }
+        });
+        assert_eq!(
+            WeeChatApp::matrix_alias_display_name(object.as_object().unwrap()),
+            Some("#woodpecker".to_owned())
+        );
+
+        let malformed = serde_json::json!({
+            "local_variables": {
+                "alias": "#bad alias:matrix.org"
+            }
+        });
+        assert_eq!(
+            WeeChatApp::matrix_alias_display_name(malformed.as_object().unwrap()),
+            None
         );
     }
 

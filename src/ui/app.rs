@@ -1414,7 +1414,7 @@ fn replaced_matrix_room_ids(buffers: &[Buffer]) -> HashSet<String> {
             if buffer
                 .matrix_replacement_room_id
                 .as_deref()
-                .is_some_and(|replacement| matrix_room_ids.contains(replacement))
+                .is_some_and(|replacement| !replacement.is_empty())
             {
                 replaced.insert(room_id.to_owned());
             }
@@ -1923,6 +1923,23 @@ mod thread_tests {
         assert!(!profile.use_ssl);
         assert!(profile.auto_connect);
         assert!(profile.save_password);
+    }
+
+    #[test]
+    fn legacy_saved_keyring_profile_autoconnects_even_if_checkbox_was_false() {
+        let mut settings = AppSettings::default();
+        settings.host = "localhost".to_owned();
+        settings.port = "9000".to_owned();
+        settings.use_ssl = false;
+        settings.save_password = false;
+
+        let profile = migrate_legacy_profile(&settings).expect("legacy profile");
+        assert_eq!(profile.label, "localhost");
+        assert_eq!(profile.host, "localhost");
+        assert_eq!(profile.port, "9000");
+        assert!(!profile.use_ssl);
+        assert!(profile.auto_connect);
+        assert!(!profile.save_password);
     }
 
     #[test]
@@ -3649,6 +3666,28 @@ mod saved_read_marker_tests {
     }
 
     #[test]
+    fn matrix_room_upgrade_hides_tombstoned_room_before_successor_is_listed() {
+        let mut predecessor = buffer("local/old", "#postgis", "channel");
+        predecessor.matrix_room_id = Some("!old:example.org".to_owned());
+        predecessor.matrix_replacement_room_id = Some("!new:example.org".to_owned());
+
+        let replaced = replaced_matrix_room_ids(&[predecessor.clone()]);
+        assert!(replaced.contains("!old:example.org"));
+        assert!(!buffer_visible_in_sidebar(
+            &predecessor,
+            false,
+            &HashSet::new(),
+            &replaced,
+        ));
+        assert!(!buffer_visible_in_sidebar(
+            &predecessor,
+            true,
+            &HashSet::new(),
+            &replaced,
+        ));
+    }
+
+    #[test]
     fn upgrade_history_keeps_equal_buffer_local_line_ids_distinct() {
         let mut predecessor = buffer("local/old", "old", "channel");
         predecessor.matrix_room_id = Some("!old:example.org".to_owned());
@@ -3926,17 +3965,14 @@ impl WeeChatApp {
             wallpaper_rx,
         };
 
-        // Trigger autoconnect for profiles that have the flag set and a saved password.
+        // Trigger autoconnect. Legacy profiles may already have a keyring secret even if
+        // their old settings file did not keep the save-password checkbox enabled.
         let auto_profiles: Vec<ConnectionProfile> = app.profiles.iter()
             .filter(|p| p.auto_connect)
             .cloned()
             .collect();
         for profile in auto_profiles {
-            let password = if profile.save_password {
-                load_profile_password(&profile).unwrap_or_default()
-            } else {
-                String::new()
-            };
+            let password = load_profile_password(&profile).unwrap_or_default();
             app.do_connect(&profile, password, &cc.egui_ctx);
         }
 
