@@ -3,8 +3,8 @@ use crate::relay::models::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crate::ui::app::{
     history_snapshot_is_exhausted, is_restorable_chat_buffer, preferred_chat_buffer_id,
-    matrix_history_snapshot_count, CommandCompletionState, SavedReadMarker, WeeChatApp,
-    LOAD_MORE_LINES, MAX_STORED_LINES,
+    replacement_buffer_id, matrix_history_snapshot_count, CommandCompletionState, SavedReadMarker,
+    WeeChatApp, LOAD_MORE_LINES, MAX_STORED_LINES,
 };
 use chrono::{Utc, DateTime, Local};
 use serde_json::Value;
@@ -1569,6 +1569,13 @@ impl WeeChatApp {
                     }
                     if let Some(profiles) = Self::extract_matrix_member_profiles(obj) {
                         buffer.matrix_member_profiles = profiles;
+                    }
+                }
+                if self.selected_buffer_id.as_deref() == Some(full_buffer_id.as_str()) {
+                    if let Some(replacement_id) =
+                        replacement_buffer_id(&self.buffers, &full_buffer_id)
+                    {
+                        self.select_buffer(replacement_id);
                     }
                 }
             }

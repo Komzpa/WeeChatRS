@@ -54,6 +54,7 @@ const MATRIX_UPLOAD_RAW_CHUNK: usize = MATRIX_UPLOAD_MAX_ENCODED_CHUNK / 4 * 3;
 const MATRIX_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
 const MATRIX_UPLOAD_CONFIRMATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
+const MATRIX_ROOM_UPGRADE_CHAIN_LIMIT: usize = 32;
 static MATRIX_UPLOAD_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn matrix_redact_command(event_id: &str) -> Result<String, String> {
@@ -1428,10 +1429,42 @@ pub(crate) fn replacement_buffer_id(
     buffers: &[Buffer],
     current_buffer_id: &str,
 ) -> Option<String> {
-    let current = buffers.iter().find(|buffer| buffer.id == current_buffer_id)?;
     let connection = current_buffer_id.split_once('/').map(|(prefix, _)| prefix);
-    if let Some(replacement_room_id) = current.matrix_replacement_room_id.as_deref() {
-        if let Some(buffer_id) = buffers
+    let mut current_id = current_buffer_id.to_owned();
+    let mut latest_id = None;
+    let mut seen = HashSet::new();
+
+    for _ in 0..MATRIX_ROOM_UPGRADE_CHAIN_LIMIT {
+        if !seen.insert(current_id.clone()) {
+            break;
+        }
+
+        let Some(current) = buffers.iter().find(|buffer| buffer.id == current_id) else {
+            break;
+        };
+
+        let replacement_room_id = current
+            .matrix_replacement_room_id
+            .as_deref()
+            .or_else(|| current.matrix_room_id.as_deref().and_then(|current_room_id| {
+                buffers
+                    .iter()
+                    .find(|buffer| {
+                        !buffer.is_matrix_thread()
+                            && buffer.matrix_predecessor_room_id.as_deref() == Some(current_room_id)
+                            && connection.is_none_or(|prefix| {
+                                buffer.id.split_once('/').map(|(candidate, _)| candidate)
+                                    == Some(prefix)
+                            })
+                    })
+                    .and_then(|buffer| buffer.matrix_room_id.as_deref())
+            }));
+
+        let Some(replacement_room_id) = replacement_room_id else {
+            break;
+        };
+
+        let Some(next_id) = buffers
             .iter()
             .find(|buffer| {
                 !buffer.is_matrix_thread()
@@ -1441,21 +1474,15 @@ pub(crate) fn replacement_buffer_id(
                     })
             })
             .map(|buffer| buffer.id.clone())
-        {
-            return Some(buffer_id);
-        }
+        else {
+            break;
+        };
+
+        latest_id = Some(next_id.clone());
+        current_id = next_id;
     }
-    let current_room_id = current.matrix_room_id.as_deref()?;
-    buffers
-        .iter()
-        .find(|buffer| {
-            !buffer.is_matrix_thread()
-                && buffer.matrix_predecessor_room_id.as_deref() == Some(current_room_id)
-                && connection.is_none_or(|prefix| {
-                    buffer.id.split_once('/').map(|(candidate, _)| candidate) == Some(prefix)
-                })
-        })
-        .map(|buffer| buffer.id.clone())
+
+    latest_id
 }
 
 fn predecessor_buffer_ids(buffers: &[Buffer], current_buffer_id: &str) -> Vec<String> {
@@ -3561,6 +3588,32 @@ mod saved_read_marker_tests {
         assert_eq!(
             upgrade_history_load_buffer_id(&buffers, "local/new", &exhausted).as_deref(),
             Some("local/old"),
+        );
+    }
+
+    #[test]
+    fn matrix_room_upgrade_selection_follows_successor_chain_to_latest_room() {
+        let mut oldest = buffer("local/oldest", "oldest", "channel");
+        oldest.matrix_room_id = Some("!oldest:example.org".to_owned());
+        oldest.matrix_replacement_room_id = Some("!middle:example.org".to_owned());
+
+        let mut middle = buffer("local/middle", "middle", "channel");
+        middle.matrix_room_id = Some("!middle:example.org".to_owned());
+        middle.matrix_predecessor_room_id = Some("!oldest:example.org".to_owned());
+        middle.matrix_replacement_room_id = Some("!latest:example.org".to_owned());
+
+        let mut latest = buffer("local/latest", "latest", "channel");
+        latest.matrix_room_id = Some("!latest:example.org".to_owned());
+        latest.matrix_predecessor_room_id = Some("!middle:example.org".to_owned());
+
+        let buffers = vec![oldest, middle, latest];
+        assert_eq!(
+            replacement_buffer_id(&buffers, "local/oldest").as_deref(),
+            Some("local/latest"),
+        );
+        assert_eq!(
+            replacement_buffer_id(&buffers, "local/middle").as_deref(),
+            Some("local/latest"),
         );
     }
 
