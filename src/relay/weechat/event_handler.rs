@@ -71,6 +71,13 @@ fn should_reveal_own_message(is_self_msg: bool, displayed: bool, is_selected: bo
     is_self_msg && displayed && is_selected
 }
 
+fn loaded_matrix_history_stable_name(buffer: &Buffer) -> Option<String> {
+    (buffer.plugin == "matrix"
+        && !buffer.is_matrix_thread()
+        && buffer.messages.iter().any(|line| line.displayed))
+    .then(|| buffer.full_name.clone())
+}
+
 fn buffer_group_key(buffer: &Buffer) -> (String, String) {
     let connection = buffer.id.split('/').next().unwrap_or_default();
     (connection.to_owned(), buffer.server.clone())
@@ -187,6 +194,16 @@ mod matrix_media_tests {
 
 
 impl WeeChatApp {
+    fn clear_matrix_loaded_history_suppression_for(&mut self, buffer_id: &str) {
+        let stable_name = self
+            .buffer_by_id(buffer_id)
+            .and_then(loaded_matrix_history_stable_name);
+        if let Some(stable_name) = stable_name {
+            self.cleared_buffer_ids.remove(buffer_id);
+            self.cleared_buffer_names.remove(&stable_name);
+        }
+    }
+
     pub(crate) fn handle_event(&mut self, conn_prefix: &str, event: BackendEvent) {
         match event {
             BackendEvent::Connected => {
@@ -385,6 +402,16 @@ impl WeeChatApp {
                     self.buffers.push(buf);
                 }
                 self.rebuild_buffer_idx();
+                let loaded_matrix_buffer_ids = self
+                    .buffers
+                    .iter()
+                    .filter(|buffer| buffer.id.starts_with(&pfx))
+                    .filter(|buffer| loaded_matrix_history_stable_name(buffer).is_some())
+                    .map(|buffer| buffer.id.clone())
+                    .collect::<Vec<_>>();
+                for buffer_id in loaded_matrix_buffer_ids {
+                    self.clear_matrix_loaded_history_suppression_for(&buffer_id);
+                }
                 if self.selected_buffer_id.is_none() {
                     if let Some(id) = preferred_chat_buffer_id(
                         &self.buffers,
@@ -447,6 +474,7 @@ impl WeeChatApp {
                         buf.messages.pop_front();
                     }
                 }
+                self.clear_matrix_loaded_history_suppression_for(&full_id);
                 if release_suppression {
                     self.cleared_buffer_ids.remove(&full_id);
                     if let Some(name) = &stable_name {
@@ -565,6 +593,7 @@ impl WeeChatApp {
                         }
                     }
                 }
+                self.clear_matrix_loaded_history_suppression_for(&full_id);
                 if is_load_more {
                     self.loading_more_buffer_id = None;
                     if received_count < LOAD_MORE_LINES || inserted_count == 0 {
@@ -1963,8 +1992,8 @@ mod tests {
 
     use super::{
         apply_saved_buffer_order, buffer_groups_are_valid, buffer_metadata_refresh,
-        matrix_history_page_status, should_reveal_own_message, sort_lines_chronologically,
-        BufferMetadataRefresh, WeeChatApp,
+        loaded_matrix_history_stable_name, matrix_history_page_status, should_reveal_own_message,
+        sort_lines_chronologically, BufferMetadataRefresh, WeeChatApp,
     };
 
     fn sidebar_buffer(id: &str, number: i32, server: &str, kind: &str) -> Buffer {
@@ -2059,6 +2088,29 @@ mod tests {
                 "localhost/libera-room",
             ],
         );
+    }
+
+    #[test]
+    fn loaded_matrix_history_identifies_stale_cleared_room_state() {
+        let mut postgis = sidebar_buffer("localhost/matrix-postgis", 10, "matrix", "channel");
+        postgis.full_name = "localhost/matrix.matrix.#PostGIS.ZmSluDJMNfyT".to_owned();
+        postgis.matrix_room_id = Some("!ZmSluDJMNfyTwfQEJh:osgeo.org".to_owned());
+        postgis.messages.push_back(Line::new(
+            "today".to_owned(),
+            Utc.timestamp_opt(1_786_523_472, 0).single().unwrap(),
+            "strk".to_owned(),
+            "current message".to_owned(),
+            true,
+            false,
+        ));
+
+        assert_eq!(
+            loaded_matrix_history_stable_name(&postgis).as_deref(),
+            Some("localhost/matrix.matrix.#PostGIS.ZmSluDJMNfyT")
+        );
+
+        postgis.messages.clear();
+        assert!(loaded_matrix_history_stable_name(&postgis).is_none());
     }
 
     #[test]
