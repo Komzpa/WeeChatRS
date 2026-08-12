@@ -421,6 +421,10 @@ fn responsive_prefix_column_cap(row_width: f32, show_timestamps: bool) -> f32 {
     (row_width * fraction).clamp(72.0, 210.0)
 }
 
+fn prefix_column_cap(configured_cap_px: f32, row_width: f32, show_timestamps: bool) -> f32 {
+    configured_cap_px.min(responsive_prefix_column_cap(row_width, show_timestamps))
+}
+
 fn prefix_span_layout() -> egui::Layout {
     egui::Layout::left_to_right(egui::Align::Center)
 }
@@ -548,7 +552,7 @@ mod inline_matrix_image_tests {
         inline_image_dimensions_allowed,
         inline_image_display_size, inline_image_preview_size, is_matrix_media_status_line,
         matrix_image_bytes_complete, matrix_media_cache_path, open_url_once,
-        prefix_span_layout, ImageState, primary_click_hits_rect,
+        prefix_column_cap, prefix_span_layout, ImageState, primary_click_hits_rect,
         quote_weechat_argument,
         responsive_prefix_column_cap,
         update_prefix_column_width,
@@ -579,6 +583,8 @@ mod inline_matrix_image_tests {
         assert_eq!(update_prefix_column_width(120.0, 72.0, 90.0), (90.0, false));
         assert_eq!(responsive_prefix_column_cap(452.0, true), 180.8);
         assert_eq!(responsive_prefix_column_cap(452.0, false), 210.0);
+        assert_eq!(prefix_column_cap(f32::INFINITY, 1100.0, true), 210.0);
+        assert_eq!(prefix_column_cap(96.0, 1100.0, true), 96.0);
     }
 
     #[test]
@@ -8186,14 +8192,11 @@ impl eframe::App for WeeChatApp {
                                         } else {
                                             f32::INFINITY
                                         };
-                                        let cap_px = if compact_row {
-                                            configured_cap_px.min(responsive_prefix_column_cap(
-                                                row_width,
-                                                self.show_timestamps,
-                                            ))
-                                        } else {
-                                            configured_cap_px
-                                        };
+                                        let cap_px = prefix_column_cap(
+                                            configured_cap_px,
+                                            row_width,
+                                            self.show_timestamps,
+                                        );
                                         let entry = self.prefix_col_widths.entry(current_buffer_id.clone().unwrap_or_default()).or_insert(0.0);
                                         let (next_col_width, grew) =
                                             update_prefix_column_width(*entry, measured_w, cap_px);

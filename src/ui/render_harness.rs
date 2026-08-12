@@ -192,3 +192,14 @@ fn harness_url_preview_state_matches_current_shipped_behavior() {
     assert_eq!(urls, ["https://example.org/a", "https://example.org/b"]);
     assert!(urls.iter().all(|url| !WeeChatApp::is_image_url(url)));
 }
+
+#[test]
+fn harness_long_sender_cannot_push_messages_into_the_middle_of_the_room() {
+    let row_width = 1100.0;
+    let cap = prefix_column_cap(f32::INFINITY, row_width, true);
+    let (col_width, grew) = update_prefix_column_width(0.0, 620.0, cap);
+
+    assert!(grew);
+    assert_eq!(col_width, 210.0);
+    assert!(row_width - col_width - PREFIX_MESSAGE_GAP >= 880.0);
+}
