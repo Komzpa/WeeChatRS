@@ -254,6 +254,7 @@ const INITIAL_HISTORY_ROWS: usize = 120;
 const IMAGE_CACHE_MAX: usize = 200;
 const PREVIEW_CACHE_MAX: usize = 200;
 const PREFIX_COL_WIDTHS_MAX: usize = 500;
+const PREFIX_COLUMN_SAFETY_PAD: f32 = 4.0;
 const MAX_INLINE_IMAGE_WIDTH: f32 = 360.0;
 const MAX_INLINE_IMAGE_HEIGHT: f32 = 240.0;
 const MAX_EXPANDED_IMAGE_WIDTH: f32 = 900.0;
@@ -418,7 +419,7 @@ fn update_prefix_column_width(current: f32, measured: f32, cap: f32) -> (f32, bo
 
 fn responsive_prefix_column_cap(row_width: f32, show_timestamps: bool) -> f32 {
     let fraction = if show_timestamps { 0.40 } else { 0.48 };
-    (row_width * fraction).clamp(72.0, 210.0)
+    (row_width * fraction).clamp(72.0, 260.0)
 }
 
 fn prefix_column_cap(configured_cap_px: f32, row_width: f32, show_timestamps: bool) -> f32 {
@@ -582,8 +583,8 @@ mod inline_matrix_image_tests {
         assert_eq!(update_prefix_column_width(72.0, 120.0, 90.0), (90.0, true));
         assert_eq!(update_prefix_column_width(120.0, 72.0, 90.0), (90.0, false));
         assert_eq!(responsive_prefix_column_cap(452.0, true), 180.8);
-        assert_eq!(responsive_prefix_column_cap(452.0, false), 210.0);
-        assert_eq!(prefix_column_cap(f32::INFINITY, 1100.0, true), 210.0);
+        assert!((responsive_prefix_column_cap(452.0, false) - 216.96).abs() < 0.01);
+        assert_eq!(prefix_column_cap(f32::INFINITY, 1100.0, true), 260.0);
         assert_eq!(prefix_column_cap(96.0, 1100.0, true), 96.0);
     }
 
@@ -8176,11 +8177,17 @@ impl eframe::App for WeeChatApp {
                                                 )
                                             })
                                             .sum();
-                                        // Keep a small right inset: the emoji-aware measuring
-                                        // path and egui's individual span widgets can differ by
-                                        // a couple of pixels at fractional scale factors.
+                                        // Keep a small growth margin for font fallback and
+                                        // fractional scale differences, but do not right-align
+                                        // the text against that margin: otherwise a clipped
+                                        // sender can lose its last glyph while leaving blank
+                                        // padding before the separator.
                                         let measured_w = measured_text_w
-                                            + if prefix_sections.is_empty() { 0.0 } else { 4.0 };
+                                            + if prefix_sections.is_empty() {
+                                                0.0
+                                            } else {
+                                                PREFIX_COLUMN_SAFETY_PAD
+                                            };
                                         let configured_cap_px = if self.prefix_align_max > 0 {
                                             ui.fonts(|f| {
                                                 f.layout_no_wrap("M".repeat(self.prefix_align_max), font_id.clone(), Color32::WHITE).size().x
@@ -8223,7 +8230,7 @@ impl eframe::App for WeeChatApp {
                                                     ui.set_opacity(0.0);
                                                 }
                                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                                ui.add_space((col_width - measured_w).max(0.0));
+                                                ui.add_space((col_width - measured_text_w).max(0.0));
                                                 for s in prefix_sections {
                                                     let format = s.style.to_format(font_id.clone(), &render_theme);
                                                     self.render_text_with_emoji(ui, &s.text, &format, false, true);
@@ -8231,7 +8238,7 @@ impl eframe::App for WeeChatApp {
                                             }
                                         ).response;
                                         if !continues_matrix_event {
-                                            let visible_prefix_width = measured_w.min(col_width);
+                                            let visible_prefix_width = measured_text_w.min(col_width);
                                             prefix_visible_rect = Some(Rect::from_min_max(
                                                 egui::pos2(
                                                     prefix_response.rect.max.x - visible_prefix_width,

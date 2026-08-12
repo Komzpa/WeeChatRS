@@ -223,6 +223,19 @@ fn harness_long_sender_cannot_push_messages_into_the_middle_of_the_room() {
     let (col_width, grew) = update_prefix_column_width(0.0, 620.0, cap);
 
     assert!(grew);
-    assert_eq!(col_width, 210.0);
-    assert!(row_width - col_width - PREFIX_MESSAGE_GAP >= 880.0);
+    assert_eq!(col_width, 260.0);
+    assert!(row_width - col_width - PREFIX_MESSAGE_GAP >= 830.0);
+}
+
+#[test]
+fn harness_full_matrix_sender_has_room_for_the_last_letter() {
+    let row_width = 1100.0;
+    let cap = prefix_column_cap(f32::INFINITY, row_width, true);
+    let sender_width_with_safety_pad = 226.0;
+    let (col_width, grew) =
+        update_prefix_column_width(0.0, sender_width_with_safety_pad, cap);
+
+    assert!(grew);
+    assert_eq!(col_width, sender_width_with_safety_pad);
+    assert!(col_width < cap);
 }
