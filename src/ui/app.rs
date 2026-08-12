@@ -3518,11 +3518,7 @@ impl SavedReadMarker {
 }
 
 fn restored_cleared_buffer_names(settings: &AppSettings) -> HashSet<String> {
-    let mut names = settings.cleared_buffer_names.clone();
-    // Migration for settings written before stable cleared names existed. A saved marker is
-    // only created after the user visits a buffer, so it is safe to treat it as read state.
-    names.extend(settings.read_markers.keys().cloned());
-    names
+    settings.cleared_buffer_names.clone()
 }
 
 #[cfg(test)]
@@ -3607,7 +3603,7 @@ mod saved_read_marker_tests {
     }
 
     #[test]
-    fn stable_cleared_names_migrate_from_saved_read_markers() {
+    fn saved_read_markers_do_not_restore_as_cleared_buffers() {
         let mut settings = AppSettings::default();
         let name = "local/matrix.matrix.!room:example.org".to_owned();
         settings.read_markers.insert(
@@ -3618,7 +3614,7 @@ mod saved_read_marker_tests {
             },
         );
 
-        assert!(super::restored_cleared_buffer_names(&settings).contains(&name));
+        assert!(!super::restored_cleared_buffer_names(&settings).contains(&name));
     }
 
     #[test]

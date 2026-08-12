@@ -143,6 +143,29 @@ fn harness_orphaned_reply_and_empty_room_history_do_not_disappear_into_spinners(
 }
 
 #[test]
+fn harness_saved_read_marker_does_not_blank_restarted_matrix_room() {
+    let room_name = "local/matrix.matrix.#PostGIS.ZmSluDJMNfyT".to_owned();
+    let mut settings = AppSettings::default();
+    settings.read_markers.insert(
+        room_name.clone(),
+        SavedReadMarker {
+            line_id: "old-id".to_owned(),
+            timestamp_nanos: 200,
+        },
+    );
+
+    let cleared = restored_cleared_buffer_names(&settings);
+    assert!(!cleared.contains(&room_name));
+
+    let mut buffer = matrix_buffer("local/postgis", "!ZmSluDJMNfyTwfQEJh:osgeo.org");
+    buffer.full_name = room_name.clone();
+    buffer.messages.push_back(line("today", 300, "strk", "current message", "$today"));
+
+    assert!(!cleared.contains(&buffer.full_name));
+    assert_eq!(buffer.messages.len(), 1);
+}
+
+#[test]
 fn harness_media_threads_and_mentions_keep_their_render_metadata() {
     let mut media_line = line("media", 10, "alice", "image", "$image:example.org");
     media_line.matrix_media = Some(MatrixMedia {
