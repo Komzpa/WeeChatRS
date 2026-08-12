@@ -801,7 +801,7 @@ pub(crate) fn history_snapshot_is_exhausted(received: usize, requested: usize) -
 }
 
 fn should_auto_request_history(current: usize, attempted: bool, rearmed: bool) -> bool {
-    (current < INITIAL_HISTORY_ROWS && !attempted) || rearmed
+    current > 0 && ((current < INITIAL_HISTORY_ROWS && !attempted) || rearmed)
 }
 
 #[cfg(test)]
@@ -844,6 +844,12 @@ mod scrollback_tests {
         assert!(super::should_auto_request_history(20, false, false));
         assert!(!super::should_auto_request_history(20, true, false));
         assert!(super::should_auto_request_history(20, true, true));
+    }
+
+    #[test]
+    fn empty_initial_page_does_not_auto_load_history() {
+        assert!(!super::should_auto_request_history(0, false, false));
+        assert!(!super::should_auto_request_history(0, true, true));
     }
 }
 const THREAD_PANEL_DEFAULT_WIDTH: f32 = 380.0;
