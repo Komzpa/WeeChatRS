@@ -1308,6 +1308,10 @@ struct MessagePreviewTargets {
     hovered_url: Option<String>,
 }
 
+fn inline_preview_control_visible(link_hovered: bool, expanded: bool) -> bool {
+    link_hovered || expanded
+}
+
 #[derive(Clone)]
 struct ThreadMessageBlock {
     timestamp: chrono::DateTime<chrono::Utc>,
@@ -2243,6 +2247,13 @@ mod thread_tests {
         assert_eq!(media.mxc_uri, "mxc://example.org/screenshot");
         assert_eq!(media.name, "screenshot.png");
         assert_eq!(media.kind, "image");
+    }
+
+    #[test]
+    fn inline_preview_controls_stay_hidden_until_hover_or_expanded() {
+        assert!(!inline_preview_control_visible(false, false));
+        assert!(inline_preview_control_visible(true, false));
+        assert!(inline_preview_control_visible(false, true));
     }
 
     #[test]
@@ -4843,6 +4854,7 @@ impl WeeChatApp {
                     if let Some(url) = &section.url {
                         let link =
                             ui.link(egui::RichText::new(&section.text).font(font_id.clone()));
+                        let link_hovered = link.hovered();
                         if link.hovered() {
                             hovered_url = Some(url.clone());
                         }
@@ -4853,27 +4865,39 @@ impl WeeChatApp {
                         }
                         if self.show_inline_images && Self::is_image_url(url) {
                             let expanded = self.image_expanded.contains(url);
-                            let button =
-                                ui.small_button(if expanded { "🖼" } else { "🖼 preview" });
-                            if response_primary_clicked(ui, &button) {
-                                if expanded {
-                                    self.image_expanded.remove(url);
-                                    self.image_full_size.remove(url);
-                                } else {
-                                    self.ensure_image_loading(url);
+                            if inline_preview_control_visible(link_hovered, expanded) {
+                                let button =
+                                    ui.small_button("🖼").on_hover_text(if expanded {
+                                        "Hide image preview"
+                                    } else {
+                                        "Show image preview"
+                                    });
+                                if response_primary_clicked(ui, &button) {
+                                    if expanded {
+                                        self.image_expanded.remove(url);
+                                        self.image_full_size.remove(url);
+                                    } else {
+                                        self.ensure_image_loading(url);
+                                    }
                                 }
                             }
                         }
                         if self.show_link_previews && !Self::is_image_url(url) {
                             let expanded = self.preview_expanded.contains(url);
-                            let button =
-                                ui.small_button(if expanded { "🔗" } else { "🔗 preview" });
-                            if response_primary_clicked(ui, &button) {
-                                if expanded {
-                                    self.preview_expanded.remove(url);
-                                } else {
-                                    self.preview_expanded.insert(url.clone());
-                                    self.ensure_link_preview_loading(url);
+                            if inline_preview_control_visible(link_hovered, expanded) {
+                                let button =
+                                    ui.small_button("🔗").on_hover_text(if expanded {
+                                        "Hide link preview"
+                                    } else {
+                                        "Show link preview"
+                                    });
+                                if response_primary_clicked(ui, &button) {
+                                    if expanded {
+                                        self.preview_expanded.remove(url);
+                                    } else {
+                                        self.preview_expanded.insert(url.clone());
+                                        self.ensure_link_preview_loading(url);
+                                    }
                                 }
                             }
                         }
