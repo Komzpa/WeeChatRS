@@ -104,6 +104,26 @@ fn contains_complete_mention(text: &str, label: &str) -> bool {
     })
 }
 
+fn semantic_mention_payload(
+    body: &str,
+    selected_mentions: &[SelectedMention],
+) -> serde_json::Value {
+    serde_json::json!({
+        "body": body,
+        "mentions": selected_mentions.iter()
+            .map(|mention| {
+                serde_json::json!({
+                    "label": mention.label,
+                    "user_id": mention.user_id,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "user_ids": selected_mentions.iter()
+            .map(|mention| mention.user_id.as_str())
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn replace_selection(text: &mut String, start: usize, end: usize, replacement: &str) -> usize {
     let start_byte = char_to_byte(text, start);
     let end_byte = char_to_byte(text, end);
@@ -775,12 +795,7 @@ impl WeeChatApp {
                     .map(|buffer| buffer.plugin == "matrix")
                     .unwrap_or(false);
             let command = if semantic_matrix_message {
-                let payload = serde_json::json!({
-                    "body": msg,
-                    "user_ids": self.selected_mentions.iter()
-                        .map(|mention| mention.user_id.as_str())
-                        .collect::<Vec<_>>(),
-                });
+                let payload = semantic_mention_payload(&msg, &self.selected_mentions);
                 format!(
                     "/matrix-send {}",
                     URL_SAFE_NO_PAD.encode(payload.to_string()),
@@ -847,9 +862,10 @@ mod tests {
     use super::{
         apply_native_completion, contains_complete_mention, matching_mentions,
         input_context_menu, input_selection, matrix_reply_command, mention_query,
-        replace_selection, selected_text, store_cursor,
+        replace_selection, selected_text, semantic_mention_payload, store_cursor,
     };
     use crate::relay::models::MentionCandidate;
+    use crate::ui::app::SelectedMention;
     use egui::text::{CCursor, CCursorRange};
     use egui::text_edit::TextEditState;
 
@@ -924,6 +940,22 @@ mod tests {
         assert!(!contains_complete_mention("hi @Adam", "@Ada"));
         assert!(!contains_complete_mention("hi @Ada_example", "@Ada"));
         assert!(!contains_complete_mention("mail@Ada", "@Ada"));
+    }
+
+    #[test]
+    fn semantic_mention_payload_keeps_labels_for_matrix_html() {
+        let payload = semantic_mention_payload(
+            "hi @Ada",
+            &[SelectedMention {
+                label: "@Ada".to_owned(),
+                user_id: "@ada:example.org".to_owned(),
+            }],
+        );
+
+        assert_eq!(payload["body"], "hi @Ada");
+        assert_eq!(payload["mentions"][0]["label"], "@Ada");
+        assert_eq!(payload["mentions"][0]["user_id"], "@ada:example.org");
+        assert_eq!(payload["user_ids"][0], "@ada:example.org");
     }
 
     #[test]
