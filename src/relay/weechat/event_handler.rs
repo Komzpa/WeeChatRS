@@ -874,26 +874,50 @@ impl WeeChatApp {
             MatrixReplyContext, MatrixReplyLineKind,
         };
 
-        let kind = if Self::has_tag(obj, "matrix_reply_header") {
-            MatrixReplyLineKind::Header
+        let legacy_event_id = Self::legacy_matrix_reply_event_id(obj);
+        let (kind, legacy_event_id) = if Self::has_tag(obj, "matrix_reply_header") {
+            (MatrixReplyLineKind::Header, None)
         } else if Self::has_tag(obj, "matrix_reply_quote") {
-            MatrixReplyLineKind::Quote
+            (MatrixReplyLineKind::Quote, None)
+        } else if let Some(event_id) = legacy_event_id {
+            (MatrixReplyLineKind::Header, Some(event_id))
         } else {
             return None;
         };
         let sender = Self::raw_tag_value(obj, "matrix_reply_sender_hex_")
             .and_then(|value| Self::decode_hex_utf8(&value));
-        let event_id = Self::raw_tag_value(obj, "matrix_reply_id_")
-            .filter(|value| {
-                value.starts_with('$')
-                    && !value.chars().any(char::is_whitespace)
-            });
+        let event_id = legacy_event_id.or_else(|| {
+            Self::raw_tag_value(obj, "matrix_reply_id_")
+                .filter(|value| Self::valid_matrix_event_id(value))
+        });
 
         Some(MatrixReplyContext {
             event_id,
             sender,
             kind,
         })
+    }
+
+    fn legacy_matrix_reply_event_id(
+        obj: &serde_json::Map<String, Value>,
+    ) -> Option<String> {
+        if !Self::has_tag(obj, "matrix_reply")
+            || Self::has_tag(obj, "matrix_reply_header")
+            || Self::has_tag(obj, "matrix_reply_quote")
+        {
+            return None;
+        }
+        let message = obj.get("message").and_then(Value::as_str)?.trim();
+        let event_id = message
+            .strip_prefix("Reply to ")?
+            .trim()
+            .trim_end_matches(':')
+            .trim();
+        Self::valid_matrix_event_id(event_id).then(|| event_id.to_owned())
+    }
+
+    fn valid_matrix_event_id(value: &str) -> bool {
+        value.starts_with('$') && !value.chars().any(char::is_whitespace)
     }
 
     fn decode_media_tag(
@@ -2161,8 +2185,40 @@ mod tests {
     }
 
     #[test]
-    fn legacy_matrix_reply_line_stays_plain_text() {
+    fn legacy_matrix_reply_header_is_read_from_weechat_tags() {
         let object = json!({
+            "message": "Reply to $original:remote.example",
+            "tags": ["matrix_reply", "matrix_id_$reply:remote.example"]
+        });
+        let reply =
+            WeeChatApp::matrix_reply_from_tags(object.as_object().unwrap())
+                .expect("legacy reply header");
+
+        assert!(matches!(reply.kind, MatrixReplyLineKind::Header));
+        assert_eq!(
+            reply.event_id.as_deref(),
+            Some("$original:remote.example")
+        );
+        assert_eq!(reply.sender.as_deref(), None);
+    }
+
+    #[test]
+    fn unmatched_legacy_matrix_reply_line_stays_plain_text() {
+        let object = json!({
+            "message": "ordinary message tagged by an old plugin",
+            "tags": ["matrix_reply", "matrix_id_$reply:remote.example"]
+        });
+
+        assert!(
+            WeeChatApp::matrix_reply_from_tags(object.as_object().unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_matrix_reply_header_does_not_parse_extra_body_text() {
+        let object = json!({
+            "message": "Reply to $original:remote.example: accidental body",
             "tags": ["matrix_reply", "matrix_id_$reply:remote.example"]
         });
 

@@ -1144,6 +1144,7 @@ mod responsive_layout_tests {
 
 #[derive(Clone)]
 struct ThreadReplyContext {
+    target_event_id: Option<String>,
     sender: Option<String>,
     quotes: Vec<String>,
     has_header: bool,
@@ -1175,10 +1176,14 @@ fn reply_contexts_by_event(lines: &VecDeque<Line>) -> HashMap<String, ThreadRepl
         let context = replies
             .entry(event_id.clone())
             .or_insert_with(|| ThreadReplyContext {
+                target_event_id: reply.event_id.clone(),
                 sender: reply.sender.clone(),
                 quotes: Vec::new(),
                 has_header: false,
             });
+        if context.target_event_id.is_none() {
+            context.target_event_id = reply.event_id.clone();
+        }
         if context.sender.is_none() {
             context.sender = reply.sender.clone();
         }
@@ -1188,6 +1193,38 @@ fn reply_contexts_by_event(lines: &VecDeque<Line>) -> HashMap<String, ThreadRepl
         }
     }
     replies
+}
+
+fn matrix_event_has_visible_body_line(
+    lines: &VecDeque<Line>,
+    event_id: &str,
+) -> bool {
+    lines.iter().any(|candidate| {
+        candidate.displayed
+            && candidate.matrix_event_id.as_deref() == Some(event_id)
+            && candidate.matrix_reply.is_none()
+    })
+}
+
+fn redundant_room_reply_header(lines: &VecDeque<Line>, line: &Line) -> bool {
+    matches!(
+        line.matrix_reply.as_ref().map(|reply| reply.kind),
+        Some(MatrixReplyLineKind::Header)
+    ) && line
+        .matrix_event_id
+        .as_deref()
+        .is_some_and(|event_id| matrix_event_has_visible_body_line(lines, event_id))
+}
+
+fn room_reply_context_for_body_line<'a>(
+    line: &Line,
+    reply_contexts: &'a HashMap<String, ThreadReplyContext>,
+) -> Option<&'a ThreadReplyContext> {
+    if line.matrix_reply.is_some() {
+        return None;
+    }
+    let event_id = line.matrix_event_id.as_deref()?;
+    reply_contexts.get(event_id)
 }
 
 fn render_reply_context_card(
@@ -1209,15 +1246,26 @@ fn render_reply_context_card(
         .show(ui, |ui| {
             ui.set_max_width(ui.available_width().min(620.0));
             ui.spacing_mut().item_spacing.y = 2.0;
-            let raw_sender = reply.sender.as_deref().unwrap_or("unknown sender");
-            let display_sender = compact_matrix_sender_label(raw_sender);
+            let raw_sender = reply.sender.as_deref();
+            let display_sender = raw_sender
+                .map(compact_matrix_sender_label)
+                .or_else(|| {
+                    reply.target_event_id.as_deref().map(|event_id| {
+                        format!("Reply to {}", short_matrix_event_id(event_id))
+                    })
+                })
+                .unwrap_or_else(|| "Reply".to_owned());
             let sender_response = ui.label(
                 egui::RichText::new(&display_sender)
                     .strong()
                     .color(accent_color),
             );
-            if raw_sender != display_sender {
-                sender_response.on_hover_text(raw_sender);
+            if let Some(raw_sender) = raw_sender {
+                if raw_sender != display_sender {
+                    sender_response.on_hover_text(raw_sender);
+                }
+            } else if let Some(event_id) = reply.target_event_id.as_deref() {
+                sender_response.on_hover_text(format!("Reply target: {event_id}"));
             }
             for quote in &reply.quotes {
                 ui.label(
@@ -1234,6 +1282,17 @@ fn render_reply_context_card(
     ui.painter()
         .rect_filled(rail, Rounding::same(3.0), accent_color);
     card.response
+}
+
+fn short_matrix_event_id(event_id: &str) -> String {
+    const MAX_CHARS: usize = 18;
+    let mut chars = event_id.chars();
+    let prefix: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }
 
 #[derive(Clone)]
@@ -1263,6 +1322,7 @@ fn append_thread_line(block: &mut ThreadMessageBlock, line: &Line) {
         Some(MatrixReplyLineKind::Header) => {
             let reply = line.matrix_reply.as_ref().expect("reply header");
             block.reply = Some(ThreadReplyContext {
+                target_event_id: reply.event_id.clone(),
                 sender: reply.sender.clone(),
                 quotes: Vec::new(),
                 has_header: true,
@@ -1273,6 +1333,7 @@ fn append_thread_line(block: &mut ThreadMessageBlock, line: &Line) {
             block
                 .reply
                 .get_or_insert_with(|| ThreadReplyContext {
+                    target_event_id: reply.event_id.clone(),
                     sender: reply.sender.clone(),
                     quotes: Vec::new(),
                     has_header: false,
@@ -2050,6 +2111,10 @@ mod thread_tests {
             ["new message"]
         );
         let reply = blocks[0].reply.as_ref().expect("reply context");
+        assert_eq!(
+            reply.target_event_id.as_deref(),
+            Some("$original:example.org")
+        );
         assert_eq!(reply.sender.as_deref(), Some("Alice"));
         assert_eq!(reply.quotes, ["original message"]);
     }
@@ -2084,6 +2149,10 @@ mod thread_tests {
             .get("$reply:example.org")
             .expect("one combined reply context");
         assert!(context.has_header);
+        assert_eq!(
+            context.target_event_id.as_deref(),
+            Some("$original:example.org")
+        );
         assert_eq!(context.sender.as_deref(), Some("Regina Obe"));
         assert_eq!(context.quotes, ["oslandia still manages this"]);
     }
@@ -2108,6 +2177,52 @@ mod thread_tests {
             .expect("orphaned quote context");
         assert!(!context.has_header);
         assert_eq!(context.quotes, ["older message at the pagination boundary"]);
+    }
+
+    #[test]
+    fn room_reply_header_attaches_to_following_body_line() {
+        let mut header = line(
+            "1",
+            "bob",
+            "Reply to $original:example.org",
+            "$reply:example.org",
+        );
+        header.matrix_reply = Some(MatrixReplyContext {
+            event_id: Some("$original:example.org".to_owned()),
+            sender: None,
+            kind: MatrixReplyLineKind::Header,
+        });
+        let body = line("2", "bob", "new message", "$reply:example.org");
+        let lines = VecDeque::from([header.clone(), body.clone()]);
+
+        assert!(redundant_room_reply_header(&lines, &header));
+        let contexts = reply_contexts_by_event(&lines);
+        let reply = room_reply_context_for_body_line(&body, &contexts)
+            .expect("attached reply context");
+        assert_eq!(
+            reply.target_event_id.as_deref(),
+            Some("$original:example.org")
+        );
+        assert_eq!(reply.sender.as_deref(), None);
+        assert!(reply.has_header);
+    }
+
+    #[test]
+    fn orphaned_room_reply_header_stays_visible_without_body_line() {
+        let mut header = line(
+            "1",
+            "bob",
+            "Reply to $original:example.org",
+            "$reply:example.org",
+        );
+        header.matrix_reply = Some(MatrixReplyContext {
+            event_id: Some("$original:example.org".to_owned()),
+            sender: None,
+            kind: MatrixReplyLineKind::Header,
+        });
+        let lines = VecDeque::from([header.clone()]);
+
+        assert!(!redundant_room_reply_header(&lines, &header));
     }
 
     #[test]
@@ -7961,7 +8076,19 @@ impl eframe::App for WeeChatApp {
                                                 })
                                                 .is_some_and(|context| context.has_header)
                                     }) {
-                                        previous_matrix_event_id = line.matrix_event_id.clone();
+                                        if !line.matrix_event_id.as_deref().is_some_and(
+                                            |event_id| {
+                                                matrix_event_has_visible_body_line(
+                                                    messages, event_id,
+                                                )
+                                            },
+                                        ) {
+                                            previous_matrix_event_id =
+                                                line.matrix_event_id.clone();
+                                        }
+                                        continue;
+                                    }
+                                    if redundant_room_reply_header(messages, line) {
                                         continue;
                                     }
 
@@ -8172,6 +8299,7 @@ impl eframe::App for WeeChatApp {
                                             ui.set_max_width(msg_col_width);
                                             let message_previews = if let Some(reply) = &line.matrix_reply {
                                                 let fallback_reply = ThreadReplyContext {
+                                                    target_event_id: reply.event_id.clone(),
                                                     sender: reply.sender.clone(),
                                                     quotes: if matches!(
                                                         reply.kind,
@@ -8210,6 +8338,23 @@ impl eframe::App for WeeChatApp {
                                                 }
                                                 None
                                             } else {
+                                                if !continues_matrix_event {
+                                                    if let Some(reply_context) =
+                                                        room_reply_context_for_body_line(
+                                                            line,
+                                                            &reply_contexts,
+                                                        )
+                                                    {
+                                                        render_reply_context_card(
+                                                            ui,
+                                                            reply_context,
+                                                            card_bg,
+                                                            accent_color,
+                                                            text_secondary,
+                                                        );
+                                                        ui.add_space(2.0);
+                                                    }
+                                                }
                                                 let previews = self.render_message_content(
                                                     ui,
                                                     &line.message,
