@@ -8701,3 +8701,7 @@ impl eframe::App for WeeChatApp {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "render_harness.rs"]
+mod render_harness;
