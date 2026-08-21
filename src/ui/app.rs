@@ -4457,6 +4457,7 @@ impl WeeChatApp {
                 .to_string()
         });
         let is_matrix = buffer.plugin == "matrix";
+        let has_displayed_messages = buffer.messages.iter().any(|line| line.displayed);
         let previous_request = self
             .history_request_counts
             .get(buffer_id)
@@ -4491,7 +4492,11 @@ impl WeeChatApp {
 
         if let Some((client, raw_id)) = self.client_for_buffer(buffer_id) {
             if is_matrix {
-                client.send_message(&raw_id, "/matrix history");
+                if view_buffer_id != buffer_id && !has_displayed_messages {
+                    client.fetch_lines(&raw_id, matrix_history_snapshot_count());
+                } else {
+                    client.send_message(&raw_id, "/matrix history");
+                }
             } else if backend_type == Some(BackendType::Soju) {
                 if let Some(timestamp) = oldest_timestamp {
                     client.fetch_lines_before(&raw_id, &timestamp);
@@ -6375,6 +6380,9 @@ impl eframe::App for WeeChatApp {
             .map(|buffer_id| composed_upgrade_history(&self.buffers, buffer_id))
             .map(|(messages, inherited)| (Some(messages), inherited))
             .unwrap_or_else(|| (None, HashSet::new()));
+        let current_buffer_has_displayed_messages = current_buffer_messages
+            .as_ref()
+            .is_some_and(|messages| messages.iter().any(|line| line.displayed));
         let current_history_load_buffer_id = current_buffer_id.as_deref().and_then(|buffer_id| {
             upgrade_history_load_buffer_id(
                 &self.buffers,
@@ -8583,15 +8591,24 @@ impl eframe::App for WeeChatApp {
                     if let Some(buf_id) = current_buffer_id.as_ref() {
                         if history_view_away_from_top {
                             pending_history_top_rearm = Some(buf_id.clone());
-                        } else if history_view_at_top
+                        } else if (history_view_at_top || !current_buffer_has_displayed_messages)
                             && self.loading_more_buffer_id.is_none()
                             && current_history_load_buffer_id.is_some()
                             && current_buffer_messages.as_ref().is_some_and(|messages| {
+                                let attempted_load_buffer =
+                                    current_history_load_buffer_id.as_ref().is_some_and(
+                                        |load_buffer_id| {
+                                            self.history_request_counts
+                                                .contains_key(load_buffer_id)
+                                        },
+                                    );
                                 should_auto_request_history(
                                     messages.len(),
-                                    self.history_request_counts.contains_key(buf_id),
+                                    attempted_load_buffer,
                                     self.history_top_armed_buffer_ids.contains(buf_id),
                                 )
+                                    || (!current_buffer_has_displayed_messages
+                                        && !attempted_load_buffer)
                             })
                         {
                             pending_load_more = current_history_load_buffer_id

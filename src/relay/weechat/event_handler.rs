@@ -1769,7 +1769,9 @@ impl WeeChatApp {
                     let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
                     if Self::has_tag(obj, "matrix_history_page") {
                         if let Some((added, exhausted)) = matrix_history_page_status(message) {
-                            if exhausted {
+                            let active_load =
+                                self.loading_more_buffer_id.as_deref() == Some(&buffer_id);
+                            if exhausted || (active_load && added == 0) {
                                 self.history_exhausted_buffer_ids.insert(buffer_id.clone());
                             }
                             if added > 0 {
@@ -1784,7 +1786,7 @@ impl WeeChatApp {
                                 } else {
                                     self.loading_more_buffer_id = None;
                                 }
-                            } else if self.loading_more_buffer_id.as_deref() == Some(&buffer_id) {
+                            } else if active_load {
                                 self.loading_more_buffer_id = None;
                             }
                         }
