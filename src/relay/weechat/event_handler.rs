@@ -1913,35 +1913,62 @@ impl WeeChatApp {
 
                 if let (Some(raw_buffer_id), Some(line_id)) = (raw_buffer_id, line_id) {
                     let buffer_id = format!("{}/{}", conn_prefix, raw_buffer_id);
+                    let prefix = obj.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+                    let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    if Self::has_tag(obj, "matrix_history_page") {
+                        if let Some((added, exhausted)) = matrix_history_page_status(message) {
+                            let active_load =
+                                self.loading_more_buffer_id.as_deref() == Some(&buffer_id);
+                            if exhausted {
+                                self.history_exhausted_buffer_ids.insert(buffer_id.clone());
+                            }
+                            if added > 0 {
+                                let count = matrix_history_snapshot_count();
+                                self.history_request_counts.insert(buffer_id.clone(), count);
+                                if let Some((client, raw_id)) = self.client_for_buffer(&buffer_id) {
+                                    client.fetch_lines(&raw_id, count);
+                                } else {
+                                    self.loading_more_buffer_id = None;
+                                }
+                            } else if active_load {
+                                self.history_exhausted_buffer_ids.insert(buffer_id.clone());
+                                self.loading_more_buffer_id = None;
+                            }
+                        }
+                        continue;
+                    }
+                    let timestamp = Self::parse_date(obj.get("date"));
+                    let highlight = obj.get("highlight").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_self_msg = Self::has_tag(obj, "self_msg");
+                    let is_selected = self.selected_buffer_id.as_deref() == Some(&buffer_id);
+                    let mut changed_line = Line::new(
+                        line_id.clone(),
+                        timestamp,
+                        prefix.to_string(),
+                        message.to_string(),
+                        displayed,
+                        highlight,
+                    );
+                    changed_line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
+                    changed_line.matrix_reply = Self::matrix_reply_from_tags(obj);
+                    changed_line.matrix_media = Self::matrix_media_from_tags(obj);
+                    self.acknowledge_matrix_attachment(
+                        &buffer_id,
+                        changed_line.matrix_media.as_ref(),
+                        is_self_msg,
+                    );
                     if let Some(buffer) = self.buffer_by_id_mut(&buffer_id) {
                         if let Some(line) = buffer.messages.iter_mut().find(|m| m.id == line_id) {
-                            line.displayed = displayed;
-                            if let Some(event_id) = Self::tag_value(obj, "matrix_id_") {
-                                line.matrix_event_id = Some(event_id);
-                            }
-                            if let Some(reply) = Self::matrix_reply_from_tags(obj) {
-                                line.matrix_reply = Some(reply);
-                            }
+                            *line = changed_line;
                         } else if displayed {
-                            let prefix = obj.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
-                            let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                            let timestamp = Self::parse_date(obj.get("date"));
-                            let mut line = Line::new(
-                                line_id,
-                                timestamp,
-                                prefix.to_string(),
-                                message.to_string(),
-                                displayed,
-                                false,
-                            );
-                            line.matrix_event_id = Self::tag_value(obj, "matrix_id_");
-                            line.matrix_reply = Self::matrix_reply_from_tags(obj);
-                            line.matrix_media = Self::matrix_media_from_tags(obj);
-                            buffer.messages.push_back(line);
+                            buffer.messages.push_back(changed_line);
                             if buffer.messages.len() > MAX_STORED_LINES {
                                 buffer.messages.pop_front();
                             }
                         }
+                    }
+                    if should_reveal_own_message(is_self_msg, displayed, is_selected) {
+                        self.force_scroll_to_bottom_buffer_id = Some(buffer_id);
                     }
                 }
             }

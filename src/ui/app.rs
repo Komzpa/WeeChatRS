@@ -2757,10 +2757,13 @@ fn spawn_event_forwarder(
     prefix: String,
     mut from_rx: mpsc::UnboundedReceiver<BackendEvent>,
     to_tx: mpsc::UnboundedSender<(String, BackendEvent)>,
+    ctx: egui::Context,
 ) {
     tokio::spawn(async move {
         while let Some(ev) = from_rx.recv().await {
-            let _ = to_tx.send((prefix.clone(), ev));
+            if to_tx.send((prefix.clone(), ev)).is_ok() {
+                ctx.request_repaint();
+            }
         }
     });
 }
@@ -5276,7 +5279,12 @@ impl WeeChatApp {
         };
         client.connect();
 
-        spawn_event_forwarder(prefix.clone(), per_conn_rx, self.shared_event_tx.clone());
+        spawn_event_forwarder(
+            prefix.clone(),
+            per_conn_rx,
+            self.shared_event_tx.clone(),
+            ctx.clone(),
+        );
 
         let mut conn = ConnectionHandle {
             prefix: prefix.clone(),
