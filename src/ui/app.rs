@@ -5390,8 +5390,17 @@ impl eframe::App for WeeChatApp {
             crate::ui::notify::init();
         }
 
+        let mut applied_backend_event = false;
         while let Ok((prefix, event)) = self.event_rx.try_recv() {
             self.handle_event(&prefix, event);
+            applied_backend_event = true;
+        }
+        if applied_backend_event {
+            // The forwarding task wakes us when it queues an event, but that
+            // wake-up can be consumed by the frame which drains the queue.
+            // Queue one frame after applying the new line so an active Matrix
+            // buffer is redrawn without requiring a buffer switch.
+            ctx.request_repaint();
         }
 
         // Drain the wallpaper-watcher thread; update override when a new theme arrives.
