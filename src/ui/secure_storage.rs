@@ -2,6 +2,30 @@ use keyring::Entry;
 
 const SERVICE: &str = "weechat-rs";
 
+/// Result of reading a credential from the platform secure store.
+///
+/// `NoEntry` is a normal passwordless-profile state. All other failures are
+/// kept distinct so startup can wait for Secret Service (or its platform
+/// equivalent) instead of accidentally attempting anonymous authentication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoadResult {
+    Found(String),
+    Missing,
+    Unavailable(String),
+}
+
+fn load_entry(key: &str) -> LoadResult {
+    match Entry::new(SERVICE, key) {
+        Ok(entry) => match entry.get_password() {
+            Ok(password) => LoadResult::Found(password),
+            Err(keyring::Error::NoEntry) => LoadResult::Missing,
+            Err(error) => LoadResult::Unavailable(error.to_string()),
+        },
+        Err(keyring::Error::NoEntry) => LoadResult::Missing,
+        Err(error) => LoadResult::Unavailable(error.to_string()),
+    }
+}
+
 // On Linux, keyring uses zbus::blocking which calls block_on internally.
 // The egui update loop runs inside a tokio runtime (CachedParkThread::block_on
 // from #[tokio::main]), so any attempt to call block_on from it will panic.
@@ -43,17 +67,14 @@ pub fn save(host: &str, port: &str, password: &str) -> Result<(), String> {
 
 #[allow(dead_code)]
 pub fn load(host: &str, port: &str) -> Option<String> {
-    let key = user_key(host, port);
-    #[cfg(target_os = "linux")]
-    return run_keyring(move || {
-        Entry::new(SERVICE, &key)
-            .ok()
-            .and_then(|e| e.get_password().ok())
-    }).ok().flatten();
-    #[cfg(not(target_os = "linux"))]
-    Entry::new(SERVICE, &key)
-        .ok()
-        .and_then(|e| e.get_password().ok())
+    match load_status(host, port) {
+        LoadResult::Found(password) => Some(password),
+        LoadResult::Missing | LoadResult::Unavailable(_) => None,
+    }
+}
+
+pub(crate) fn load_status(host: &str, port: &str) -> LoadResult {
+    load_by_key_status(&user_key(host, port))
 }
 
 #[allow(dead_code)]
@@ -87,15 +108,17 @@ pub fn save_by_key(key: &str, password: &str) -> Result<(), String> {
 }
 
 pub fn load_by_key(key: &str) -> Option<String> {
+    match load_by_key_status(key) {
+        LoadResult::Found(password) => Some(password),
+        LoadResult::Missing | LoadResult::Unavailable(_) => None,
+    }
+}
+
+pub(crate) fn load_by_key_status(key: &str) -> LoadResult {
     let key = key.to_string();
     #[cfg(target_os = "linux")]
-    return run_keyring(move || {
-        Entry::new(SERVICE, &key)
-            .ok()
-            .and_then(|e| e.get_password().ok())
-    }).ok().flatten();
+    return run_keyring(move || load_entry(&key))
+        .unwrap_or_else(|error| LoadResult::Unavailable(error));
     #[cfg(not(target_os = "linux"))]
-    Entry::new(SERVICE, &key)
-        .ok()
-        .and_then(|e| e.get_password().ok())
+    load_entry(&key)
 }

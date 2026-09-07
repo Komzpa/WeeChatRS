@@ -2892,9 +2892,107 @@ fn migrate_legacy_profile(settings: &AppSettings) -> Option<ConnectionProfile> {
     })
 }
 
+fn combine_password_loads(
+    profile_key: crate::ui::secure_storage::LoadResult,
+    legacy_key: crate::ui::secure_storage::LoadResult,
+) -> crate::ui::secure_storage::LoadResult {
+    use crate::ui::secure_storage::LoadResult;
+    match profile_key {
+        LoadResult::Found(password) => LoadResult::Found(password),
+        LoadResult::Missing => legacy_key,
+        LoadResult::Unavailable(profile_error) => match legacy_key {
+            LoadResult::Found(password) => LoadResult::Found(password),
+            LoadResult::Missing => LoadResult::Unavailable(profile_error),
+            LoadResult::Unavailable(legacy_error) => LoadResult::Unavailable(format!(
+                "profile key: {profile_error}; legacy key: {legacy_error}"
+            )),
+        },
+    }
+}
+
+fn load_profile_password_status(profile: &ConnectionProfile) -> crate::ui::secure_storage::LoadResult {
+    let profile_key = crate::ui::secure_storage::load_by_key_status(&profile.keyring_host_key());
+    if matches!(profile_key, crate::ui::secure_storage::LoadResult::Found(_)) {
+        return profile_key;
+    }
+    combine_password_loads(
+        profile_key,
+        crate::ui::secure_storage::load_status(&profile.host, &profile.port),
+    )
+}
+
 pub(crate) fn load_profile_password(profile: &ConnectionProfile) -> Option<String> {
-    crate::ui::secure_storage::load_by_key(&profile.keyring_host_key())
-        .or_else(|| crate::ui::secure_storage::load(&profile.host, &profile.port))
+    match load_profile_password_status(profile) {
+        crate::ui::secure_storage::LoadResult::Found(password) => Some(password),
+        crate::ui::secure_storage::LoadResult::Missing => None,
+        crate::ui::secure_storage::LoadResult::Unavailable(error) => {
+            log::warn!("secure storage unavailable for {}: {}", profile.prefix(), error);
+            None
+        }
+    }
+}
+
+struct CredentialEvent {
+    generation: u64,
+    profile: ConnectionProfile,
+    result: crate::ui::secure_storage::LoadResult,
+}
+
+fn credential_retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(2u64.saturating_pow(attempt.min(4)))
+}
+
+fn credential_event_is_current(
+    pending_generation: Option<&u64>,
+    generation: u64,
+    current_profile: Option<&ConnectionProfile>,
+    event_profile: &ConnectionProfile,
+) -> bool {
+    pending_generation == Some(&generation) && current_profile == Some(event_profile)
+}
+
+#[cfg(test)]
+mod credential_startup_tests {
+    use super::{combine_password_loads, credential_event_is_current, credential_retry_delay, ConnectionProfile};
+    use crate::ui::secure_storage::LoadResult;
+    use std::time::Duration;
+
+    #[test]
+    fn temporary_storage_failure_does_not_mask_available_legacy_credential() {
+        assert_eq!(
+            combine_password_loads(
+                LoadResult::Unavailable("Secret Service is starting".into()),
+                LoadResult::Found("legacy-password".into()),
+            ),
+            LoadResult::Found("legacy-password".into()),
+        );
+    }
+
+    #[test]
+    fn credential_retry_delay_is_bounded_exponential_backoff() {
+        assert_eq!(credential_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(credential_retry_delay(4), Duration::from_secs(16));
+        assert_eq!(credential_retry_delay(20), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn missing_both_credentials_is_a_passwordless_terminal_result() {
+        assert_eq!(
+            combine_password_loads(LoadResult::Missing, LoadResult::Missing),
+            LoadResult::Missing,
+        );
+    }
+
+    #[test]
+    fn cancelled_or_replaced_profile_cannot_apply_stale_startup_result() {
+        let profile = ConnectionProfile::default();
+        assert!(credential_event_is_current(Some(&7), 7, Some(&profile), &profile));
+        assert!(!credential_event_is_current(None, 7, Some(&profile), &profile));
+        assert!(!credential_event_is_current(Some(&8), 7, Some(&profile), &profile));
+        let mut replaced = profile.clone();
+        replaced.host = "new-host".into();
+        assert!(!credential_event_is_current(Some(&7), 7, Some(&replaced), &profile));
+    }
 }
 
 impl Default for AppSettings {
@@ -2951,6 +3049,12 @@ pub struct WeeChatApp {
     pub(crate) profiles: Vec<ConnectionProfile>,
     pub(crate) shared_event_tx: mpsc::UnboundedSender<(String, BackendEvent)>,
     pub(crate) event_rx: mpsc::UnboundedReceiver<(String, BackendEvent)>,
+    credential_tx: mpsc::UnboundedSender<CredentialEvent>,
+    credential_rx: mpsc::UnboundedReceiver<CredentialEvent>,
+    credential_generation: u64,
+    pending_credentials: HashMap<String, u64>,
+    pending_credential_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    credential_status: HashMap<String, String>,
 
     // Connection management UI state
     pub(crate) show_connection_log: bool,
@@ -3989,6 +4093,7 @@ mod saved_read_marker_tests {
 impl WeeChatApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (shared_event_tx, event_rx) = mpsc::unbounded_channel::<(String, BackendEvent)>();
+        let (credential_tx, credential_rx) = mpsc::unbounded_channel::<CredentialEvent>();
         let (image_tx, image_rx) = mpsc::unbounded_channel();
         let (preview_tx, preview_rx) = mpsc::unbounded_channel();
         let (np_tx, np_rx) = mpsc::unbounded_channel::<(String, String)>();
@@ -4026,6 +4131,12 @@ impl WeeChatApp {
             profiles,
             shared_event_tx,
             event_rx,
+            credential_tx,
+            credential_rx,
+            credential_generation: 0,
+            pending_credentials: HashMap::new(),
+            pending_credential_tasks: HashMap::new(),
+            credential_status: HashMap::new(),
             show_connection_log: false,
             connection_log_unread: false,
             selected_conn_log: None,
@@ -4152,8 +4263,7 @@ impl WeeChatApp {
             .cloned()
             .collect();
         for profile in auto_profiles {
-            let password = load_profile_password(&profile).unwrap_or_default();
-            app.do_connect(&profile, password, &cc.egui_ctx);
+            app.begin_auto_connect(profile, &cc.egui_ctx);
         }
 
         app
@@ -5191,9 +5301,68 @@ impl WeeChatApp {
         }
     }
 
+    fn cancel_auto_connect(&mut self, prefix: &str) {
+        self.pending_credentials.remove(prefix);
+        if let Some(task) = self.pending_credential_tasks.remove(prefix) {
+            task.abort();
+        }
+        self.credential_status.remove(prefix);
+    }
+
+    fn begin_auto_connect(&mut self, profile: ConnectionProfile, ctx: &egui::Context) {
+        let prefix = profile.prefix();
+        self.cancel_auto_connect(&prefix);
+        self.credential_generation = self.credential_generation.wrapping_add(1);
+        let generation = self.credential_generation;
+        self.pending_credentials.insert(prefix.clone(), generation);
+        self.credential_status
+            .insert(prefix.clone(), "Waiting for secure storage…".to_owned());
+
+        let tx = self.credential_tx.clone();
+        let repaint = ctx.clone();
+        let task_prefix = prefix.clone();
+        let task = tokio::spawn(async move {
+            let mut attempt = 0;
+            loop {
+                let candidate = profile.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    load_profile_password_status(&candidate)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    crate::ui::secure_storage::LoadResult::Unavailable(format!(
+                        "credential worker failed: {error}"
+                    ))
+                });
+                let retry = matches!(
+                    &result,
+                    crate::ui::secure_storage::LoadResult::Unavailable(_)
+                );
+                if tx
+                    .send(CredentialEvent {
+                        generation,
+                        profile: profile.clone(),
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                repaint.request_repaint();
+                if !retry {
+                    break;
+                }
+                tokio::time::sleep(credential_retry_delay(attempt)).await;
+                attempt = attempt.saturating_add(1);
+            }
+        });
+        self.pending_credential_tasks.insert(task_prefix, task);
+    }
+
     /// Start a connection for the given profile with the given password.
     pub(crate) fn do_connect(&mut self, profile: &ConnectionProfile, password: String, ctx: &egui::Context) {
         let prefix = profile.prefix();
+        self.cancel_auto_connect(&prefix);
         // Remove any stale handle with same prefix
         self.connections.retain(|c| c.prefix != prefix);
 
@@ -5388,6 +5557,38 @@ impl eframe::App for WeeChatApp {
         if !self.notify_initialized {
             self.notify_initialized = true;
             crate::ui::notify::init();
+        }
+
+        while let Ok(event) = self.credential_rx.try_recv() {
+            let prefix = event.profile.prefix();
+            let current_profile = self.profiles.iter().find(|profile| **profile == event.profile);
+            if !credential_event_is_current(
+                self.pending_credentials.get(&prefix),
+                event.generation,
+                current_profile,
+                &event.profile,
+            ) {
+                // An edited/deleted profile no longer owns this lookup. Abort
+                // its retry task without cancelling a newer generation.
+                if self.pending_credentials.get(&prefix) == Some(&event.generation) {
+                    self.cancel_auto_connect(&prefix);
+                }
+                continue;
+            }
+            match event.result {
+                crate::ui::secure_storage::LoadResult::Unavailable(error) => {
+                    self.credential_status.insert(
+                        prefix,
+                        format!("Secure storage unavailable; retrying: {error}"),
+                    );
+                }
+                crate::ui::secure_storage::LoadResult::Found(password) => {
+                    self.do_connect(&event.profile, password, ctx);
+                }
+                crate::ui::secure_storage::LoadResult::Missing => {
+                    self.do_connect(&event.profile, String::new(), ctx);
+                }
+            }
         }
 
         let mut applied_backend_event = false;
@@ -5831,6 +6032,13 @@ impl eframe::App for WeeChatApp {
                                 };
                                 ui.label(egui::RichText::new(status_text).color(status_color).small());
                             }
+                        }
+                        for (prefix, status) in &self.credential_status {
+                            ui.label(
+                                egui::RichText::new(format!("● {prefix}: {status}"))
+                                    .color(Color32::from_rgb(255, 165, 0))
+                                    .small(),
+                            );
                         }
                     });
                 });
